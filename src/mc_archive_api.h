@@ -34,45 +34,53 @@ uint8_t *mc_build(mc_voxel_fn src, void *ud, const mc_build_opts *opts, size_t *
 int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const char *outpath);
 
 // ============================================================================
-// APPENDABLE WRITER — a persistent, crash-safe, on-disk archive built one 256^3
-// chunk at a time. Reopens across process runs and keeps appending. The file is a
-// fully valid, decodable archive after every appended chunk (chunk payloads append
-// at EOF; the dense node index is updated in place with the chunk offset published
-// LAST as the commit word). Modeled on volume-compressor's mmap+atomic-cursor writer:
-// a large virtual reservation whose base never moves, file grown by ftruncate, append
-// cursor advanced atomically, lock-free concurrent appends to disjoint EOF ranges.
+// mc_archive — a persistent, crash-safe, READ+WRITE on-disk archive. ONE handle both
+// appends chunks and decodes them (no writer/reader split). Reopens across process
+// runs and keeps appending. The file is a fully valid, decodable archive after every
+// appended chunk (chunk payloads append at EOF; the dense node index is updated in
+// place with the chunk offset published LAST as the commit word). Modeled on
+// volume-compressor's mmap+atomic-cursor writer: a large virtual reservation whose base
+// never moves, file grown by ftruncate, append cursor advanced atomically, lock-free
+// concurrent appends to disjoint EOF ranges, decode reads the live mmap.
 // ============================================================================
-typedef struct mc_writer mc_writer;
+typedef struct mc_archive mc_archive;
 
 // Per-chunk coverage (queried without decoding).
 typedef enum { MC_ABSENT = 0, MC_PRESENT = 1 } mc_cover;
 
-// Open (or create) an appendable archive at `path` for a volume of edge `dim`
-// (multiple of MC_CHUNK_ALIGN=256) at the given `quality`. If the file exists and is
-// a valid mc archive, it is reopened for appending (dim/quality must match the stored
-// header). Returns NULL on failure.
-mc_writer *mc_writer_open(const char *path, int dim, float quality);
+// Open (or create) an archive at `path` for a volume of edge `dim` (multiple of
+// MC_CHUNK_ALIGN=256) at the given `quality`. If the file exists and is a valid mc
+// archive, it is reopened (dim/quality must match the stored header). NULL on failure.
+mc_archive *mc_archive_open(const char *path, int dim, float quality);
 
-// Append one 256^3 chunk of raw u8 voxels at chunk coords (cz,cy,cx) in `lod`.
-// Encodes via the mc codec, writes the compressed chunk blob contiguously at EOF, and
-// installs it in the index. Returns 0 on success. An all-air chunk is a no-op (the
-// slot stays absent, which already decodes to zero).
-int mc_append_chunk_raw(mc_writer *w, int lod, int cz,int cy,int cx,
-                        const mc_u8 vox[256*256*256]);
+// Append one 256^3 chunk of raw u8 voxels at chunk coords (cz,cy,cx) in `lod`. Encodes
+// via the mc codec, writes the compressed chunk blob contiguously at EOF, installs it
+// in the index. Returns 0 on success. An all-air chunk is a no-op (slot stays absent,
+// which decodes to zero).
+int mc_archive_append_chunk_raw(mc_archive *a, int lod, int cz,int cy,int cx,
+                                const mc_u8 vox[256*256*256]);
 
-// Append an ALREADY-COMPRESSED chunk blob verbatim (no re-encode). `blob`/`len` must
-// be a valid mc chunk blob (e.g. copied from another mc archive via mc_chunk_blob_len).
-// Use this for the direct .mca -> .mca fast path. Returns 0 on success.
-int mc_append_chunk_compressed(mc_writer *w, int lod, int cz,int cy,int cx,
-                               const uint8_t *blob, size_t len);
+// Append an ALREADY-COMPRESSED chunk blob verbatim (no re-encode). `blob`/`len` must be
+// a valid mc chunk blob. Direct .mca -> .mca fast path. Returns 0 on success.
+int mc_archive_append_chunk_compressed(mc_archive *a, int lod, int cz,int cy,int cx,
+                                       const uint8_t *blob, size_t len);
 
-// Coverage of a chunk in the writer's archive without decoding.
-mc_cover mc_writer_chunk_coverage(mc_writer *w, int lod, int cz,int cy,int cx);
+// Coverage of a chunk without decoding.
+mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx);
 
-// Flush + close the writer (msync, persist header, truncate to exact length).
-void mc_writer_close(mc_writer *w);
+// Resolve a chunk to its blob offset (0 = absent). Pass to mc_archive_decode_block to
+// decode its 16^3 blocks (resolve once per chunk, decode 4096 blocks).
+uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx);
 
-// ---- read side ----
+// Decode one 16^3 block (bz,by,bx in [0,16)) of the chunk at `chunk_off` into `dst`
+// (16^3 bytes). Missing/air -> dst zeroed. Reads the live mmap; safe vs concurrent
+// appends.
+void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst);
+
+// Flush + close (msync, persist header, truncate to exact length).
+void mc_archive_close(mc_archive *a);
+
+// ---- read-only-from-bytes side (already-built archive in a buffer / mmap) ----
 typedef struct mc_reader mc_reader;
 mc_reader *mc_open(const uint8_t *arc, size_t len);       // in-memory / mmap'd archive
 void       mc_close(mc_reader *r);

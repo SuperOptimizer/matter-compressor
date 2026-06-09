@@ -65,21 +65,40 @@ int main(void){
     mc_u8 *chunk = malloc((size_t)256*256*256);
 
     // ---- phase 1: create + append LOD0 chunk (0,0,0) and LOD1 chunk (0,0,0) ----
-    mc_writer *w = mc_writer_open(path, DIM, Q);
+    mc_archive *w = mc_archive_open(path, DIM, Q);
     if(!w){ fprintf(stderr,"writer_open failed\n"); return 1; }
-    fill_chunk(chunk,0,0,0,0); if(mc_append_chunk_raw(w,0,0,0,0,chunk)){ fprintf(stderr,"append l0 failed\n"); return 1; }
-    fill_chunk(chunk,1,0,0,0); if(mc_append_chunk_raw(w,1,0,0,0,chunk)){ fprintf(stderr,"append l1 failed\n"); return 1; }
-    if(mc_writer_chunk_coverage(w,0,0,0,0)!=MC_PRESENT){ fprintf(stderr,"coverage l0 wrong\n"); return 1; }
-    mc_writer_close(w);
+    fill_chunk(chunk,0,0,0,0); if(mc_archive_append_chunk_raw(w,0,0,0,0,chunk)){ fprintf(stderr,"append l0 failed\n"); return 1; }
+    fill_chunk(chunk,1,0,0,0); if(mc_archive_append_chunk_raw(w,1,0,0,0,chunk)){ fprintf(stderr,"append l1 failed\n"); return 1; }
+    if(mc_archive_chunk_coverage(w,0,0,0,0)!=MC_PRESENT){ fprintf(stderr,"coverage l0 wrong\n"); return 1; }
+    mc_archive_close(w);
     printf("phase 1: appended LOD0(0,0,0) + LOD1(0,0,0), closed\n");
 
     // ---- phase 2: REOPEN (persistence) + append another LOD0 chunk (1,1,1) ----
-    w = mc_writer_open(path, DIM, Q);
+    w = mc_archive_open(path, DIM, Q);
     if(!w){ fprintf(stderr,"reopen failed\n"); return 1; }
-    if(mc_writer_chunk_coverage(w,0,0,0,0)!=MC_PRESENT){ fprintf(stderr,"reopen lost LOD0(0,0,0)\n"); return 1; }
-    fill_chunk(chunk,0,1,1,1); if(mc_append_chunk_raw(w,0,1,1,1,chunk)){ fprintf(stderr,"append l0(1,1,1) failed\n"); return 1; }
-    mc_writer_close(w);
-    printf("phase 2: reopened (persisted), appended LOD0(1,1,1), closed\n");
+    if(mc_archive_chunk_coverage(w,0,0,0,0)!=MC_PRESENT){ fprintf(stderr,"reopen lost LOD0(0,0,0)\n"); return 1; }
+    fill_chunk(chunk,0,1,1,1); if(mc_archive_append_chunk_raw(w,0,1,1,1,chunk)){ fprintf(stderr,"append l0(1,1,1) failed\n"); return 1; }
+
+    // SAME-HANDLE read-back: decode a freshly-appended chunk directly via the archive
+    // (no separate reader) — proves one handle reads + writes.
+    {
+        uint64_t co = mc_archive_chunk_offset(w,0,1,1,1);
+        if(!co){ fprintf(stderr,"same-handle resolve of just-appended chunk failed\n"); return 1; }
+        mc_u8 dec[16*16*16]; long sq=0,mat=0,leak=0;
+        for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
+            mc_archive_decode_block(w,co,bz,by,bx,dec);
+            for(int z=0;z<16;++z)for(int y=0;y<16;++y)for(int x=0;x<16;++x){
+                int gx=(1*16+bx)*16+x, gy=(1*16+by)*16+y, gz=(1*16+bz)*16+z;
+                int s=sample(0,gx,gy,gz), d=dec[(z*16+y)*16+x];
+                if(s==0){ if(d) leak++; } else { mat++; long e=labs((long)d-s); sq+=e*e; }
+            }
+        }
+        double rmse=mat?sqrt((double)sq/mat):0;
+        printf("  self  LOD0(1,1,1) via archive handle: RMSE=%.2f leak=%ld\n",rmse,leak);
+        if(leak || rmse>8.0){ fprintf(stderr,"same-handle decode bad\n"); return 1; }
+    }
+    mc_archive_close(w);
+    printf("phase 2: reopened (persisted), appended LOD0(1,1,1), self-read OK, closed\n");
 
     // ---- phase 3a: flat reader verify ----
     FILE *f=fopen(path,"rb"); fseek(f,0,SEEK_END); long flen=ftell(f); fseek(f,0,SEEK_SET);

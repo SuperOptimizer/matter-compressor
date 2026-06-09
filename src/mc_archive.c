@@ -7,10 +7,13 @@
 //
 // Three faces:
 //   - mc_build / mc_build_to_file : one-shot build of a whole volume (RAM-materialized).
-//   - mc_writer_* : persistent, crash-safe, appendable on-disk archive (mmap + atomic
-//                   append cursor + in-place dense-node index + release-published commit),
-//                   modeled on volume-compressor's writer.
-//   - mc_open / mc_open_streaming + decode : random-access read (flat buffer or byte-source).
+//   - mc_archive_* : ONE persistent, crash-safe, appendable on-disk handle that both
+//                    APPENDS chunks and DECODES them (no writer/reader split). mmap +
+//                    atomic append cursor + in-place dense-node index + release-published
+//                    commit, modeled on volume-compressor's writer; decode reads the live
+//                    mmap.
+//   - mc_open / mc_open_streaming + decode : read an already-built archive from a buffer
+//                    or a byte-source (streaming / S3).
 // ============================================================================
 #include "mc_archive_api.h"
 #include "mc_archive.h"
@@ -235,7 +238,7 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
 #define MC_RESERVE   (10ull*1024*1024*1024*1024)   // 10 TiB virtual reservation (NORESERVE)
 #define MC_GROW_STEP (1ull*1024*1024*1024)          // grow the file 1 GiB at a time
 
-struct mc_writer {
+struct mc_archive {
     int fd;
     u8 *base;                  // fixed mmap base (never moves)
     _Atomic uint64_t cursor;   // append EOF (bytes used)
@@ -243,9 +246,12 @@ struct mc_writer {
     int dim;
     float quality;
     pthread_mutex_t grow_mu;   // serializes ftruncate
+    pthread_mutex_t dec_mu;    // serializes decode (codec quality is process-global)
+    u8 *cmask;                 // cached 256^3 air mask for the last-decoded chunk
+    uint64_t cmask_key;        // chunk_off the cached cmask belongs to
 };
 
-static int w_ensure(mc_writer *w, uint64_t need){
+static int w_ensure(mc_archive *w, uint64_t need){
     uint64_t fl = atomic_load_explicit(&w->file_len, memory_order_acquire);
     if(need <= fl) return 0;
     pthread_mutex_lock(&w->grow_mu);
@@ -260,13 +266,13 @@ static int w_ensure(mc_writer *w, uint64_t need){
     return 0;
 }
 // reserve a disjoint [off, off+n) range at EOF, growing the file as needed.
-static uint64_t w_alloc(mc_writer *w, uint64_t n){
+static uint64_t w_alloc(mc_archive *w, uint64_t n){
     uint64_t off = atomic_fetch_add_explicit(&w->cursor, n, memory_order_relaxed);
     if(w_ensure(w, off+n)!=0) return ~0ull;
     return off;
 }
-static void w_write_u64(mc_writer *w, uint64_t at, uint64_t v){ memcpy(w->base+at,&v,8); }
-static uint64_t w_read_u64(mc_writer *w, uint64_t at){ uint64_t v; memcpy(&v,w->base+at,8); return v; }
+static void w_write_u64(mc_archive *w, uint64_t at, uint64_t v){ memcpy(w->base+at,&v,8); }
+static uint64_t w_read_u64(mc_archive *w, uint64_t at){ uint64_t v; memcpy(&v,w->base+at,8); return v; }
 
 // growable sink wrapping a writer EOF append (used by encode_chunk_blob via a staging
 // buffer; we encode to RAM first then memcpy the whole blob into one EOF range so the
@@ -281,7 +287,7 @@ static void stage_put(void *out, const void *s, size_t n){
 // ensure the index path root->inner->shard exists for (lod,cz,cy,cx); return the file
 // offset of the SHARD-table slot that will hold the chunk offset. Creates dense node
 // tables in place as needed (allocated zeroed at EOF, parent slot published last).
-static uint64_t w_ensure_shard_slot(mc_writer *w, int lod, int cz,int cy,int cx){
+static uint64_t w_ensure_shard_slot(mc_archive *w, int lod, int cz,int cy,int cx){
     uint64_t root = w_read_u64(w, MCH_ROOTOFF + (uint64_t)lod*8);
     if(!root){
         uint64_t no = w_alloc(w, MC_NODE_BYTES); if(no==~0ull) return ~0ull;
@@ -310,7 +316,7 @@ static uint64_t w_ensure_shard_slot(mc_writer *w, int lod, int cz,int cy,int cx)
 }
 
 // append a finished compressed blob at EOF + publish it in the shard slot (commit word).
-static int w_install_blob(mc_writer *w,int lod,int cz,int cy,int cx,const u8 *blob,size_t len){
+static int w_install_blob(mc_archive *w,int lod,int cz,int cy,int cx,const u8 *blob,size_t len){
     uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
     if(slot==~0ull) return -1;
     uint64_t off = w_alloc(w, len);
@@ -325,13 +331,13 @@ static int w_install_blob(mc_writer *w,int lod,int cz,int cy,int cx,const u8 *bl
     return 0;
 }
 
-mc_writer *mc_writer_open(const char *path, int dim, float quality){
+mc_archive *mc_archive_open(const char *path, int dim, float quality){
     if(dim % MC_CHUNK_ALIGN != 0){
-        fprintf(stderr,"mc_writer_open: dim %d not a multiple of %d\n",dim,MC_CHUNK_ALIGN); return NULL;
+        fprintf(stderr,"mc_archive_open: dim %d not a multiple of %d\n",dim,MC_CHUNK_ALIGN); return NULL;
     }
     mc_codec_init(); mc_set_quality(quality);
     int fd = open(path, O_RDWR|O_CREAT, 0644);
-    if(fd<0){ perror("mc_writer_open: open"); return NULL; }
+    if(fd<0){ perror("mc_archive_open: open"); return NULL; }
     struct stat sb; if(fstat(fd,&sb)!=0){ perror("fstat"); close(fd); return NULL; }
     int fresh = (sb.st_size==0);
     uint64_t init_len;
@@ -344,9 +350,11 @@ mc_writer *mc_writer_open(const char *path, int dim, float quality){
     u8 *base = mmap(NULL, MC_RESERVE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_NORESERVE, fd, 0);
     if(base==MAP_FAILED){ perror("mmap"); close(fd); return NULL; }
 
-    mc_writer *w = calloc(1,sizeof *w);
+    mc_archive *w = calloc(1,sizeof *w);
     w->fd=fd; w->base=base; w->dim=dim; w->quality=quality;
+    w->cmask_key=~0ull;
     pthread_mutex_init(&w->grow_mu,NULL);
+    pthread_mutex_init(&w->dec_mu,NULL);
     atomic_store(&w->file_len, init_len);
 
     if(fresh){
@@ -365,7 +373,7 @@ mc_writer *mc_writer_open(const char *path, int dim, float quality){
         uint32_t ver;   memcpy(&ver,base+MCH_VER,4);
         uint32_t d;     memcpy(&d,base+MCH_NX,4);
         if(magic!=MC_MAGIC || ver!=MC_VERSION || (int)d!=dim){
-            fprintf(stderr,"mc_writer_open: %s is not a matching mc archive (magic/ver/dim)\n",path);
+            fprintf(stderr,"mc_archive_open: %s is not a matching mc archive (magic/ver/dim)\n",path);
             munmap(base,MC_RESERVE); close(fd); free(w); return NULL;
         }
         uint64_t totlen; memcpy(&totlen,base+MCH_TOTLEN,8);
@@ -375,49 +383,83 @@ mc_writer *mc_writer_open(const char *path, int dim, float quality){
     return w;
 }
 
-int mc_append_chunk_compressed(mc_writer *w, int lod, int cz,int cy,int cx,
-                               const uint8_t *blob, size_t len){
-    if(!w||lod<0||lod>7||!blob||!len) return -1;
-    return w_install_blob(w,lod,cz,cy,cx,blob,len);
+int mc_archive_append_chunk_compressed(mc_archive *a, int lod, int cz,int cy,int cx,
+                                       const uint8_t *blob, size_t len){
+    if(!a||lod<0||lod>7||!blob||!len) return -1;
+    return w_install_blob(a,lod,cz,cy,cx,blob,len);
 }
 
-int mc_append_chunk_raw(mc_writer *w, int lod, int cz,int cy,int cx, const mc_u8 vox[256*256*256]){
-    if(!w||lod<0||lod>7||!vox) return -1;
-    mc_set_quality(w->quality);
+int mc_archive_append_chunk_raw(mc_archive *a, int lod, int cz,int cy,int cx, const mc_u8 vox[256*256*256]){
+    if(!a||lod<0||lod>7||!vox) return -1;
+    mc_set_quality(a->quality);
     stage_t st={0};
     size_t blen = encode_chunk_blob(vox, stage_put, &st);
     int rc = 0;
-    if(blen) rc = w_install_blob(w,lod,cz,cy,cx,st.p,st.len);
+    if(blen) rc = w_install_blob(a,lod,cz,cy,cx,st.p,st.len);
     // all-air chunk (blen==0): no blob, slot stays absent (decodes to zero). rc stays 0.
     free(st.p);
     return rc;
 }
 
-mc_cover mc_writer_chunk_coverage(mc_writer *w, int lod, int cz,int cy,int cx){
-    if(!w||lod<0||lod>7) return MC_ABSENT;
-    uint64_t root = w_read_u64(w, MCH_ROOTOFF+(uint64_t)lod*8);
-    return mc_resolve_chunk(w->base, root, cz,cy,cx) ? MC_PRESENT : MC_ABSENT;
+mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx){
+    if(!a||lod<0||lod>7) return MC_ABSENT;
+    uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);
+    return mc_resolve_chunk(a->base, root, cz,cy,cx) ? MC_PRESENT : MC_ABSENT;
 }
 
-void mc_writer_close(mc_writer *w){
-    if(!w) return;
-    uint64_t cur = atomic_load(&w->cursor);
-    w_write_u64(w, MCH_TOTLEN, cur);
-    msync(w->base, cur, MS_SYNC);
-    munmap(w->base, MC_RESERVE);
-    if(ftruncate(w->fd,(off_t)cur)!=0) perror("mc_writer_close: ftruncate");
-    close(w->fd);
-    pthread_mutex_destroy(&w->grow_mu);
-    free(w);
+uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
+    if(!a||lod<0||lod>7) return 0;
+    uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);
+    return mc_resolve_chunk(a->base, root, cz,cy,cx);
 }
 
-#else // !MC_HAVE_MMAP — appendable writer requires mmap/ftruncate.
-mc_writer *mc_writer_open(const char *p,int d,float q){ (void)p;(void)d;(void)q;
-    fprintf(stderr,"mc_writer: appendable writer requires a POSIX mmap platform\n"); return NULL; }
-int mc_append_chunk_raw(mc_writer*w,int l,int z,int y,int x,const mc_u8*v){ (void)w;(void)l;(void)z;(void)y;(void)x;(void)v; return -1; }
-int mc_append_chunk_compressed(mc_writer*w,int l,int z,int y,int x,const uint8_t*b,size_t n){ (void)w;(void)l;(void)z;(void)y;(void)x;(void)b;(void)n; return -1; }
-mc_cover mc_writer_chunk_coverage(mc_writer*w,int l,int z,int y,int x){ (void)w;(void)l;(void)z;(void)y;(void)x; return MC_ABSENT; }
-void mc_writer_close(mc_writer*w){ (void)w; }
+// Decode one 16^3 block from the live mmap. Reuses a per-archive cached 256^3 air mask
+// keyed on chunk_off so iterating a chunk's 4096 blocks decodes the mask once. Guarded
+// by the archive's decode mutex (codec quality is process-global).
+void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
+    if(!a||!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    pthread_mutex_lock(&a->dec_mu);
+    mc_set_quality(a->quality);
+    if(!a->cmask) a->cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
+    if(a->cmask_key!=chunk_off){
+        uint32_t cml; const u8 *cmb=mc_chunk_mask(a->base,chunk_off,&cml);
+        if(cmb) mc_dec_chunkmask(cmb,cml,a->cmask); else memset(a->cmask,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
+        a->cmask_key=chunk_off;
+    }
+    static _Thread_local mc_u8 rair[MC_BLK*MC_BLK*MC_BLK];
+    for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)for(int x=0;x<MC_BLK;++x){
+        size_t ci=((size_t)(bz*MC_BLK+z)*MC_CHUNK+(by*MC_BLK+y))*MC_CHUNK+(bx*MC_BLK+x);
+        rair[(z*MC_BLK+y)*MC_BLK+x]=a->cmask[ci];
+    }
+    uint64_t boff; uint32_t bl;
+    if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); pthread_mutex_unlock(&a->dec_mu); return; }
+    mc_dec_block(a->base+boff,rair,dst);
+    pthread_mutex_unlock(&a->dec_mu);
+}
+
+void mc_archive_close(mc_archive *a){
+    if(!a) return;
+    uint64_t cur = atomic_load(&a->cursor);
+    w_write_u64(a, MCH_TOTLEN, cur);
+    msync(a->base, cur, MS_SYNC);
+    munmap(a->base, MC_RESERVE);
+    if(ftruncate(a->fd,(off_t)cur)!=0) perror("mc_archive_close: ftruncate");
+    close(a->fd);
+    pthread_mutex_destroy(&a->grow_mu);
+    pthread_mutex_destroy(&a->dec_mu);
+    free(a->cmask);
+    free(a);
+}
+
+#else // !MC_HAVE_MMAP — the appendable archive requires mmap/ftruncate.
+mc_archive *mc_archive_open(const char *p,int d,float q){ (void)p;(void)d;(void)q;
+    fprintf(stderr,"mc_archive: requires a POSIX mmap platform\n"); return NULL; }
+int mc_archive_append_chunk_raw(mc_archive*a,int l,int z,int y,int x,const mc_u8*v){ (void)a;(void)l;(void)z;(void)y;(void)x;(void)v; return -1; }
+int mc_archive_append_chunk_compressed(mc_archive*a,int l,int z,int y,int x,const uint8_t*b,size_t n){ (void)a;(void)l;(void)z;(void)y;(void)x;(void)b;(void)n; return -1; }
+mc_cover mc_archive_chunk_coverage(mc_archive*a,int l,int z,int y,int x){ (void)a;(void)l;(void)z;(void)y;(void)x; return MC_ABSENT; }
+uint64_t mc_archive_chunk_offset(mc_archive*a,int l,int z,int y,int x){ (void)a;(void)l;(void)z;(void)y;(void)x; return 0; }
+void mc_archive_decode_block(mc_archive*a,uint64_t o,int z,int y,int x,mc_u8*d){ (void)a;(void)o;(void)z;(void)y;(void)x; memset(d,0,MC_BLK*MC_BLK*MC_BLK); }
+void mc_archive_close(mc_archive*a){ (void)a; }
 #endif
 
 // ============================================================================
