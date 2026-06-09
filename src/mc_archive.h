@@ -34,7 +34,7 @@
 // ---- header (256B) ----
 #define MC_MAGIC   0x0043434Du      // "MCC\0"
 #define MCH_MAGIC   0               // u32 magic
-#define MCH_VER     4               // u32 format version
+#define MCH_VER     4               // byte offset of the u32 format-version field
 #define MCH_NX      12              // u32 volume dims
 #define MCH_NY      16
 #define MCH_NZ      20
@@ -46,7 +46,7 @@
 #define MC_HDR      256u            // header size; metadata region begins here
 #define MC_META_END (128u*1024u)    // archive data begins at this offset (128KB)
 #define MC_META_CAP (MC_META_END - MC_HDR)
-#define MC_VERSION  4u
+#define MC_VERSION  1u              // matter-compressor format version (starts at 1)
 
 #define MC_CHUNK_ALIGN 256          // volume dim must be a multiple of this
 
