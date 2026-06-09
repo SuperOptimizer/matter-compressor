@@ -245,10 +245,7 @@ struct mc_archive {
     _Atomic uint64_t file_len; // current ftruncate'd file size
     int dim;
     float quality;
-    pthread_mutex_t grow_mu;   // serializes ftruncate
-    pthread_mutex_t dec_mu;    // serializes decode (codec quality is process-global)
-    u8 *cmask;                 // cached 256^3 air mask for the last-decoded chunk
-    uint64_t cmask_key;        // chunk_off the cached cmask belongs to
+    pthread_mutex_t grow_mu;   // serializes ftruncate only; decode is lock-free
 };
 
 static int w_ensure(mc_archive *w, uint64_t need){
@@ -352,9 +349,7 @@ mc_archive *mc_archive_open(const char *path, int dim, float quality){
 
     mc_archive *w = calloc(1,sizeof *w);
     w->fd=fd; w->base=base; w->dim=dim; w->quality=quality;
-    w->cmask_key=~0ull;
     pthread_mutex_init(&w->grow_mu,NULL);
-    pthread_mutex_init(&w->dec_mu,NULL);
     atomic_store(&w->file_len, init_len);
 
     if(fresh){
@@ -413,28 +408,30 @@ uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
     return mc_resolve_chunk(a->base, root, cz,cy,cx);
 }
 
-// Decode one 16^3 block from the live mmap. Reuses a per-archive cached 256^3 air mask
-// keyed on chunk_off so iterating a chunk's 4096 blocks decodes the mask once. Guarded
-// by the archive's decode mutex (codec quality is process-global).
+// Decode one 16^3 block from the live mmap. LOCK-FREE: the codec's per-call scratch is
+// all _Thread_local and g_quality is constant for the archive's lifetime (set once at
+// open), so concurrent decodes are safe without serialization. A THREAD-LOCAL 256^3 air
+// mask is cached + keyed on chunk_off so iterating a chunk's 4096 blocks decodes the mask
+// once per thread. The mmap is read-only here; appends publish via a release fence so a
+// resolved chunk_off always points at fully-written bytes.
 void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
     if(!a||!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    pthread_mutex_lock(&a->dec_mu);
-    mc_set_quality(a->quality);
-    if(!a->cmask) a->cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-    if(a->cmask_key!=chunk_off){
+    static _Thread_local mc_u8 *tl_cmask=0;
+    static _Thread_local uint64_t tl_cmask_key=~0ull;
+    if(!tl_cmask) tl_cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
+    if(tl_cmask_key!=chunk_off){
         uint32_t cml; const u8 *cmb=mc_chunk_mask(a->base,chunk_off,&cml);
-        if(cmb) mc_dec_chunkmask(cmb,cml,a->cmask); else memset(a->cmask,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-        a->cmask_key=chunk_off;
+        if(cmb) mc_dec_chunkmask(cmb,cml,tl_cmask); else memset(tl_cmask,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
+        tl_cmask_key=chunk_off;
     }
     static _Thread_local mc_u8 rair[MC_BLK*MC_BLK*MC_BLK];
     for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)for(int x=0;x<MC_BLK;++x){
         size_t ci=((size_t)(bz*MC_BLK+z)*MC_CHUNK+(by*MC_BLK+y))*MC_CHUNK+(bx*MC_BLK+x);
-        rair[(z*MC_BLK+y)*MC_BLK+x]=a->cmask[ci];
+        rair[(z*MC_BLK+y)*MC_BLK+x]=tl_cmask[ci];
     }
     uint64_t boff; uint32_t bl;
-    if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); pthread_mutex_unlock(&a->dec_mu); return; }
+    if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     mc_dec_block(a->base+boff,rair,dst);
-    pthread_mutex_unlock(&a->dec_mu);
 }
 
 void mc_archive_close(mc_archive *a){
@@ -446,8 +443,6 @@ void mc_archive_close(mc_archive *a){
     if(ftruncate(a->fd,(off_t)cur)!=0) perror("mc_archive_close: ftruncate");
     close(a->fd);
     pthread_mutex_destroy(&a->grow_mu);
-    pthread_mutex_destroy(&a->dec_mu);
-    free(a->cmask);
     free(a);
 }
 
