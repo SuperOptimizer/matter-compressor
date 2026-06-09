@@ -12,15 +12,22 @@ if(NOT DEFINED MC_NO_NATIVE)
   add_compile_options(-march=native)
 endif()
 
-# core library: codec + archive (no external deps; just libm)
+# core library: codec + archive (deps: libm + pthread for the appendable writer)
 add_library(matter_compressor STATIC
   src/mc_codec.c
   src/mc_archive.c)
 target_include_directories(matter_compressor PUBLIC src)
-target_link_libraries(matter_compressor m)
+find_package(Threads REQUIRED)
+target_link_libraries(matter_compressor m Threads::Threads)
 
 # round-trip test
 enable_testing()
 add_executable(mc_roundtrip tests/mc_roundtrip.c)
 target_link_libraries(mc_roundtrip matter_compressor)
 add_test(NAME roundtrip COMMAND mc_roundtrip)
+
+# appendable-writer round-trip: open -> append chunks -> close -> reopen -> append more
+# -> decode + verify; exercises persistence + crash-safe in-place index.
+add_executable(mc_append_roundtrip tests/mc_append_roundtrip.c)
+target_link_libraries(mc_append_roundtrip matter_compressor)
+add_test(NAME append_roundtrip COMMAND mc_append_roundtrip)

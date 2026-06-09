@@ -1,7 +1,16 @@
 // ============================================================================
-// mc_archive.c — matter-compressor archive build + decode. See mc_archive_api.h.
-// Source-agnostic: pulls voxels through a callback (no zarr/S3 here). Owns the LOD
-// pyramid, the sparse-tree writer (calling mc_codec), and the reader.
+// mc_archive.c — matter-compressor archive build + APPENDABLE writer + decode.
+// See mc_archive_api.h. Source-agnostic: no zarr/S3 here.
+//
+// Index is a DENSE node tree (root node -> inner node -> shard), each a flat
+// MC_GRID3 array of u64 offsets, updatable in place. Chunk payloads append at EOF.
+//
+// Three faces:
+//   - mc_build / mc_build_to_file : one-shot build of a whole volume (RAM-materialized).
+//   - mc_writer_* : persistent, crash-safe, appendable on-disk archive (mmap + atomic
+//                   append cursor + in-place dense-node index + release-published commit),
+//                   modeled on volume-compressor's writer.
+//   - mc_open / mc_open_streaming + decode : random-access read (flat buffer or byte-source).
 // ============================================================================
 #include "mc_archive_api.h"
 #include "mc_archive.h"
@@ -10,6 +19,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <errno.h>
+
+#if defined(__unix__) || defined(__APPLE__)
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <pthread.h>
+  #define MC_HAVE_MMAP 1
+#else
+  #define MC_HAVE_MMAP 0
+#endif
 
 typedef uint8_t u8;
 
@@ -28,87 +50,132 @@ static u8 *decimate(const u8 *src,int D){ int H=D/2; u8 *o=calloc((size_t)H*H*H,
             u8 v=src[(((size_t)(2*z+dz))*D+(2*y+dy))*D+(2*x+dx)]; if(v){s+=v;c++;}}
         o[((size_t)z*H+y)*H+x]=c?(u8)((s+c/2)/c):0; } return o; }
 
-// gather a 16^3 block (zero-padded at edges).
-static int gather_blk(const vol_t *V,int cz,int cy,int cx,int bz,int by,int bx,u8 *dst){
-    int z0=(cz*16+bz)*MC_BLK,y0=(cy*16+by)*MC_BLK,x0=(cx*16+bx)*MC_BLK,any=0;
+// gather a 16^3 block from a contiguous 256^3 chunk buffer (chunk is dense, no edges).
+static int gather_blk256(const u8 *chunk,int bz,int by,int bx,u8 *dst){
+    int z0=bz*MC_BLK,y0=by*MC_BLK,x0=bx*MC_BLK,any=0;
     for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)for(int x=0;x<MC_BLK;++x){
-        u8 v=vget(V,z0+z,y0+y,x0+x); dst[(z*MC_BLK+y)*MC_BLK+x]=v; any|=v; }
+        u8 v=chunk[((size_t)(z0+z)*MC_CHUNK+(y0+y))*MC_CHUNK+(x0+x)]; dst[(z*MC_BLK+y)*MC_BLK+x]=v; any|=v; }
     return any;
 }
-static int chunk_present(const vol_t *V,int cz,int cy,int cx){
-    int D=V->dim,z0=cz*256,y0=cy*256,x0=cx*256;
-    if(z0>=D||y0>=D||x0>=D) return 0;
-    int z1=z0+256<D?z0+256:D,y1=y0+256<D?y0+256:D,x1=x0+256<D?x0+256:D;
-    for(int z=z0;z<z1;++z)for(int y=y0;y<y1;++y)for(int x=x0;x<x1;++x) if(vget(V,z,y,x)) return 1;
-    return 0;
-}
 
-// ---------------------------------------------------------------- archive byte buffer
-typedef struct { u8 *p; size_t len, cap; } abuf;
-static void a_reserve(abuf*b,size_t n){ if(b->len+n<=b->cap)return; size_t nc=b->cap?b->cap*2:1<<20; while(nc<b->len+n)nc*=2; b->p=realloc(b->p,nc); b->cap=nc; }
-static size_t a_put(abuf*b,const void*s,size_t n){ a_reserve(b,n); size_t at=b->len; memcpy(b->p+at,s,n); b->len+=n; return at; }
-static size_t a_zero(abuf*b,size_t n){ a_reserve(b,n); size_t at=b->len; memset(b->p+at,0,n); b->len+=n; return at; }
-static void a_u32(abuf*b,size_t at,uint32_t v){ memcpy(b->p+at,&v,4); }
-static void a_u64(abuf*b,size_t at,uint64_t v){ memcpy(b->p+at,&v,8); }
+// ---------------------------------------------------------------- chunk-blob encoder
+// Encode one dense 256^3 chunk buffer into a compressed blob in `out` (a growable
+// byte sink: out_put(out, ptr, n)). Returns the blob length, or 0 if the chunk is all
+// air (no blob — caller leaves the slot absent). Shared by build + writer.
+// blob = [u32 masklen][mask][512B block-bitmap][present-block u32 lens][block payloads].
+typedef void (*out_put_fn)(void *out, const void *s, size_t n);
 
-static int g_nchunks=0;
-static _Thread_local u8 *g_cmask=0;   // prepared 256^3 air mask for the chunk being written
+static size_t encode_chunk_blob(const u8 *chunk256, out_put_fn put, void *out){
+    // air mask: air=1 where voxel==0.
+    static _Thread_local u8 *cmask=0;
+    if(!cmask) cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
+    int anyvox=0;
+    for(size_t i=0;i<(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK;++i){ u8 v=chunk256[i]; cmask[i]=v?0:1; anyvox|=v; }
+    if(!anyvox) return 0;   // all air -> no blob
 
-static void prep_chunk_mask(const vol_t *V,int cz,int cy,int cx){
-    if(!g_cmask) g_cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-    int z0=cz*256,y0=cy*256,x0=cx*256;
-    for(int z=0;z<MC_CHUNK;++z)for(int y=0;y<MC_CHUNK;++y)for(int x=0;x<MC_CHUNK;++x)
-        g_cmask[((size_t)z*MC_CHUNK+y)*MC_CHUNK+x] = vget(V,z0+z,y0+y,x0+x)?0:1;  // air=1
-}
-
-// write one dense 256^3 chunk: [u32 masklen][mask][512B bitmap][present lens][payloads].
-static uint64_t write_chunk(abuf*b,const vol_t *V,int cz,int cy,int cx){
-    prep_chunk_mask(V,cz,cy,cx);
     static _Thread_local mc_buf tmp; tmp.len=0;
     uint8_t bm[MC_BITMAP_BYTES]; memset(bm,0,sizeof bm);
     uint32_t blen[MC_GRID3]; int npresent=0;
     static _Thread_local u8 vox[MC_BLK*MC_BLK*MC_BLK], rair[MC_BLK*MC_BLK*MC_BLK];
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         int bi=(bz*16+by)*16+bx;
-        if(!gather_blk(V,cz,cy,cx,bz,by,bx,vox)) continue;
+        if(!gather_blk256(chunk256,bz,by,bx,vox)) continue;
         for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)for(int x=0;x<MC_BLK;++x){
             size_t ci=((size_t)(bz*MC_BLK+z)*MC_CHUNK+(by*MC_BLK+y))*MC_CHUNK+(bx*MC_BLK+x);
-            rair[(z*MC_BLK+y)*MC_BLK+x]=g_cmask[ci];
+            rair[(z*MC_BLK+y)*MC_BLK+x]=cmask[ci];
         }
         uint32_t len=0; if(mc_enc_block(vox,rair,&tmp,&len)){ mc_bit_set(bm,bi); blen[bi]=len; npresent++; }
     }
-    size_t at=b->len;
     static _Thread_local mc_u8 *mbuf=0; if(!mbuf) mbuf=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK/4+1024);
-    uint32_t mlen=mc_enc_chunkmask(g_cmask,mbuf,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK/4+1024);
-    a_put(b,&mlen,4); a_put(b,mbuf,mlen);
-    a_put(b,bm,MC_BITMAP_BYTES);
-    for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(bm,bi)) a_put(b,&blen[bi],4);
-    if(npresent) a_put(b,tmp.p,tmp.len);
-    return (uint64_t)at;
+    uint32_t mlen=mc_enc_chunkmask(cmask,mbuf,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK/4+1024);
+    size_t total=4+mlen+MC_BITMAP_BYTES+(size_t)npresent*4+tmp.len;
+    put(out,&mlen,4); put(out,mbuf,mlen);
+    put(out,bm,MC_BITMAP_BYTES);
+    for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(bm,bi)) put(out,&blen[bi],4);
+    if(npresent) put(out,tmp.p,tmp.len);
+    return total;
 }
-static uint64_t write_shard(abuf*b,const vol_t *V,int bz,int by,int bx){
-    uint64_t tbl[MC_GRID3]; memset(tbl,0,sizeof tbl); int any=0;
-    for(int dz=0;dz<16;++dz){ int cz=bz+dz; if(cz>=g_nchunks)break;
-    for(int dy=0;dy<16;++dy){ int cy=by+dy; if(cy>=g_nchunks)break;
-    for(int dx=0;dx<16;++dx){ int cx=bx+dx; if(cx>=g_nchunks)break;
-        if(chunk_present(V,cz,cy,cx)){ tbl[(dz*16+dy)*16+dx]=write_chunk(b,V,cz,cy,cx); any=1; } }}}
-    if(!any) return 0;
-    return (uint64_t)a_put(b,tbl,MC_SHARD_BYTES);
+
+// ---------------------------------------------------------------- one-shot build (abuf)
+typedef struct { u8 *p; size_t len, cap; } abuf;
+static void a_reserve(abuf*b,size_t n){ if(b->len+n<=b->cap)return; size_t nc=b->cap?b->cap*2:1<<20; while(nc<b->len+n)nc*=2; b->p=realloc(b->p,nc); b->cap=nc; }
+static size_t a_put_at(abuf*b,const void*s,size_t n){ a_reserve(b,n); size_t at=b->len; memcpy(b->p+at,s,n); b->len+=n; return at; }
+static size_t a_zero(abuf*b,size_t n){ a_reserve(b,n); size_t at=b->len; memset(b->p+at,0,n); b->len+=n; return at; }
+static void a_u32(abuf*b,size_t at,uint32_t v){ memcpy(b->p+at,&v,4); }
+static void a_u64(abuf*b,size_t at,uint64_t v){ memcpy(b->p+at,&v,8); }
+static void abuf_put(void *out, const void *s, size_t n){ a_put_at((abuf*)out,s,n); }
+
+// gather a contiguous 256^3 chunk out of a LOD volume (zero-padded at the volume edge).
+static int gather_chunk256(const vol_t *V,int cz,int cy,int cx,u8 *dst){
+    int z0=cz*256,y0=cy*256,x0=cx*256,any=0;
+    for(int z=0;z<MC_CHUNK;++z)for(int y=0;y<MC_CHUNK;++y)for(int x=0;x<MC_CHUNK;++x){
+        u8 v=vget(V,z0+z,y0+y,x0+x); dst[((size_t)z*MC_CHUNK+y)*MC_CHUNK+x]=v; any|=v; }
+    return any;
 }
-static uint64_t write_node(abuf*b,const vol_t *V,int level,int bz,int by,int bx){
-    int span=16; for(int i=0;i<level;++i) span*=16;
-    uint8_t bm[MC_BITMAP_BYTES]; memset(bm,0,sizeof bm);
-    uint64_t coff[MC_GRID3]; int any=0;
-    for(int dz=0;dz<16;++dz){ int cz=bz+dz*span; if(cz>=g_nchunks)break;
-    for(int dy=0;dy<16;++dy){ int cy=by+dy*span; if(cy>=g_nchunks)break;
-    for(int dx=0;dx<16;++dx){ int cx=bx+dx*span; if(cx>=g_nchunks)break;
-        int idx=(dz*16+dy)*16+dx;
-        uint64_t off = level==0 ? write_shard(b,V,cz,cy,cx) : write_node(b,V,level-1,cz,cy,cx);
-        if(off){ mc_bit_set(bm,idx); coff[idx]=off; any=1; } }}}
-    if(!any) return 0;
-    size_t nat=a_put(b,bm,MC_BITMAP_BYTES);
-    for(int idx=0;idx<MC_GRID3;++idx) if(mc_bit_get(bm,idx)) a_put(b,&coff[idx],8);
-    return (uint64_t)nat;
+
+// dense one-shot build: write the dense node tree for one LOD volume. Allocate the
+// dense tables top-down with deferred offset back-patch (we know child offsets only
+// after writing children, but the tables are dense + fixed-size so we reserve then fill).
+// Simpler: build bottom-up into an in-RAM dense tree, then emit. We emit chunks first,
+// recording offsets in a dense shard map, then emit shards, inner nodes, root.
+
+static uint64_t build_lod_dense(abuf*b, const vol_t *V, int nchunks){
+    // dense maps over chunk grid (sparse population). We allocate per populated node.
+    // root: 16^3 inner-node offsets; inner: 16^3 shard offsets; shard: 16^3 chunk offsets.
+    // chunk coord nibbles: 2 (root), 1 (inner), 0 (shard).
+    // First pass: emit chunk blobs, fill shard tables in RAM keyed by (n1=hi, n0).
+    // To keep it simple + correct for any nchunks up to 4096/axis, use hash-free dense
+    // allocation only where present.
+    // We build a 3-level RAM tree of u64 tables, emit chunk blobs to `b`, then emit the
+    // tables bottom-up and return the root offset.
+
+    // RAM node: 4096 u64 child *table-indices* during build, resolved to file offsets on emit.
+    // Use dynamic arrays of tables.
+    typedef struct { uint64_t slot[MC_GRID3]; } table_t;   // 32KB each
+    // shards keyed by (n2,n1); inners keyed by n2; root single.
+    // We accumulate present shards/inners in vectors with their grid index.
+    table_t *root = calloc(1,sizeof *root);
+    // inner tables: up to 4096; allocate lazily.
+    table_t **inner = calloc(MC_GRID3,sizeof *inner);
+    // for each inner, its shard tables lazily.
+    table_t ***shard = calloc(MC_GRID3,sizeof *shard);
+
+    static _Thread_local u8 *chunkbuf=0; if(!chunkbuf) chunkbuf=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
+
+    for(int cz=0;cz<nchunks;++cz)for(int cy=0;cy<nchunks;++cy)for(int cx=0;cx<nchunks;++cx){
+        if(!gather_chunk256(V,cz,cy,cx,chunkbuf)) continue;
+        size_t at=b->len;
+        if(!encode_chunk_blob(chunkbuf,abuf_put,b)) continue;   // all air
+        int n2=(mc_nib(cz,2)*16+mc_nib(cy,2))*16+mc_nib(cx,2);
+        int n1=(mc_nib(cz,1)*16+mc_nib(cy,1))*16+mc_nib(cx,1);
+        int n0=(mc_nib(cz,0)*16+mc_nib(cy,0))*16+mc_nib(cx,0);
+        if(!inner[n2]) inner[n2]=calloc(1,sizeof(table_t));
+        if(!shard[n2]) shard[n2]=calloc(MC_GRID3,sizeof(table_t*));
+        if(!shard[n2][n1]) shard[n2][n1]=calloc(1,sizeof(table_t));
+        shard[n2][n1]->slot[n0]=(uint64_t)at;   // chunk-blob offset
+    }
+    // emit bottom-up: shards, then inners, then root.
+    int any_root=0;
+    for(int n2=0;n2<MC_GRID3;++n2){
+        if(!inner[n2]) continue;
+        int any_inner=0;
+        for(int n1=0;n1<MC_GRID3;++n1){
+            if(!shard[n2] || !shard[n2][n1]) continue;
+            uint64_t soff=a_put_at(b,shard[n2][n1],MC_SHARD_BYTES);
+            inner[n2]->slot[n1]=soff; any_inner=1;
+        }
+        if(any_inner){ uint64_t ioff=a_put_at(b,inner[n2],MC_NODE_BYTES); root->slot[n2]=ioff; any_root=1; }
+    }
+    uint64_t root_off=0;
+    if(any_root) root_off=a_put_at(b,root,MC_NODE_BYTES);
+
+    // free RAM tree
+    for(int n2=0;n2<MC_GRID3;++n2){
+        if(shard[n2]){ for(int n1=0;n1<MC_GRID3;++n1) free(shard[n2][n1]); free(shard[n2]); }
+        free(inner[n2]);
+    }
+    free(shard); free(inner); free(root);
+    return root_off;
 }
 
 uint8_t *mc_build(mc_voxel_fn src, void *ud, const mc_build_opts *opts, size_t *out_len){
@@ -118,13 +185,12 @@ uint8_t *mc_build(mc_voxel_fn src, void *ud, const mc_build_opts *opts, size_t *
         return NULL;
     }
     mc_codec_init(); mc_set_quality(opts->quality);
-    // materialize LOD0 from the source callback.
     u8 *lod0=malloc((size_t)V*V*V);
     if(!lod0){ fprintf(stderr,"mc_build: OOM allocating %dx%dx%d\n",V,V,V); return NULL; }
     for(int z=0;z<V;++z)for(int y=0;y<V;++y)for(int x=0;x<V;++x)
         lod0[((size_t)z*V+y)*V+x]=src(ud,x,y,z);
 
-    abuf b={0}; a_zero(&b,MC_META_END);    // reserve header + metadata region; data starts at 128KB
+    abuf b={0}; a_zero(&b,MC_META_END);
     size_t mlen=0;
     if(opts->metadata && opts->meta_len){
         mlen=opts->meta_len;
@@ -133,20 +199,22 @@ uint8_t *mc_build(mc_voxel_fn src, void *ud, const mc_build_opts *opts, size_t *
     }
     uint64_t roots[8]={0};
     const u8 *cur=lod0; u8 *owned=NULL; int d=V;
-    for(int lod=0; lod<8 && d>=MC_BLK; ++lod){
-        vol_t vv={cur,d}; g_nchunks=(d+255)/256;
-        roots[lod]=write_node(&b,&vv,MC_SPARSE_LEVELS-1,0,0,0);
-        if(d/2<MC_BLK){ ++lod; break; }
+    for(int lod=0; lod<8 && d>=MC_CHUNK; ++lod){
+        vol_t vv={cur,d}; int nchunks=(d+255)/256;
+        roots[lod]=build_lod_dense(&b,&vv,nchunks);
+        if(d/2<MC_CHUNK){ break; }
         u8 *next=decimate(cur,d);
         if(owned) free(owned); owned=next; cur=next; d/=2;
     }
     if(owned) free(owned);
     free(lod0);
+    float q=opts->quality;
     a_u32(&b,MCH_MAGIC,MC_MAGIC); a_u32(&b,MCH_VER,MC_VERSION);
     a_u32(&b,MCH_NX,V); a_u32(&b,MCH_NY,V); a_u32(&b,MCH_NZ,V);
     for(int l=0;l<8;++l) a_u64(&b,MCH_ROOTOFF+l*8,roots[l]);
     a_u64(&b,MCH_TOTLEN,b.len);
     a_u64(&b,MCH_METAOFF,MC_HDR); a_u64(&b,MCH_METACAP,MC_META_CAP); a_u64(&b,MCH_METALEN,mlen);
+    memcpy(b.p+MCH_QUALITY,&q,4);
     if(out_len) *out_len=b.len;
     return b.p;
 }
@@ -159,31 +227,303 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
     return 0;
 }
 
-// ---------------------------------------------------------------- reader
+// ============================================================================
+// APPENDABLE WRITER — persistent mmap'd archive, modeled on volume-compressor.
+// ============================================================================
+#if MC_HAVE_MMAP
+
+#define MC_RESERVE   (10ull*1024*1024*1024*1024)   // 10 TiB virtual reservation (NORESERVE)
+#define MC_GROW_STEP (1ull*1024*1024*1024)          // grow the file 1 GiB at a time
+
+struct mc_writer {
+    int fd;
+    u8 *base;                  // fixed mmap base (never moves)
+    _Atomic uint64_t cursor;   // append EOF (bytes used)
+    _Atomic uint64_t file_len; // current ftruncate'd file size
+    int dim;
+    float quality;
+    pthread_mutex_t grow_mu;   // serializes ftruncate
+};
+
+static int w_ensure(mc_writer *w, uint64_t need){
+    uint64_t fl = atomic_load_explicit(&w->file_len, memory_order_acquire);
+    if(need <= fl) return 0;
+    pthread_mutex_lock(&w->grow_mu);
+    fl = atomic_load_explicit(&w->file_len, memory_order_relaxed);
+    if(need > fl){
+        uint64_t nf = fl;
+        while(nf < need) nf += MC_GROW_STEP;
+        if(ftruncate(w->fd, (off_t)nf) != 0){ pthread_mutex_unlock(&w->grow_mu); return -1; }
+        atomic_store_explicit(&w->file_len, nf, memory_order_release);
+    }
+    pthread_mutex_unlock(&w->grow_mu);
+    return 0;
+}
+// reserve a disjoint [off, off+n) range at EOF, growing the file as needed.
+static uint64_t w_alloc(mc_writer *w, uint64_t n){
+    uint64_t off = atomic_fetch_add_explicit(&w->cursor, n, memory_order_relaxed);
+    if(w_ensure(w, off+n)!=0) return ~0ull;
+    return off;
+}
+static void w_write_u64(mc_writer *w, uint64_t at, uint64_t v){ memcpy(w->base+at,&v,8); }
+static uint64_t w_read_u64(mc_writer *w, uint64_t at){ uint64_t v; memcpy(&v,w->base+at,8); return v; }
+
+// growable sink wrapping a writer EOF append (used by encode_chunk_blob via a staging
+// buffer; we encode to RAM first then memcpy the whole blob into one EOF range so the
+// chunk payload is contiguous + committed atomically).
+typedef struct { u8 *p; size_t len, cap; } stage_t;
+static void stage_put(void *out, const void *s, size_t n){
+    stage_t *st=(stage_t*)out;
+    if(st->len+n>st->cap){ size_t nc=st->cap?st->cap*2:1<<16; while(nc<st->len+n)nc*=2; st->p=realloc(st->p,nc); st->cap=nc; }
+    memcpy(st->p+st->len,s,n); st->len+=n;
+}
+
+// ensure the index path root->inner->shard exists for (lod,cz,cy,cx); return the file
+// offset of the SHARD-table slot that will hold the chunk offset. Creates dense node
+// tables in place as needed (allocated zeroed at EOF, parent slot published last).
+static uint64_t w_ensure_shard_slot(mc_writer *w, int lod, int cz,int cy,int cx){
+    uint64_t root = w_read_u64(w, MCH_ROOTOFF + (uint64_t)lod*8);
+    if(!root){
+        uint64_t no = w_alloc(w, MC_NODE_BYTES); if(no==~0ull) return ~0ull;
+        memset(w->base+no, 0, MC_NODE_BYTES);
+        // publish root in the header (single writer per (lod) path here; appends to the
+        // same lod are serialized by the caller's per-writer use, but be safe: only set
+        // if still empty).
+        w_write_u64(w, MCH_ROOTOFF+(uint64_t)lod*8, no);
+        root = no;
+    }
+    // walk nibble 2 (root) -> nibble 1 (inner) -> nibble 0 (shard slot).
+    uint64_t node = root;
+    for(int nib=MC_TREE_LEVELS-1; nib>=1; --nib){
+        int idx=(mc_nib(cz,nib)*16+mc_nib(cy,nib))*16+mc_nib(cx,nib);
+        uint64_t child = w_read_u64(w, node + (uint64_t)idx*8);
+        if(!child){
+            uint64_t no = w_alloc(w, MC_NODE_BYTES); if(no==~0ull) return ~0ull;
+            memset(w->base+no, 0, MC_NODE_BYTES);
+            w_write_u64(w, node + (uint64_t)idx*8, no);   // publish child slot
+            child = no;
+        }
+        node = child;
+    }
+    int n0=(mc_nib(cz,0)*16+mc_nib(cy,0))*16+mc_nib(cx,0);
+    return node + (uint64_t)n0*8;   // address of the shard slot for this chunk
+}
+
+// append a finished compressed blob at EOF + publish it in the shard slot (commit word).
+static int w_install_blob(mc_writer *w,int lod,int cz,int cy,int cx,const u8 *blob,size_t len){
+    uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
+    if(slot==~0ull) return -1;
+    uint64_t off = w_alloc(w, len);
+    if(off==~0ull) return -1;
+    memcpy(w->base+off, blob, len);
+    // release fence so the payload bytes are visible before the commit word.
+    atomic_thread_fence(memory_order_release);
+    w_write_u64(w, slot, off);   // publish chunk offset = commit
+    // keep the header's total length current so the file is valid if reopened now.
+    uint64_t cur = atomic_load_explicit(&w->cursor, memory_order_relaxed);
+    w_write_u64(w, MCH_TOTLEN, cur);
+    return 0;
+}
+
+mc_writer *mc_writer_open(const char *path, int dim, float quality){
+    if(dim % MC_CHUNK_ALIGN != 0){
+        fprintf(stderr,"mc_writer_open: dim %d not a multiple of %d\n",dim,MC_CHUNK_ALIGN); return NULL;
+    }
+    mc_codec_init(); mc_set_quality(quality);
+    int fd = open(path, O_RDWR|O_CREAT, 0644);
+    if(fd<0){ perror("mc_writer_open: open"); return NULL; }
+    struct stat sb; if(fstat(fd,&sb)!=0){ perror("fstat"); close(fd); return NULL; }
+    int fresh = (sb.st_size==0);
+    uint64_t init_len;
+    if(fresh){
+        init_len = MC_META_END;   // header + metadata region; data appends after.
+        if(ftruncate(fd,(off_t)init_len)!=0){ perror("ftruncate"); close(fd); return NULL; }
+    } else {
+        init_len = (uint64_t)sb.st_size;
+    }
+    u8 *base = mmap(NULL, MC_RESERVE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_NORESERVE, fd, 0);
+    if(base==MAP_FAILED){ perror("mmap"); close(fd); return NULL; }
+
+    mc_writer *w = calloc(1,sizeof *w);
+    w->fd=fd; w->base=base; w->dim=dim; w->quality=quality;
+    pthread_mutex_init(&w->grow_mu,NULL);
+    atomic_store(&w->file_len, init_len);
+
+    if(fresh){
+        memset(base,0,MC_HDR);
+        uint32_t magic=MC_MAGIC, ver=MC_VERSION, d=(uint32_t)dim;
+        memcpy(base+MCH_MAGIC,&magic,4); memcpy(base+MCH_VER,&ver,4);
+        memcpy(base+MCH_NX,&d,4); memcpy(base+MCH_NY,&d,4); memcpy(base+MCH_NZ,&d,4);
+        uint64_t z=0; for(int l=0;l<8;++l) memcpy(base+MCH_ROOTOFF+l*8,&z,8);
+        uint64_t metaoff=MC_HDR, metacap=MC_META_CAP, totlen=MC_META_END;
+        memcpy(base+MCH_METAOFF,&metaoff,8); memcpy(base+MCH_METACAP,&metacap,8);
+        memcpy(base+MCH_METALEN,&z,8); memcpy(base+MCH_TOTLEN,&totlen,8);
+        memcpy(base+MCH_QUALITY,&quality,4);
+        atomic_store(&w->cursor, MC_META_END);
+    } else {
+        uint32_t magic; memcpy(&magic,base+MCH_MAGIC,4);
+        uint32_t ver;   memcpy(&ver,base+MCH_VER,4);
+        uint32_t d;     memcpy(&d,base+MCH_NX,4);
+        if(magic!=MC_MAGIC || ver!=MC_VERSION || (int)d!=dim){
+            fprintf(stderr,"mc_writer_open: %s is not a matching mc archive (magic/ver/dim)\n",path);
+            munmap(base,MC_RESERVE); close(fd); free(w); return NULL;
+        }
+        uint64_t totlen; memcpy(&totlen,base+MCH_TOTLEN,8);
+        if(totlen < MC_META_END) totlen=MC_META_END;
+        atomic_store(&w->cursor, totlen);
+    }
+    return w;
+}
+
+int mc_append_chunk_compressed(mc_writer *w, int lod, int cz,int cy,int cx,
+                               const uint8_t *blob, size_t len){
+    if(!w||lod<0||lod>7||!blob||!len) return -1;
+    return w_install_blob(w,lod,cz,cy,cx,blob,len);
+}
+
+int mc_append_chunk_raw(mc_writer *w, int lod, int cz,int cy,int cx, const mc_u8 vox[256*256*256]){
+    if(!w||lod<0||lod>7||!vox) return -1;
+    mc_set_quality(w->quality);
+    stage_t st={0};
+    size_t blen = encode_chunk_blob(vox, stage_put, &st);
+    int rc = 0;
+    if(blen) rc = w_install_blob(w,lod,cz,cy,cx,st.p,st.len);
+    // all-air chunk (blen==0): no blob, slot stays absent (decodes to zero). rc stays 0.
+    free(st.p);
+    return rc;
+}
+
+mc_cover mc_writer_chunk_coverage(mc_writer *w, int lod, int cz,int cy,int cx){
+    if(!w||lod<0||lod>7) return MC_ABSENT;
+    uint64_t root = w_read_u64(w, MCH_ROOTOFF+(uint64_t)lod*8);
+    return mc_resolve_chunk(w->base, root, cz,cy,cx) ? MC_PRESENT : MC_ABSENT;
+}
+
+void mc_writer_close(mc_writer *w){
+    if(!w) return;
+    uint64_t cur = atomic_load(&w->cursor);
+    w_write_u64(w, MCH_TOTLEN, cur);
+    msync(w->base, cur, MS_SYNC);
+    munmap(w->base, MC_RESERVE);
+    if(ftruncate(w->fd,(off_t)cur)!=0) perror("mc_writer_close: ftruncate");
+    close(w->fd);
+    pthread_mutex_destroy(&w->grow_mu);
+    free(w);
+}
+
+#else // !MC_HAVE_MMAP — appendable writer requires mmap/ftruncate.
+mc_writer *mc_writer_open(const char *p,int d,float q){ (void)p;(void)d;(void)q;
+    fprintf(stderr,"mc_writer: appendable writer requires a POSIX mmap platform\n"); return NULL; }
+int mc_append_chunk_raw(mc_writer*w,int l,int z,int y,int x,const mc_u8*v){ (void)w;(void)l;(void)z;(void)y;(void)x;(void)v; return -1; }
+int mc_append_chunk_compressed(mc_writer*w,int l,int z,int y,int x,const uint8_t*b,size_t n){ (void)w;(void)l;(void)z;(void)y;(void)x;(void)b;(void)n; return -1; }
+mc_cover mc_writer_chunk_coverage(mc_writer*w,int l,int z,int y,int x){ (void)w;(void)l;(void)z;(void)y;(void)x; return MC_ABSENT; }
+void mc_writer_close(mc_writer*w){ (void)w; }
+#endif
+
+// ============================================================================
+// READER (flat buffer + streaming byte-source)
+// ============================================================================
 const char *mc_metadata(const uint8_t *arc, size_t *out_len){
     uint64_t off,len; memcpy(&off,arc+MCH_METAOFF,8); memcpy(&len,arc+MCH_METALEN,8);
     if(!off) off=MC_HDR;
     if(out_len) *out_len=(size_t)len;
     return (const char*)(arc+off);
 }
-struct mc_reader { const uint8_t *arc; size_t len; uint64_t roots[8]; u8 *cmask; uint64_t cmask_key; };
+
+struct mc_reader {
+    const uint8_t *arc;        // flat mode: archive buffer; streaming: NULL
+    size_t len;
+    uint64_t roots[8];
+    mc_read_fn read; void *read_ud;   // streaming mode
+    u8 *cmask; uint64_t cmask_key;
+    // streaming scratch: a fetched window of the current chunk blob.
+    u8 *cbuf; uint64_t cbuf_off; uint64_t cbuf_len;
+};
+
 mc_reader *mc_open(const uint8_t *arc, size_t len){
     mc_codec_init();
     mc_reader *r=calloc(1,sizeof *r); r->arc=arc; r->len=len; r->cmask_key=~0ull;
     for(int l=0;l<8;++l) memcpy(&r->roots[l], arc+MCH_ROOTOFF+l*8, 8);
     return r;
 }
-void mc_close(mc_reader *r){ if(!r)return; free(r->cmask); free(r); }
+
+// streaming: fetch exactly len bytes at off into dst (via callback).
+static int sread(mc_reader *r, uint64_t off, uint32_t len, u8 *dst){
+    return r->read(r->read_ud, off, len, dst);
+}
+
+mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len){
+    mc_codec_init();
+    mc_reader *r=calloc(1,sizeof *r); r->read=read; r->read_ud=ud; r->len=(size_t)total_len; r->cmask_key=~0ull;
+    u8 hdr[MC_HDR];
+    if(read(ud,0,MC_HDR,hdr)!=0){ free(r); return NULL; }
+    uint32_t magic; memcpy(&magic,hdr+MCH_MAGIC,4);
+    if(magic!=MC_MAGIC){ free(r); return NULL; }
+    for(int l=0;l<8;++l) memcpy(&r->roots[l], hdr+MCH_ROOTOFF+l*8, 8);
+    return r;
+}
+
+void mc_close(mc_reader *r){ if(!r)return; free(r->cmask); free(r->cbuf); free(r); }
 void mc_reader_set_quality(mc_reader *r, float q){ (void)r; mc_set_quality(q); }
+
+// streaming chunk-offset resolve: pull node tables on demand (each is MC_NODE_BYTES).
+static uint64_t sresolve_chunk(mc_reader *r,int lod,int cz,int cy,int cx){
+    uint64_t node = r->roots[lod];
+    u8 tbl[MC_NODE_BYTES];
+    for(int nib=MC_TREE_LEVELS-1; nib>=0; --nib){
+        if(!node) return 0;
+        if(sread(r,node,MC_NODE_BYTES,tbl)!=0) return 0;
+        int idx=(mc_nib(cz,nib)*16+mc_nib(cy,nib))*16+mc_nib(cx,nib);
+        uint64_t child; memcpy(&child,tbl+(size_t)idx*8,8);
+        node=child;
+    }
+    return node;
+}
+
 uint64_t mc_chunk_offset(mc_reader *r,int lod,int cz,int cy,int cx){
     if(lod<0||lod>7) return 0;
-    return mc_resolve_chunk(r->arc,r->roots[lod],cz,cy,cx);
+    if(r->arc) return mc_resolve_chunk(r->arc,r->roots[lod],cz,cy,cx);
+    return sresolve_chunk(r,lod,cz,cy,cx);
 }
+
+// streaming: ensure the whole chunk blob at chunk_off is cached in r->cbuf, return ptr.
+static const u8 *sfetch_chunk(mc_reader *r, uint64_t chunk_off){
+    if(r->cbuf && r->cbuf_off==chunk_off) return r->cbuf;
+    // read the header words to size the blob, then fetch the whole blob in one GET.
+    u8 head[4]; if(sread(r,chunk_off,4,head)!=0) return NULL;
+    uint32_t ml; memcpy(&ml,head,4);
+    // fetch mask + bitmap to compute total length, then the full blob.
+    uint64_t bm_off = chunk_off + 4 + ml;
+    u8 bm[MC_BITMAP_BYTES];
+    if(sread(r,bm_off,MC_BITMAP_BYTES,bm)!=0) return NULL;
+    int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
+    u8 *lens=malloc((size_t)npresent*4);
+    if(npresent && sread(r,bm_off+MC_BITMAP_BYTES,(uint32_t)(npresent*4),lens)!=0){ free(lens); return NULL; }
+    uint64_t paybytes=0; for(int s=0;s<npresent;++s){ uint32_t l; memcpy(&l,lens+(size_t)s*4,4); paybytes+=l; }
+    free(lens);
+    uint64_t total = (bm_off+MC_BITMAP_BYTES+(uint64_t)npresent*4+paybytes) - chunk_off;
+    r->cbuf = realloc(r->cbuf, total);
+    if(sread(r,chunk_off,(uint32_t)total,r->cbuf)!=0) return NULL;
+    r->cbuf_off=chunk_off; r->cbuf_len=total;
+    return r->cbuf;
+}
+
 void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
     if(!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    // resolve the chunk-blob base pointer (flat mmap or streamed window).
+    const u8 *blob_base;       // points at the chunk blob start
+    uint64_t blob_origin;      // absolute archive offset of that blob start
+    if(r->arc){ blob_base=r->arc; blob_origin=0; }            // absolute offsets index into arc
+    else {
+        const u8 *cb = sfetch_chunk(r,chunk_off);
+        if(!cb){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+        blob_base = cb - chunk_off;   // so blob_base + abs_off lands inside the window
+        blob_origin = 0;
+    }
+    (void)blob_origin;
     if(r->cmask_key!=chunk_off){
         if(!r->cmask) r->cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-        uint32_t cml; const u8 *cmb=mc_chunk_mask(r->arc,chunk_off,&cml);
+        uint32_t cml; const u8 *cmb=mc_chunk_mask(blob_base,chunk_off,&cml);
         if(cmb) mc_dec_chunkmask(cmb,cml,r->cmask); else memset(r->cmask,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
         r->cmask_key=chunk_off;
     }
@@ -193,6 +533,6 @@ void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_
         rair[(z*MC_BLK+y)*MC_BLK+x]=r->cmask[ci];
     }
     uint64_t boff; uint32_t blen;
-    if(!mc_block_range(r->arc,chunk_off,bz,by,bx,&boff,&blen)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    mc_dec_block(r->arc+boff,rair,dst);
+    if(!mc_block_range(blob_base,chunk_off,bz,by,bx,&boff,&blen)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    mc_dec_block(blob_base+boff,rair,dst);
 }
