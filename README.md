@@ -23,7 +23,7 @@ dependencies beyond libm/pthreads:
   mmap arena, 64-way sharded, S3-FIFO eviction (CLOCK optional), batch
   update/resolve, async tickets with cancel, and an optional tick-phase mode
   (freeze/thaw) where render-phase reads are fully lock-free.
-- **sample + render** (`mc_sample.h`, `mc_render.h`) — volume-cartographer-
+- **sample + render**  — volume-cartographer-
   style surface rendering: generic point-grid renderer with plane and quad
   surface generators, nearest/trilinear filtering, min/mean/max/alpha
   compositing along surface normals, and LOD-matched rendering: the

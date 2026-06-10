@@ -17,8 +17,7 @@
 #define MC_VOLUME_H
 #include <stdint.h>
 #include <stddef.h>
-#include "mc_sample.h"
-#include "mc_render.h"
+#include "matter_compressor.h"
 
 #ifdef __cplusplus
 extern "C" {

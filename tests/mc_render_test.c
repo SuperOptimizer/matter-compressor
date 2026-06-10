@@ -1,7 +1,5 @@
 // mc_render/mc_sample tests: filters, plane + quad surfaces, compositing,
 // parallel==serial, cache-source parity with dense sampling.
-#include "../src/mc_sample.h"
-#include "../src/mc_render.h"
 #include "../src/matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,5 +1,4 @@
-#include "mc_sample.h"
-#include "mc_render.h"
+#include "matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>

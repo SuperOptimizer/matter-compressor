@@ -436,4 +436,212 @@ mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r);
 
 
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---------------------------------------------------------------------------
+// source: anything that can produce 16^3 blocks
+// ---------------------------------------------------------------------------
+// block() returns a pointer to the 4096-byte block at block coords
+// (bz,by,bx), in z-major (z*256 + y*16 + x) layout:
+//   - a stable pointer of its own (e.g. mc_cache arena), or
+//   - `tmp` after filling it (sources that must copy/decode), or
+//   - NULL for "no data here" (absent / pure air) — sampled as 0.
+// `tmp` is 4096 bytes of sampler-owned scratch, valid until the next
+// block() call on the same sampler. block() is called outside any lock the
+// sampler holds; it must tolerate out-of-range block coords (return NULL).
+typedef struct mc_sample_src mc_sample_src;
+struct mc_sample_src {
+    void *ud;                             // binding-private
+    int aux, aux2;                        // binding-private (lod, flags, ...)
+    const uint8_t *(*block)(const mc_sample_src *src,
+                            int bz, int by, int bx, uint8_t *tmp);
+    int nz, ny, nx;                       // voxel dims of the sampled level
+    // Optional direct path: when set, samplers address voxels straight off
+    // this base pointer (voxel (z,y,x) at dense[z*dsy + y*dsx + x]) and
+    // never call block(). mc_sample_src_dense sets it; blocked sources
+    // leave it NULL.
+    const uint8_t *dense;
+    size_t dsy, dsx;
+};
+
+// Ready-made sources:
+struct mc_cache;
+// mc_cache-backed (zero-copy arena pointers; decodes misses synchronously).
+// `lod` selects the level; pass that level's voxel dims.
+mc_sample_src mc_sample_src_cache(struct mc_cache *c, int lod,
+                                  int nz, int ny, int nx);
+// Dense C-order u8 array (no copies; blocks are synthesized in `tmp`).
+mc_sample_src mc_sample_src_dense(const uint8_t *vox, int nz, int ny, int nx);
+
+// ---------------------------------------------------------------------------
+// sampler
+// ---------------------------------------------------------------------------
+typedef struct mc_sampler mc_sampler;
+typedef enum { MC_FILTER_NEAREST = 0, MC_FILTER_TRILINEAR = 1 } mc_filter;
+
+mc_sampler *mc_sampler_new(const mc_sample_src *src);
+void        mc_sampler_free(mc_sampler *s);
+// Drop memoized block pointers (call when the source was invalidated, e.g.
+// after mc_cache_thaw/update cycles replaced chunks).
+void        mc_sampler_reset(mc_sampler *s);
+
+// One sample at (z,y,x). Out-of-bounds / NaN -> 0.
+float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f);
+
+// Batch: n points, zyx[i*3+{0,1,2}] = (z,y,x). Points with any coordinate
+// < 0 (volume-cartographer's invalid marker) or NaN write 0.
+void mc_sample_points(mc_sampler *s, const float *zyx, size_t n,
+                      mc_filter f, float *out);
+void mc_sample_points_u8(mc_sampler *s, const float *zyx, size_t n,
+                         mc_filter f, uint8_t *out);
+
+typedef enum {
+    MC_COMP_NONE  = 0,
+    MC_COMP_MIN   = 1,
+    MC_COMP_MEAN  = 2,
+    MC_COMP_MAX   = 3,
+    MC_COMP_ALPHA = 4,
+} mc_comp;
+
+typedef struct {
+    mc_filter filter;       // MC_FILTER_NEAREST / MC_FILTER_TRILINEAR
+    mc_comp   comp;         // reduction along the normal
+    float t0, t1;           // composite range along the normal, in voxels
+    float dt;               // step (<= 0 -> 1.0)
+    float alpha_min;        // MC_COMP_ALPHA: value threshold in [0,1)
+    float alpha_opacity;    // MC_COMP_ALPHA: per-sample opacity scale (0,1]
+} mc_render_params;
+
+// ---------------------------------------------------------------------------
+// core: dense point grid -> image
+// ---------------------------------------------------------------------------
+// pts: W*H*3 floats, (z,y,x) per pixel. normals: W*H*3 unit (z,y,x) or NULL
+// (required when comp != MC_COMP_NONE). A point with any coordinate < 0 or
+// NaN renders 0 (volume-cartographer's invalid marker). out: W*H bytes.
+void mc_render_points(mc_sampler *s,
+                      const float *pts, const float *normals,
+                      int w, int h, const mc_render_params *p, uint8_t *out);
+
+// Parallel variant: same image, row bands across `nthreads` workers
+// (0 -> one per core, capped at 16). Creates one sampler per worker over
+// `src` (mc_sampler is single-threaded); src->block must be thread-safe
+// (mc_cache is; a dense array trivially is).
+void mc_render_points_par(const mc_sample_src *src,
+                          const float *pts, const float *normals,
+                          int w, int h, const mc_render_params *p,
+                          uint8_t *out, int nthreads);
+
+// ---------------------------------------------------------------------------
+// plane surface (volume-cartographer PlaneSurface)
+// ---------------------------------------------------------------------------
+// A plane through `origin` with unit `normal`; `u` and `v` are the in-plane
+// pixel axes. mc_plane_basis() builds an arbitrary stable (u,v) orthonormal
+// pair from `normal` when you have no preferred orientation.
+typedef struct {
+    float origin[3];        // (z,y,x)
+    float normal[3];        // unit (z,y,x)
+    float u[3], v[3];       // unit in-plane axes: image x steps u, y steps v
+} mc_plane;
+
+void mc_plane_basis(mc_plane *pl);
+
+// Generate the W*H point grid (and constant normals, if non-NULL) for the
+// image whose pixel (i,j) sits at origin + (j - w/2)*scale*u +
+// (i - h/2)*scale*v. `scale` = voxels per pixel (1 = native).
+void mc_plane_gen(const mc_plane *pl, int w, int h, float scale,
+                  float *pts, float *normals);
+
+// ---------------------------------------------------------------------------
+// quad surface (volume-cartographer QuadSurface)
+// ---------------------------------------------------------------------------
+// A control grid of gw*gh 3D points (z,y,x), row-major, VC's invalid marker
+// (-1,-1,-1) honored. Rendering bilinearly interpolates the control grid to
+// the output resolution and derives per-pixel normals from the grid
+// tangents (du x dv, normalized) — VC's gen() contract.
+typedef struct {
+    const float *grid;      // gw*gh*3 (z,y,x)
+    int gw, gh;
+} mc_quad;
+
+// Generate a W*H point grid (+ normals, if non-NULL) sampling the control
+// grid over the rect [x0, x0+w*step) x [y0, y0+h*step) in grid units
+// (step = grid cells per pixel; 1 renders the grid at native density;
+// VC's render scale = 1/step). Pixels mapping outside the grid or onto
+// invalid control points emit invalid (-1,-1,-1) points.
+void mc_quad_gen(const mc_quad *q, float x0, float y0, float step,
+                 int w, int h, float *pts, float *normals);
+
+// ---------------------------------------------------------------------------
+// one-call conveniences (gen + parallel render, scratch managed internally)
+// ---------------------------------------------------------------------------
+int mc_render_plane(const mc_sample_src *src, const mc_plane *pl,
+                    int w, int h, float scale,
+                    const mc_render_params *p, uint8_t *out, int nthreads);
+int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
+                   float x0, float y0, float step, int w, int h,
+                   const mc_render_params *p, uint8_t *out, int nthreads);
+
+// ---------------------------------------------------------------------------
+// LOD-matched rendering
+// ---------------------------------------------------------------------------
+// Zoomed-out views shouldn't sample the finest level: at `vox_per_pixel`
+// voxels per output pixel, level floor(log2(vox_per_pixel)) carries all the
+// information the image can show, with 8x fewer voxels per level. Geometry
+// stays in LOD-0 voxel space; the renderer picks the level, remaps
+// coordinates (half-voxel-center correct: c_L = (c_0 + 0.5)/2^L - 0.5) and
+// scales the composite range so the slab covers the same physical depth,
+// stepped at the sampled level's voxel pitch.
+typedef struct {
+    mc_sample_src lods[8];      // [0] = finest; dims halve per level
+    int nlods;
+} mc_sample_lods;
+
+// ---------------------------------------------------------------------------
+// 3D resampling (surface-aligned volumes)
+// ---------------------------------------------------------------------------
+// Composite rendering's ray walk without the reduction: keep every sample.
+//
+// mc_sample_quad_volume samples a w*h*nlayers u8 volume over the quad's
+// parameterization — pixel (i,j) of layer k samples P(i,j) + (t0 + k*dt) *
+// N(i,j), i.e. the "flattened surface volume" ink-detection models consume.
+// out is layer-major: out[k*w*h + i*w + j]. Invalid surface points write 0
+// through all layers.
+int mc_sample_quad_volume(const mc_sample_src *src, const mc_quad *q,
+                          float x0, float y0, float step, int w, int h,
+                          float t0, float dt, int nlayers,
+                          mc_filter f, uint8_t *out, int nthreads);
+
+// Oriented-box resample: out voxel (k,i,j) samples origin + j*du + i*dv +
+// k*dw (axes in voxels; need not be unit or orthogonal). out[k*w*h + i*w + j].
+// The surface-normal-aligned ML crop primitive; with unit axes and integer
+// origin it degenerates to a plain copy.
+int mc_sample_box(const mc_sample_src *src,
+                  const float origin[3], const float du[3],
+                  const float dv[3], const float dw[3],
+                  int w, int h, int d,
+                  mc_filter f, uint8_t *out, int nthreads);
+
+// floor(log2(vox_per_pixel)) clamped to [0, nlods-1]; <2 vox/px -> 0.
+int mc_render_pick_lod(const mc_sample_lods *ls, float vox_per_pixel);
+
+// Mean LOD-0 voxel spacing of one rendered pixel step across the quad's
+// control grid (sparse probe; multiply by your render step).
+float mc_quad_spacing(const mc_quad *q);
+
+// As mc_render_plane / mc_render_quad, but sampling the LOD matched to
+// the render scale (plane: vox/px = scale; quad: step * mc_quad_spacing).
+int mc_render_plane_lod(const mc_sample_lods *ls, const mc_plane *pl,
+                        int w, int h, float scale,
+                        const mc_render_params *p, uint8_t *out, int nthreads);
+int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
+                       float x0, float y0, float step, int w, int h,
+                       const mc_render_params *p, uint8_t *out, int nthreads);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif // MATTER_COMPRESSOR_H

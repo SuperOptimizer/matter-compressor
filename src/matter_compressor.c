@@ -3182,3 +3182,1255 @@ mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r){
     c->rd=r; c->src=src_reader; c->src_ud=c;
     return c;
 }
+
+// ============================================================================
+// mc_sample — point sampling over blocked u8 volumes (see header)
+// ============================================================================
+#include <unistd.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
+#define MC_S_MEMO 256   // covers an oblique 1024-px row's block working set
+
+typedef struct {
+    int bz, by, bx;             // -1 = empty
+    const uint8_t *ptr;         // NULL = known-absent (sampled as 0)
+    uint8_t buf[4096];
+} mc_s_memo;
+
+struct mc_sampler {
+    mc_sample_src src;
+    int nbz, nby, nbx;
+    int lbz, lby, lbx;          // last block touched (ray-coherence cache)
+    const uint8_t *lptr;
+    mc_s_memo m[MC_S_MEMO];
+};
+
+static inline const uint8_t *mc_s_block(mc_sampler *s, int bz, int by, int bx) {
+    if (bz == s->lbz && by == s->lby && bx == s->lbx) return s->lptr;
+    unsigned h = ((unsigned)bz * 73856093u) ^ ((unsigned)by * 19349663u) ^
+                 ((unsigned)bx * 83492791u);
+    mc_s_memo *e = &s->m[h & (MC_S_MEMO - 1)];
+    if (!(e->bz == bz && e->by == by && e->bx == bx)) {
+        e->bz = bz; e->by = by; e->bx = bx;
+        e->ptr = s->src.block(&s->src, bz, by, bx, e->buf);
+    }
+    s->lbz = bz; s->lby = by; s->lbx = bx; s->lptr = e->ptr;
+    return e->ptr;
+}
+
+static inline float mc_s_voxel(mc_sampler *s, int z, int y, int x) {
+    if ((unsigned)z >= (unsigned)s->src.nz ||
+        (unsigned)y >= (unsigned)s->src.ny ||
+        (unsigned)x >= (unsigned)s->src.nx) return 0.0f;
+    if (s->src.dense)
+        return (float)s->src.dense[(size_t)z * s->src.dsy +
+                                   (size_t)y * s->src.dsx + (size_t)x];
+    const uint8_t *b = mc_s_block(s, z >> 4, y >> 4, x >> 4);
+    return b ? (float)b[((z & 15) << 8) | ((y & 15) << 4) | (x & 15)] : 0.0f;
+}
+
+static inline float mc_s_nearest(mc_sampler *s, float z, float y, float x) {
+    return mc_s_voxel(s, (int)floorf(z + 0.5f), (int)floorf(y + 0.5f),
+                      (int)floorf(x + 0.5f));
+}
+
+static inline float mc_s_trilinear(mc_sampler *s, float z, float y, float x) {
+    float zf = floorf(z), yf = floorf(y), xf = floorf(x);
+    int z0 = (int)zf, y0 = (int)yf, x0 = (int)xf;
+    float dz = z - zf, dy = y - yf, dx = x - xf;
+    // dense fast path: direct strided gather, only a bounds check
+    if (s->src.dense &&
+        (unsigned)z0 < (unsigned)(s->src.nz - 1) &&
+        (unsigned)y0 < (unsigned)(s->src.ny - 1) &&
+        (unsigned)x0 < (unsigned)(s->src.nx - 1)) {
+        const size_t sy = s->src.dsy, sx = s->src.dsx;
+        const uint8_t *p = s->src.dense + (size_t)z0 * sy + (size_t)y0 * sx + x0;
+        float c00 = (float)p[0]      + ((float)p[1]        - (float)p[0])      * dx;
+        float c01 = (float)p[sx]     + ((float)p[sx + 1]   - (float)p[sx])     * dx;
+        float c10 = (float)p[sy]     + ((float)p[sy + 1]   - (float)p[sy])     * dx;
+        float c11 = (float)p[sy + sx] + ((float)p[sy + sx + 1] - (float)p[sy + sx]) * dx;
+        float c0 = c00 + (c01 - c00) * dy;
+        float c1 = c10 + (c11 - c10) * dy;
+        return c0 + (c1 - c0) * dz;
+    }
+    // blocked fast path: all 8 corners inside one block and in bounds (~82%
+    // of uniformly distributed samples; far more for coherent rays)
+    if (!s->src.dense &&
+        (unsigned)z0 < (unsigned)(s->src.nz - 1) &&
+        (unsigned)y0 < (unsigned)(s->src.ny - 1) &&
+        (unsigned)x0 < (unsigned)(s->src.nx - 1) &&
+        (z0 & 15) != 15 && (y0 & 15) != 15 && (x0 & 15) != 15) {
+        const uint8_t *b = mc_s_block(s, z0 >> 4, y0 >> 4, x0 >> 4);
+        if (!b) return 0.0f;
+        const uint8_t *p = b + (((z0 & 15) << 8) | ((y0 & 15) << 4) | (x0 & 15));
+        float c00 = (float)p[0]   + ((float)p[1]   - (float)p[0])   * dx;
+        float c01 = (float)p[16]  + ((float)p[17]  - (float)p[16])  * dx;
+        float c10 = (float)p[256] + ((float)p[257] - (float)p[256]) * dx;
+        float c11 = (float)p[272] + ((float)p[273] - (float)p[272]) * dx;
+        float c0 = c00 + (c01 - c00) * dy;
+        float c1 = c10 + (c11 - c10) * dy;
+        return c0 + (c1 - c0) * dz;
+    }
+    // slow path: block/bounds handled per corner (edges mix with 0)
+    float c000 = mc_s_voxel(s, z0, y0, x0);
+    float c001 = mc_s_voxel(s, z0, y0, x0 + 1);
+    float c010 = mc_s_voxel(s, z0, y0 + 1, x0);
+    float c011 = mc_s_voxel(s, z0, y0 + 1, x0 + 1);
+    float c100 = mc_s_voxel(s, z0 + 1, y0, x0);
+    float c101 = mc_s_voxel(s, z0 + 1, y0, x0 + 1);
+    float c110 = mc_s_voxel(s, z0 + 1, y0 + 1, x0);
+    float c111 = mc_s_voxel(s, z0 + 1, y0 + 1, x0 + 1);
+    float c00 = c000 + (c001 - c000) * dx;
+    float c01 = c010 + (c011 - c010) * dx;
+    float c10 = c100 + (c101 - c100) * dx;
+    float c11 = c110 + (c111 - c110) * dx;
+    float c0 = c00 + (c01 - c00) * dy;
+    float c1 = c10 + (c11 - c10) * dy;
+    return c0 + (c1 - c0) * dz;
+}
+
+static inline float mc_s_sample(mc_sampler *s, float z, float y, float x,
+                                mc_filter f) {
+    if (!(z == z) || !(y == y) || !(x == x)) return 0.0f;   // NaN
+    return f == MC_FILTER_NEAREST ? mc_s_nearest(s, z, y, x)
+                                  : mc_s_trilinear(s, z, y, x);
+}
+
+// ---------------------------------------------------------------------------
+// 4-wide trilinear (ray-step batching for the compositors)
+// ---------------------------------------------------------------------------
+// Sample 4 positions at once. Lanes that qualify for a fast path are
+// gathered and lerped with NEON; anything else (edges, absent blocks,
+// non-aarch64) falls back to the scalar sampler per lane. Uses separate
+// mul+add (no fma), so every lane is bit-identical to mc_s_trilinear.
+#if defined(__aarch64__)
+static inline float32x4_t mc_s_lerp8x4(const uint8_t *p0, const uint8_t *p1,
+                                       const uint8_t *p2, const uint8_t *p3,
+                                       size_t sy, size_t sx,
+                                       float32x4_t dz, float32x4_t dy,
+                                       float32x4_t dx) {
+    uint16x4_t g00 = vdup_n_u16(0), g01 = vdup_n_u16(0);
+    uint16x4_t g10 = vdup_n_u16(0), g11 = vdup_n_u16(0);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p0, g00, 0);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p1, g00, 1);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p2, g00, 2);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p3, g00, 3);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p0 + sx), g01, 0);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p1 + sx), g01, 1);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p2 + sx), g01, 2);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p3 + sx), g01, 3);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p0 + sy), g10, 0);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p1 + sy), g10, 1);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p2 + sy), g10, 2);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p3 + sy), g10, 3);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p0 + sy + sx), g11, 0);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p1 + sy + sx), g11, 1);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p2 + sy + sx), g11, 2);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p3 + sy + sx), g11, 3);
+    uint16x8_t w00 = vmovl_u8(vreinterpret_u8_u16(g00));
+    uint16x8_t w01 = vmovl_u8(vreinterpret_u8_u16(g01));
+    uint16x8_t w10 = vmovl_u8(vreinterpret_u8_u16(g10));
+    uint16x8_t w11 = vmovl_u8(vreinterpret_u8_u16(g11));
+#define MC_S_F32E(w) vcvtq_f32_u32(vmovl_u16(vuzp1_u16(vget_low_u16(w), vget_high_u16(w))))
+#define MC_S_F32O(w) vcvtq_f32_u32(vmovl_u16(vuzp2_u16(vget_low_u16(w), vget_high_u16(w))))
+    float32x4_t f000 = MC_S_F32E(w00), f001 = MC_S_F32O(w00);
+    float32x4_t f010 = MC_S_F32E(w01), f011 = MC_S_F32O(w01);
+    float32x4_t f100 = MC_S_F32E(w10), f101 = MC_S_F32O(w10);
+    float32x4_t f110 = MC_S_F32E(w11), f111 = MC_S_F32O(w11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    float32x4_t c00 = vaddq_f32(f000, vmulq_f32(vsubq_f32(f001, f000), dx));
+    float32x4_t c01 = vaddq_f32(f010, vmulq_f32(vsubq_f32(f011, f010), dx));
+    float32x4_t c10 = vaddq_f32(f100, vmulq_f32(vsubq_f32(f101, f100), dx));
+    float32x4_t c11 = vaddq_f32(f110, vmulq_f32(vsubq_f32(f111, f110), dx));
+    float32x4_t c0 = vaddq_f32(c00, vmulq_f32(vsubq_f32(c01, c00), dy));
+    float32x4_t c1 = vaddq_f32(c10, vmulq_f32(vsubq_f32(c11, c10), dy));
+    return vaddq_f32(c0, vmulq_f32(vsubq_f32(c1, c0), dz));
+}
+#elif defined(__SSE4_1__)
+static inline uint16_t mc_s_ld16(const uint8_t *p) {
+    uint16_t v; __builtin_memcpy(&v, p, 2); return v;
+}
+static inline __m128 mc_s_lerp8x4(const uint8_t *p0, const uint8_t *p1,
+                                  const uint8_t *p2, const uint8_t *p3,
+                                  size_t sy, size_t sx,
+                                  __m128 dz, __m128 dy, __m128 dx) {
+    // per corner-row: 4 samples' (c0,c1) byte pairs in u16 lanes 0..3
+    __m128i z = _mm_setzero_si128();
+    __m128i g00 = _mm_insert_epi16(z, mc_s_ld16(p0), 0);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p1), 1);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p2), 2);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p3), 3);
+    __m128i g01 = _mm_insert_epi16(z, mc_s_ld16(p0 + sx), 0);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p1 + sx), 1);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p2 + sx), 2);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p3 + sx), 3);
+    __m128i g10 = _mm_insert_epi16(z, mc_s_ld16(p0 + sy), 0);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p1 + sy), 1);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p2 + sy), 2);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p3 + sy), 3);
+    __m128i g11 = _mm_insert_epi16(z, mc_s_ld16(p0 + sy + sx), 0);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p1 + sy + sx), 1);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p2 + sy + sx), 2);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p3 + sy + sx), 3);
+    // split even bytes (x0 corner) / odd bytes (x1 corner) -> u32 -> f32
+    const __m128i me = _mm_set_epi8(-1, -1, -1, 6, -1, -1, -1, 4,
+                                    -1, -1, -1, 2, -1, -1, -1, 0);
+    const __m128i mo = _mm_set_epi8(-1, -1, -1, 7, -1, -1, -1, 5,
+                                    -1, -1, -1, 3, -1, -1, -1, 1);
+#define MC_S_F32E(g) _mm_cvtepi32_ps(_mm_shuffle_epi8(g, me))
+#define MC_S_F32O(g) _mm_cvtepi32_ps(_mm_shuffle_epi8(g, mo))
+    __m128 f000 = MC_S_F32E(g00), f001 = MC_S_F32O(g00);
+    __m128 f010 = MC_S_F32E(g01), f011 = MC_S_F32O(g01);
+    __m128 f100 = MC_S_F32E(g10), f101 = MC_S_F32O(g10);
+    __m128 f110 = MC_S_F32E(g11), f111 = MC_S_F32O(g11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    __m128 c00 = _mm_add_ps(f000, _mm_mul_ps(_mm_sub_ps(f001, f000), dx));
+    __m128 c01 = _mm_add_ps(f010, _mm_mul_ps(_mm_sub_ps(f011, f010), dx));
+    __m128 c10 = _mm_add_ps(f100, _mm_mul_ps(_mm_sub_ps(f101, f100), dx));
+    __m128 c11 = _mm_add_ps(f110, _mm_mul_ps(_mm_sub_ps(f111, f110), dx));
+    __m128 c0 = _mm_add_ps(c00, _mm_mul_ps(_mm_sub_ps(c01, c00), dy));
+    __m128 c1 = _mm_add_ps(c10, _mm_mul_ps(_mm_sub_ps(c11, c10), dy));
+    return _mm_add_ps(c0, _mm_mul_ps(_mm_sub_ps(c1, c0), dz));
+}
+
+#if defined(__AVX2__) && !defined(MC_S_NO_TRI8)
+// 8-wide variant for the x86-64-v3 fleet (Zen 3/4/5, 12th-gen+ Intel).
+#define MC_S_HAVE_TRI8 1
+static inline __m256i mc_s_g8(const uint8_t *const p[8], size_t off) {
+    __m128i lo = _mm_setzero_si128(), hi = lo;
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[0] + off), 0);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[1] + off), 1);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[2] + off), 2);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[3] + off), 3);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[4] + off), 0);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[5] + off), 1);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[6] + off), 2);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[7] + off), 3);
+    return _mm256_set_m128i(hi, lo);
+}
+static inline __m256 mc_s_lerp8x8(const uint8_t *const p[8],
+                                  size_t sy, size_t sx,
+                                  __m256 dz, __m256 dy, __m256 dx) {
+    __m256i g00 = mc_s_g8(p, 0),  g01 = mc_s_g8(p, sx);
+    __m256i g10 = mc_s_g8(p, sy), g11 = mc_s_g8(p, sy + sx);
+    // even byte of each u16 pair = x0 corner, odd = x1 (per 128-bit half)
+    const __m256i me = _mm256_broadcastsi128_si256(
+        _mm_set_epi8(-1, -1, -1, 6, -1, -1, -1, 4,
+                     -1, -1, -1, 2, -1, -1, -1, 0));
+    const __m256i mo = _mm256_broadcastsi128_si256(
+        _mm_set_epi8(-1, -1, -1, 7, -1, -1, -1, 5,
+                     -1, -1, -1, 3, -1, -1, -1, 1));
+#define MC_S_F32E(g) _mm256_cvtepi32_ps(_mm256_shuffle_epi8(g, me))
+#define MC_S_F32O(g) _mm256_cvtepi32_ps(_mm256_shuffle_epi8(g, mo))
+    __m256 f000 = MC_S_F32E(g00), f001 = MC_S_F32O(g00);
+    __m256 f010 = MC_S_F32E(g01), f011 = MC_S_F32O(g01);
+    __m256 f100 = MC_S_F32E(g10), f101 = MC_S_F32O(g10);
+    __m256 f110 = MC_S_F32E(g11), f111 = MC_S_F32O(g11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    __m256 c00 = _mm256_add_ps(f000, _mm256_mul_ps(_mm256_sub_ps(f001, f000), dx));
+    __m256 c01 = _mm256_add_ps(f010, _mm256_mul_ps(_mm256_sub_ps(f011, f010), dx));
+    __m256 c10 = _mm256_add_ps(f100, _mm256_mul_ps(_mm256_sub_ps(f101, f100), dx));
+    __m256 c11 = _mm256_add_ps(f110, _mm256_mul_ps(_mm256_sub_ps(f111, f110), dx));
+    __m256 c0 = _mm256_add_ps(c00, _mm256_mul_ps(_mm256_sub_ps(c01, c00), dy));
+    __m256 c1 = _mm256_add_ps(c10, _mm256_mul_ps(_mm256_sub_ps(c11, c10), dy));
+    return _mm256_add_ps(c0, _mm256_mul_ps(_mm256_sub_ps(c1, c0), dz));
+}
+#endif  /* __AVX2__ */
+#endif
+
+static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
+                             const float *px, float *out) {
+#if defined(__aarch64__)
+    float32x4_t zv = vld1q_f32(pz), yv = vld1q_f32(py), xv = vld1q_f32(px);
+    float32x4_t zf = vrndmq_f32(zv), yf = vrndmq_f32(yv), xf = vrndmq_f32(xv);
+    int32x4_t zi = vcvtq_s32_f32(zf), yi = vcvtq_s32_f32(yf),
+              xi = vcvtq_s32_f32(xf);
+    // all-lanes in-bounds check: 0 <= c < n-1 per axis
+    uint32x4_t ok = vcltq_u32(vreinterpretq_u32_s32(zi),
+                              vdupq_n_u32((unsigned)(s->src.nz - 1)));
+    ok = vandq_u32(ok, vcltq_u32(vreinterpretq_u32_s32(yi),
+                                 vdupq_n_u32((unsigned)(s->src.ny - 1))));
+    ok = vandq_u32(ok, vcltq_u32(vreinterpretq_u32_s32(xi),
+                                 vdupq_n_u32((unsigned)(s->src.nx - 1))));
+    if (vminvq_u32(ok) != 0) {
+        float32x4_t dz = vsubq_f32(zv, zf), dy = vsubq_f32(yv, yf),
+                    dx = vsubq_f32(xv, xf);
+        if (s->src.dense) {
+            int32_t z0[4], y0[4], x0[4];
+            vst1q_s32(z0, zi); vst1q_s32(y0, yi); vst1q_s32(x0, xi);
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            const uint8_t *base = s->src.dense;
+            vst1q_f32(out, mc_s_lerp8x4(
+                base + (size_t)z0[0] * sy + (size_t)y0[0] * sx + x0[0],
+                base + (size_t)z0[1] * sy + (size_t)y0[1] * sx + x0[1],
+                base + (size_t)z0[2] * sy + (size_t)y0[2] * sx + x0[2],
+                base + (size_t)z0[3] * sy + (size_t)y0[3] * sx + x0[3],
+                sy, sx, dz, dy, dx));
+            return;
+        }
+        // blocked: every lane's 8 corners must sit inside one block
+        uint32x4_t in15 = vmvnq_u32(vorrq_u32(vorrq_u32(
+            vceqq_s32(vandq_s32(zi, vdupq_n_s32(15)), vdupq_n_s32(15)),
+            vceqq_s32(vandq_s32(yi, vdupq_n_s32(15)), vdupq_n_s32(15))),
+            vceqq_s32(vandq_s32(xi, vdupq_n_s32(15)), vdupq_n_s32(15))));
+        if (vminvq_u32(in15) != 0) {
+            int32_t z0[4], y0[4], x0[4];
+            vst1q_s32(z0, zi); vst1q_s32(y0, yi); vst1q_s32(x0, xi);
+            const uint8_t *b[4];
+            int allb = 1;
+            for (int k = 0; k < 4; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { allb = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (allb) {
+                vst1q_f32(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
+                                            256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+#endif
+#if defined(__SSE4_1__) && !defined(__aarch64__)
+    __m128 zv = _mm_loadu_ps(pz), yv = _mm_loadu_ps(py), xv = _mm_loadu_ps(px);
+    __m128 zf = _mm_floor_ps(zv), yf = _mm_floor_ps(yv), xf = _mm_floor_ps(xv);
+    __m128i zi = _mm_cvttps_epi32(zf), yi = _mm_cvttps_epi32(yf),
+            xi = _mm_cvttps_epi32(xf);
+    // all-lanes 0 <= c < n-1 (signed compares; negatives fail the >= 0 side)
+    __m128i ok = _mm_and_si128(
+        _mm_cmpgt_epi32(zi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.nz - 1), zi));
+    ok = _mm_and_si128(ok, _mm_and_si128(
+        _mm_cmpgt_epi32(yi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.ny - 1), yi)));
+    ok = _mm_and_si128(ok, _mm_and_si128(
+        _mm_cmpgt_epi32(xi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.nx - 1), xi)));
+    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) {
+        __m128 dz = _mm_sub_ps(zv, zf), dy = _mm_sub_ps(yv, yf),
+               dx = _mm_sub_ps(xv, xf);
+        int32_t z0[4], y0[4], x0[4];
+        _mm_storeu_si128((__m128i *)z0, zi);
+        _mm_storeu_si128((__m128i *)y0, yi);
+        _mm_storeu_si128((__m128i *)x0, xi);
+        if (s->src.dense) {
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            const uint8_t *base = s->src.dense;
+            _mm_storeu_ps(out, mc_s_lerp8x4(
+                base + (size_t)z0[0] * sy + (size_t)y0[0] * sx + x0[0],
+                base + (size_t)z0[1] * sy + (size_t)y0[1] * sx + x0[1],
+                base + (size_t)z0[2] * sy + (size_t)y0[2] * sx + x0[2],
+                base + (size_t)z0[3] * sy + (size_t)y0[3] * sx + x0[3],
+                sy, sx, dz, dy, dx));
+            return;
+        }
+        int in15 = 1;
+        for (int k = 0; k < 4; k++)
+            in15 &= (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
+                    (x0[k] & 15) != 15;
+        if (in15) {
+            const uint8_t *b[4];
+            int allb = 1;
+            for (int k = 0; k < 4; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { allb = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (allb) {
+                _mm_storeu_ps(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
+                                                256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+#endif
+    out[0] = mc_s_trilinear(s, pz[0], py[0], px[0]);
+    out[1] = mc_s_trilinear(s, pz[1], py[1], px[1]);
+    out[2] = mc_s_trilinear(s, pz[2], py[2], px[2]);
+    out[3] = mc_s_trilinear(s, pz[3], py[3], px[3]);
+}
+
+#ifdef MC_S_HAVE_TRI8
+// 8 positions at once (AVX2). Same fallback discipline as mc_s_tri4.
+static inline void mc_s_tri8(mc_sampler *s, const float *pz, const float *py,
+                             const float *px, float *out) {
+    __m256 zv = _mm256_loadu_ps(pz), yv = _mm256_loadu_ps(py),
+           xv = _mm256_loadu_ps(px);
+    __m256 zf = _mm256_floor_ps(zv), yf = _mm256_floor_ps(yv),
+           xf = _mm256_floor_ps(xv);
+    __m256i zi = _mm256_cvttps_epi32(zf), yi = _mm256_cvttps_epi32(yf),
+            xi = _mm256_cvttps_epi32(xf);
+    __m256i ok = _mm256_and_si256(
+        _mm256_cmpgt_epi32(zi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.nz - 1), zi));
+    ok = _mm256_and_si256(ok, _mm256_and_si256(
+        _mm256_cmpgt_epi32(yi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.ny - 1), yi)));
+    ok = _mm256_and_si256(ok, _mm256_and_si256(
+        _mm256_cmpgt_epi32(xi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.nx - 1), xi)));
+    if (_mm256_movemask_ps(_mm256_castsi256_ps(ok)) == 0xFF) {
+        __m256 dz = _mm256_sub_ps(zv, zf), dy = _mm256_sub_ps(yv, yf),
+               dx = _mm256_sub_ps(xv, xf);
+        int32_t z0[8], y0[8], x0[8];
+        _mm256_storeu_si256((__m256i *)z0, zi);
+        _mm256_storeu_si256((__m256i *)y0, yi);
+        _mm256_storeu_si256((__m256i *)x0, xi);
+        const uint8_t *b[8];
+        if (s->src.dense) {
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            for (int k = 0; k < 8; k++)
+                b[k] = s->src.dense + (size_t)z0[k] * sy +
+                       (size_t)y0[k] * sx + x0[k];
+            _mm256_storeu_ps(out, mc_s_lerp8x8(b, sy, sx, dz, dy, dx));
+            return;
+        }
+        int fast = 1;
+        for (int k = 0; k < 8 && fast; k++)
+            fast = (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
+                   (x0[k] & 15) != 15;
+        if (fast) {
+            for (int k = 0; k < 8 && fast; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { fast = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (fast) {
+                _mm256_storeu_ps(out, mc_s_lerp8x8(b, 256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+    mc_s_tri4(s, pz, py, px, out);
+    mc_s_tri4(s, pz + 4, py + 4, px + 4, out + 4);
+}
+#endif
+
+
+#define BLK 16
+#define BLKB 4096
+
+// ---------------------------------------------------------------------------
+// sources
+// ---------------------------------------------------------------------------
+static const uint8_t *cache_block(const mc_sample_src *src,
+                                  int bz, int by, int bx, uint8_t *tmp) {
+    (void)tmp;
+    // mc_cache_get decodes misses synchronously and returns an arena pointer
+    // (non-owning; same stability contract as VC's BlockCache). In frozen
+    // tick-phase a miss returns NULL — sampled as 0, recorded as feedback.
+    return mc_cache_get((mc_cache *)src->ud, src->aux, bz, by, bx);
+}
+
+mc_sample_src mc_sample_src_cache(struct mc_cache *c, int lod,
+                                  int nz, int ny, int nx) {
+    mc_sample_src s = {0};
+    s.ud = c; s.aux = lod; s.block = cache_block;
+    s.nz = nz; s.ny = ny; s.nx = nx;
+    return s;
+}
+
+static const uint8_t *dense_block(const mc_sample_src *src,
+                                  int bz, int by, int bx, uint8_t *tmp) {
+    const uint8_t *vox = src->ud;
+    int z0 = bz * BLK, y0 = by * BLK, x0 = bx * BLK;
+    if (z0 >= src->nz || y0 >= src->ny || x0 >= src->nx) return NULL;
+    int dz = src->nz - z0 < BLK ? src->nz - z0 : BLK;
+    int dy = src->ny - y0 < BLK ? src->ny - y0 : BLK;
+    int dx = src->nx - x0 < BLK ? src->nx - x0 : BLK;
+    if (dz < BLK || dy < BLK || dx < BLK) memset(tmp, 0, BLKB);
+    for (int z = 0; z < dz; z++)
+        for (int y = 0; y < dy; y++)
+            memcpy(tmp + ((z << 8) | (y << 4)),
+                   vox + ((size_t)(z0 + z) * src->ny + (y0 + y)) * src->nx + x0,
+                   (size_t)dx);
+    return tmp;
+}
+
+mc_sample_src mc_sample_src_dense(const uint8_t *vox, int nz, int ny, int nx) {
+    mc_sample_src s = {0};
+    s.ud = (void *)(uintptr_t)vox;
+    s.block = dense_block;                // kept for completeness; the direct
+    s.dense = vox;                        // path below short-circuits it
+    s.dsy = (size_t)ny * nx; s.dsx = (size_t)nx;
+    s.nz = nz; s.ny = ny; s.nx = nx;
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// sampler
+// ---------------------------------------------------------------------------
+mc_sampler *mc_sampler_new(const mc_sample_src *src) {
+    if (!src || !src->block) return NULL;
+    mc_sampler *s = malloc(sizeof *s);
+    if (!s) return NULL;
+    s->src = *src;
+    s->nbz = (src->nz + BLK - 1) / BLK;
+    s->nby = (src->ny + BLK - 1) / BLK;
+    s->nbx = (src->nx + BLK - 1) / BLK;
+    mc_sampler_reset(s);
+    return s;
+}
+
+void mc_sampler_free(mc_sampler *s) { free(s); }
+
+void mc_sampler_reset(mc_sampler *s) {
+    if (!s) return;
+    for (int i = 0; i < MC_S_MEMO; i++) s->m[i].bz = -1;
+    s->lbz = s->lby = s->lbx = -1;
+    s->lptr = NULL;
+}
+
+float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f) {
+    return mc_s_sample(s, z, y, x, f);
+}
+
+static inline int pt_valid(const float *p) {
+    if (p[0] != p[0] || p[1] != p[1] || p[2] != p[2]) return 0;   // NaN
+    return p[0] >= 0.0f && p[1] >= 0.0f && p[2] >= 0.0f;
+}
+
+void mc_sample_points(mc_sampler *s, const float *zyx, size_t n,
+                      mc_filter f, float *out) {
+    if (f == MC_FILTER_NEAREST) {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            out[i] = pt_valid(p) ? mc_s_nearest(s, p[0], p[1], p[2]) : 0.0f;
+        }
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            out[i] = pt_valid(p) ? mc_s_trilinear(s, p[0], p[1], p[2]) : 0.0f;
+        }
+    }
+}
+
+void mc_sample_points_u8(mc_sampler *s, const float *zyx, size_t n,
+                         mc_filter f, uint8_t *out) {
+    if (f == MC_FILTER_NEAREST) {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            float v = pt_valid(p) ? mc_s_nearest(s, p[0], p[1], p[2]) : 0.0f;
+            out[i] = (uint8_t)(v < 0.0f ? 0 : v > 255.0f ? 255 : (int)(v + 0.5f));
+        }
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            float v = pt_valid(p) ? mc_s_trilinear(s, p[0], p[1], p[2]) : 0.0f;
+            out[i] = (uint8_t)(v < 0.0f ? 0 : v > 255.0f ? 255 : (int)(v + 0.5f));
+        }
+    }
+}
+
+// ============================================================================
+// mc_render — surface rendering, compositing, LOD, 3D resampling
+// ============================================================================
+// ---------------------------------------------------------------------------
+// core
+// ---------------------------------------------------------------------------
+static inline uint8_t to_u8(float v) {
+    return (uint8_t)(v < 0.0f ? 0 : v > 255.0f ? 255 : (int)(v + 0.5f));
+}
+
+// Per-image constants hoisted out of the pixel loop.
+typedef struct {
+    mc_filter filter;
+    mc_comp comp;
+    float t0, dt;
+    int nsteps;                 // iterations of the [t0, t1] dt walk
+    float a_min, a_op;          // alpha params, clamped
+} rcfg_t;
+
+static rcfg_t make_cfg(const mc_render_params *p) {
+    rcfg_t c;
+    c.filter = p->filter;
+    c.comp = p->comp;
+    c.dt = p->dt > 0.0f ? p->dt : 1.0f;
+    float t0 = p->t0, t1 = p->t1;
+    if (t1 < t0) { float tmp = t0; t0 = t1; t1 = tmp; }
+    c.t0 = t0;
+    c.nsteps = 0;
+    for (float t = t0; t <= t1 + 1e-4f; t += c.dt) c.nsteps++;
+    c.a_min = p->alpha_min < 0.0f ? 0.0f :
+              p->alpha_min > 0.99f ? 0.99f : p->alpha_min;
+    c.a_op  = p->alpha_opacity <= 0.0f ? 1.0f :
+              p->alpha_opacity > 1.0f ? 1.0f : p->alpha_opacity;
+    return c;
+}
+
+// Composite one ray. Trilinear rays are consumed in chunks of 4 steps via
+// mc_s_tri4 (NEON gather+lerp on aarch64, ~1.4x the scalar core); the
+// accumulation itself stays sequential per chunk, which keeps ALPHA\'s
+// front-to-back order and early-out exact. Positions are P + t*N with t
+// advanced additively, as before.
+static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
+                            const rcfg_t *cfg) {
+    if (!pt_valid(P)) return 0;
+    if (cfg->comp == MC_COMP_NONE || !N)
+        return to_u8(mc_s_sample(s, P[0], P[1], P[2], cfg->filter));
+    float nz = N[0], ny = N[1], nx = N[2];
+    float n2 = nz * nz + ny * ny + nx * nx;
+    if (n2 < 1e-12f)
+        return to_u8(mc_s_sample(s, P[0], P[1], P[2], cfg->filter));
+    if (n2 < 0.9998f || n2 > 1.0002f) {     // gen paths emit unit normals
+        float nl = 1.0f / sqrtf(n2);
+        nz *= nl; ny *= nl; nx *= nl;
+    }
+
+    const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
+    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
+          px = P[2] + cfg->t0 * nx;
+    const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
+    float acc = 0.0f, A = 0.0f, mn = 255.0f, mx = 0.0f, sum = 0.0f;
+    int it = 0, done = 0;
+
+    if (cfg->filter == MC_FILTER_TRILINEAR) {
+// NOTE: composites deliberately stay 4-wide. Measured on Zen 3 (EPYC
+        // 7763): 8-wide ray chunks ran 1.6x SLOWER than two independent 4-wide
+        // chunks (the 8-long insert-gather dependency chain over z-strided
+        // addresses serializes); 8-wide only wins for adjacent-pixel loads
+        // (the slice path below).
+        for (; it + 4 <= cfg->nsteps && !done; it += 4) {
+            float bz[4], by[4], bx[4], v4[4];
+            for (int k = 0; k < 4; k++) {
+                bz[k] = pz; by[k] = py; bx[k] = px;
+                pz += sz_; py += sy_; px += sx_;
+            }
+            mc_s_tri4(s, bz, by, bx, v4);
+            switch (cfg->comp) {
+            case MC_COMP_MIN:
+                for (int k = 0; k < 4; k++) if (v4[k] < mn) mn = v4[k];
+                break;
+            case MC_COMP_MAX:
+                for (int k = 0; k < 4; k++) if (v4[k] > mx) mx = v4[k];
+                if (mx >= 255.0f) done = 1;     // saturated
+                break;
+            case MC_COMP_MEAN:
+                sum += v4[0] + v4[1] + v4[2] + v4[3];
+                break;
+            default:                            // ALPHA
+                for (int k = 0; k < 4 && !done; k++) {
+                    float a = (v4[k] * (1.0f / 255.0f) - a_th) * a_sc;
+                    if (a > 0.0f) {
+                        if (a > 1.0f) a = 1.0f;
+                        acc += (1.0f - A) * a * v4[k];
+                        A   += (1.0f - A) * a;
+                        if (A >= 0.98f) done = 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    for (; it < cfg->nsteps && !done; it++) {
+        float v = mc_s_sample(s, pz, py, px, cfg->filter);
+        switch (cfg->comp) {
+        case MC_COMP_MIN:  if (v < mn) mn = v; break;
+        case MC_COMP_MAX:  if (v > mx) mx = v; break;
+        case MC_COMP_MEAN: sum += v; break;
+        default: {                              // ALPHA
+            float a = (v * (1.0f / 255.0f) - a_th) * a_sc;
+            if (a > 0.0f) {
+                if (a > 1.0f) a = 1.0f;
+                acc += (1.0f - A) * a * v;
+                A   += (1.0f - A) * a;
+                if (A >= 0.98f) done = 1;
+            }
+            break;
+        }
+        }
+        pz += sz_; py += sy_; px += sx_;
+    }
+    switch (cfg->comp) {
+    case MC_COMP_MIN:  return to_u8(mn);
+    case MC_COMP_MAX:  return to_u8(mx);
+    case MC_COMP_MEAN:
+        return to_u8(cfg->nsteps ? sum / (float)cfg->nsteps : 0.0f);
+    case MC_COMP_ALPHA: return to_u8(acc);
+    default:           return 0;
+    }
+}
+
+void mc_render_points(mc_sampler *s,
+                      const float *pts, const float *normals,
+                      int w, int h, const mc_render_params *p, uint8_t *out) {
+    rcfg_t cfg = make_cfg(p);
+    size_t n = (size_t)w * h;
+    if (cfg.comp == MC_COMP_NONE || !normals) {
+        // slice fast path: no per-pixel normal handling, branch on the
+        // filter once
+        if (cfg.filter == MC_FILTER_NEAREST) {
+            for (size_t k = 0; k < n; k++) {
+                const float *P = pts + k * 3;
+                out[k] = pt_valid(P)
+                             ? to_u8(mc_s_nearest(s, P[0], P[1], P[2])) : 0;
+            }
+        } else {
+            // 4/8 pixels per mc_s_tri4/8 call (SIMD gather+lerp)
+            size_t k = 0;
+#ifdef MC_S_HAVE_TRI8
+            for (; k + 8 <= n; k += 8) {
+                const float *P = pts + k * 3;
+                int allv = 1;
+                for (int q = 0; q < 8; q++) allv &= pt_valid(P + q * 3);
+                if (allv) {
+                    float bz[8], by[8], bx[8], v8[8];
+                    for (int q = 0; q < 8; q++) {
+                        bz[q] = P[q * 3]; by[q] = P[q * 3 + 1];
+                        bx[q] = P[q * 3 + 2];
+                    }
+                    mc_s_tri8(s, bz, by, bx, v8);
+                    for (int q = 0; q < 8; q++) out[k + q] = to_u8(v8[q]);
+                } else {
+                    for (size_t q = k; q < k + 8; q++) {
+                        const float *Q = pts + q * 3;
+                        out[q] = pt_valid(Q)
+                            ? to_u8(mc_s_trilinear(s, Q[0], Q[1], Q[2])) : 0;
+                    }
+                }
+            }
+#endif
+            for (; k + 4 <= n; k += 4) {
+                const float *P = pts + k * 3;
+                if (pt_valid(P) && pt_valid(P + 3) &&
+                    pt_valid(P + 6) && pt_valid(P + 9)) {
+                    float bz[4] = { P[0], P[3], P[6], P[9]  };
+                    float by[4] = { P[1], P[4], P[7], P[10] };
+                    float bx[4] = { P[2], P[5], P[8], P[11] };
+                    float v4[4];
+                    mc_s_tri4(s, bz, by, bx, v4);
+                    out[k]     = to_u8(v4[0]);
+                    out[k + 1] = to_u8(v4[1]);
+                    out[k + 2] = to_u8(v4[2]);
+                    out[k + 3] = to_u8(v4[3]);
+                } else {
+                    for (size_t q = k; q < k + 4; q++) {
+                        const float *Q = pts + q * 3;
+                        out[q] = pt_valid(Q)
+                            ? to_u8(mc_s_trilinear(s, Q[0], Q[1], Q[2])) : 0;
+                    }
+                }
+            }
+            for (; k < n; k++) {
+                const float *P = pts + k * 3;
+                out[k] = pt_valid(P)
+                             ? to_u8(mc_s_trilinear(s, P[0], P[1], P[2])) : 0;
+            }
+        }
+        return;
+    }
+    for (size_t k = 0; k < n; k++)
+        out[k] = render_pixel(s, pts + k * 3, normals + k * 3, &cfg);
+}
+
+// ---------------------------------------------------------------------------
+// parallel core: row bands, one sampler per worker
+// ---------------------------------------------------------------------------
+// rowgen fills one row of points (+normals) into band-local scratch; plane
+// and quad renders go through this so no W*H grid is ever materialized
+// (a 1024^2 trilinear frame otherwise mallocs and touches 24 MB of points).
+typedef void (*rowgen_fn)(const void *ud, int row, int w,
+                          float *pts, float *normals);
+
+typedef struct {
+    const mc_sample_src *src;
+    const float *pts, *normals;     // dense mode (rowgen == NULL)
+    rowgen_fn rowgen;               // strip mode
+    const void *rg_ud;
+    int w, h;
+    const mc_render_params *p;
+    uint8_t *out;
+    int row0, row1;
+} band_t;
+
+static void *band_main(void *ud) {
+    band_t *b = ud;
+    mc_sampler *s = mc_sampler_new(b->src);
+    if (!s) return NULL;
+    if (!b->rowgen) {
+        size_t off = (size_t)b->row0 * b->w;
+        mc_render_points(s, b->pts + off * 3,
+                         b->normals ? b->normals + off * 3 : NULL,
+                         b->w, b->row1 - b->row0, b->p, b->out + off);
+    } else {
+        int need_n = b->p->comp != MC_COMP_NONE;
+        float *row = malloc((size_t)b->w * 3 * sizeof(float) * (need_n ? 2 : 1));
+        if (row) {
+            float *nrm = need_n ? row + (size_t)b->w * 3 : NULL;
+            for (int i = b->row0; i < b->row1; i++) {
+                b->rowgen(b->rg_ud, i, b->w, row, nrm);
+                mc_render_points(s, row, nrm, b->w, 1, b->p,
+                                 b->out + (size_t)i * b->w);
+            }
+            free(row);
+        }
+        else memset(b->out + (size_t)b->row0 * b->w, 0,
+                    (size_t)(b->row1 - b->row0) * b->w);
+    }
+    mc_sampler_free(s);
+    return NULL;
+}
+
+static void render_bands(const mc_sample_src *src,
+                         const float *pts, const float *normals,
+                         rowgen_fn rowgen, const void *rg_ud,
+                         int w, int h, const mc_render_params *p,
+                         uint8_t *out, int nthreads) {
+    if (w <= 0 || h <= 0) return;
+    if (nthreads <= 0) {
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        nthreads = nc > 0 ? (int)nc : 1;
+    }
+    if (nthreads > 16) nthreads = 16;
+    if (nthreads > h)  nthreads = h;
+    pthread_t th[16];
+    band_t bands[16];
+    int per = (h + nthreads - 1) / nthreads;
+    int nb = 0;
+    for (int t = 0; t < nthreads; t++) {
+        int r0 = t * per, r1 = r0 + per > h ? h : r0 + per;
+        if (r0 >= r1) break;
+        bands[nb] = (band_t){ src, pts, normals, rowgen, rg_ud,
+                              w, h, p, out, r0, r1 };
+        if (nthreads == 1) { band_main(&bands[nb]); continue; }
+        if (pthread_create(&th[nb], NULL, band_main, &bands[nb]) != 0) {
+            band_main(&bands[nb]);          // degrade to inline
+            continue;
+        }
+        nb++;
+    }
+    for (int t = 0; t < nb; t++) pthread_join(th[t], NULL);
+}
+
+void mc_render_points_par(const mc_sample_src *src,
+                          const float *pts, const float *normals,
+                          int w, int h, const mc_render_params *p,
+                          uint8_t *out, int nthreads) {
+    render_bands(src, pts, normals, NULL, NULL, w, h, p, out, nthreads);
+}
+
+// ---------------------------------------------------------------------------
+// plane surface
+// ---------------------------------------------------------------------------
+static inline void v3_norm(float *v) {
+    float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 1e-12f) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+static inline void v3_cross(const float *a, const float *b, float *o) {
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+void mc_plane_basis(mc_plane *pl) {
+    float *n = pl->normal;
+    v3_norm(n);
+    // pick the world axis least aligned with n as the seed
+    float az = fabsf(n[0]), ay = fabsf(n[1]), ax = fabsf(n[2]);
+    float e[3] = {0, 0, 0};
+    if (az <= ay && az <= ax) e[0] = 1.0f;
+    else if (ay <= ax)        e[1] = 1.0f;
+    else                      e[2] = 1.0f;
+    v3_cross(n, e, pl->u); v3_norm(pl->u);
+    v3_cross(n, pl->u, pl->v); v3_norm(pl->v);
+}
+
+void mc_plane_gen(const mc_plane *pl, int w, int h, float scale,
+                  float *pts, float *normals) {
+    float cx = (float)w * 0.5f, cy = (float)h * 0.5f;
+    for (int i = 0; i < h; i++)
+        for (int j = 0; j < w; j++) {
+            float du = ((float)j - cx) * scale;
+            float dv = ((float)i - cy) * scale;
+            float *P = pts + ((size_t)i * w + j) * 3;
+            for (int k = 0; k < 3; k++)
+                P[k] = pl->origin[k] + du * pl->u[k] + dv * pl->v[k];
+            if (normals) {
+                float *N = normals + ((size_t)i * w + j) * 3;
+                N[0] = pl->normal[0]; N[1] = pl->normal[1]; N[2] = pl->normal[2];
+            }
+        }
+}
+
+// ---------------------------------------------------------------------------
+// quad surface
+// ---------------------------------------------------------------------------
+static inline int qvalid(const float *p) {
+    return !(p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f) &&
+           p[0] == p[0] && p[1] == p[1] && p[2] == p[2];
+}
+
+void mc_quad_gen(const mc_quad *q, float x0, float y0, float step,
+                 int w, int h, float *pts, float *normals) {
+    const int gw = q->gw, gh = q->gh;
+    for (int i = 0; i < h; i++) {
+        float *Prow = pts + (size_t)i * w * 3;
+        float *Nrow = normals ? normals + (size_t)i * w * 3 : NULL;
+        float gy = y0 + (float)i * step;
+        // row-invalid fast fill
+        if (!(gy >= 0.0f) || gy > (float)(gh - 1)) {
+            for (int j = 0; j < w; j++) {
+                Prow[j * 3] = Prow[j * 3 + 1] = Prow[j * 3 + 2] = -1.0f;
+                if (Nrow) Nrow[j * 3] = Nrow[j * 3 + 1] = Nrow[j * 3 + 2] = 0.0f;
+            }
+            continue;
+        }
+        int y0i = (int)gy;
+        if (y0i > gh - 2) y0i = gh - 2;
+        if (y0i < 0) y0i = 0;               // gh == 1
+        float fy = gy - (float)y0i;
+        const float *r0 = q->grid + (size_t)y0i * gw * 3;
+        const float *r1 = q->grid + (size_t)(y0i + (gh > 1)) * gw * 3;
+
+        // per-cell state, reloaded only when the pixel crosses a grid cell
+        int cell = -2, cell_ok = 0;
+        float A[3], B[3], du[3], dv0[3], dv1[3];
+        for (int j = 0; j < w; j++) {
+            float *P = Prow + j * 3;
+            float *N = Nrow ? Nrow + j * 3 : NULL;
+            P[0] = P[1] = P[2] = -1.0f;
+            if (N) N[0] = N[1] = N[2] = 0.0f;
+            float gx = x0 + (float)j * step;
+            if (!(gx >= 0.0f) || gx > (float)(gw - 1)) continue;
+            int x0i = (int)gx;
+            if (x0i > gw - 2) x0i = gw - 2;
+            if (x0i < 0) x0i = 0;           // gw == 1
+            if (x0i != cell) {
+                cell = x0i;
+                const float *p00 = r0 + (size_t)x0i * 3;
+                const float *p01 = r0 + (size_t)(x0i + (gw > 1)) * 3;
+                const float *p10 = r1 + (size_t)x0i * 3;
+                const float *p11 = r1 + (size_t)(x0i + (gw > 1)) * 3;
+                cell_ok = qvalid(p00) && qvalid(p01) &&
+                          qvalid(p10) && qvalid(p11);
+                if (cell_ok)
+                    for (int k = 0; k < 3; k++) {
+                        // y-lerped column endpoints: P = A + (B-A)*fx
+                        A[k] = p00[k] + (p10[k] - p00[k]) * fy;
+                        B[k] = p01[k] + (p11[k] - p01[k]) * fy;
+                        // bilinear tangents (du constant per cell row)
+                        du[k] = (p01[k] - p00[k]) * (1.0f - fy) +
+                                (p11[k] - p10[k]) * fy;
+                        dv0[k] = p10[k] - p00[k];
+                        dv1[k] = p11[k] - p01[k];
+                    }
+            }
+            if (!cell_ok) continue;
+            float fx = gx - (float)x0i;
+            P[0] = A[0] + (B[0] - A[0]) * fx;
+            P[1] = A[1] + (B[1] - A[1]) * fx;
+            P[2] = A[2] + (B[2] - A[2]) * fx;
+            if (N) {
+                float dv[3] = {
+                    dv0[0] + (dv1[0] - dv0[0]) * fx,
+                    dv0[1] + (dv1[1] - dv0[1]) * fx,
+                    dv0[2] + (dv1[2] - dv0[2]) * fx,
+                };
+                v3_cross(du, dv, N);
+                v3_norm(N);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// conveniences (row-strip rendering, no W*H grid)
+// ---------------------------------------------------------------------------
+typedef struct {
+    mc_plane pl;                // normal pre-normalized
+    float scale, cx, cy;
+} plane_rg;
+
+static void plane_rowgen(const void *ud, int row, int w,
+                         float *pts, float *normals) {
+    const plane_rg *g = ud;
+    float dv = ((float)row - g->cy) * g->scale;
+    float base[3], du[3];
+    for (int k = 0; k < 3; k++) {
+        base[k] = g->pl.origin[k] + dv * g->pl.v[k]
+                  - g->cx * g->scale * g->pl.u[k];
+        du[k] = g->scale * g->pl.u[k];
+    }
+    for (int j = 0; j < w; j++) {
+        pts[j * 3 + 0] = base[0] + (float)j * du[0];
+        pts[j * 3 + 1] = base[1] + (float)j * du[1];
+        pts[j * 3 + 2] = base[2] + (float)j * du[2];
+    }
+    if (normals)
+        for (int j = 0; j < w; j++) {
+            normals[j * 3 + 0] = g->pl.normal[0];
+            normals[j * 3 + 1] = g->pl.normal[1];
+            normals[j * 3 + 2] = g->pl.normal[2];
+        }
+}
+
+int mc_render_plane(const mc_sample_src *src, const mc_plane *pl,
+                    int w, int h, float scale,
+                    const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!src || !pl || !p || !out || w <= 0 || h <= 0) return -1;
+    plane_rg g = { *pl, scale, (float)w * 0.5f, (float)h * 0.5f };
+    v3_norm(g.pl.normal);
+    render_bands(src, NULL, NULL, plane_rowgen, &g, w, h, p, out, nthreads);
+    return 0;
+}
+
+typedef struct {
+    const mc_quad *q;
+    float x0, y0, step;
+} quad_rg;
+
+static void quad_rowgen(const void *ud, int row, int w,
+                        float *pts, float *normals) {
+    const quad_rg *g = ud;
+    mc_quad_gen(g->q, g->x0, g->y0 + (float)row * g->step, g->step,
+                w, 1, pts, normals);
+}
+
+int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
+                   float x0, float y0, float step, int w, int h,
+                   const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!src || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !p || !out || w <= 0 || h <= 0) return -1;
+    quad_rg g = { q, x0, y0, step };
+    render_bands(src, NULL, NULL, quad_rowgen, &g, w, h, p, out, nthreads);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// LOD-matched rendering
+// ---------------------------------------------------------------------------
+int mc_render_pick_lod(const mc_sample_lods *ls, float vox_per_pixel) {
+    if (!ls || ls->nlods <= 1) return 0;
+    int L = 0;
+    float v = vox_per_pixel;
+    while (v >= 2.0f && L < ls->nlods - 1) { v *= 0.5f; L++; }
+    // skip levels the caller left empty
+    while (L > 0 && (ls->lods[L].nz <= 0 || !ls->lods[L].block)) L--;
+    return L;
+}
+
+float mc_quad_spacing(const mc_quad *q) {
+    if (!q || !q->grid || q->gw < 2 || q->gh < 1) return 1.0f;
+    // probe up to 32 horizontal neighbor pairs along the grid diagonal
+    double sum = 0.0;
+    int n = 0;
+    int probes = q->gh < 32 ? q->gh : 32;
+    for (int i = 0; i < probes; i++) {
+        int gy = (int)(((int64_t)i * (q->gh - 1)) / (probes > 1 ? probes - 1 : 1));
+        int gx = (int)(((int64_t)i * (q->gw - 2)) / (probes > 1 ? probes - 1 : 1));
+        const float *a = q->grid + ((size_t)gy * q->gw + gx) * 3;
+        const float *b = a + 3;
+        if (!qvalid(a) || !qvalid(b)) continue;
+        float dz = b[0] - a[0], dy = b[1] - a[1], dx = b[2] - a[2];
+        sum += sqrtf(dz * dz + dy * dy + dx * dx);
+        n++;
+    }
+    return n ? (float)(sum / n) : 1.0f;
+}
+
+// wrap a rowgen: remap generated LOD-0 points into LOD-L voxel space.
+// c_L = c_0 * 2^-L + (0.5 * 2^-L - 0.5); border points that map a fraction
+// below 0 clamp to 0 (they are inside voxel 0 of the coarse level) instead
+// of tripping the <0 invalid convention.
+typedef struct {
+    rowgen_fn inner;
+    const void *inner_ud;
+    float a, b;
+} lod_rg;
+
+static void lod_rowgen(const void *ud, int row, int w,
+                       float *pts, float *normals) {
+    const lod_rg *g = ud;
+    g->inner(g->inner_ud, row, w, pts, normals);
+    for (int j = 0; j < w; j++) {
+        float *P = pts + (size_t)j * 3;
+        if (!pt_valid(P)) continue;
+        for (int k = 0; k < 3; k++) {
+            float v = P[k] * g->a + g->b;
+            P[k] = v < 0.0f ? 0.0f : v;
+        }
+    }
+    // normals are directions: unchanged under uniform scaling
+}
+
+static int render_lod(const mc_sample_lods *ls, int L,
+                      rowgen_fn inner, const void *inner_ud,
+                      int w, int h, const mc_render_params *p,
+                      uint8_t *out, int nthreads) {
+    const float inv = 1.0f / (float)(1 << L);
+    lod_rg g = { inner, inner_ud, inv, 0.5f * inv - 0.5f };
+    mc_render_params pl_ = *p;
+    pl_.t0 = p->t0 * inv;       // same physical slab ...
+    pl_.t1 = p->t1 * inv;       // ... stepped at the coarse level's pitch
+    render_bands(&ls->lods[L], NULL, NULL, lod_rowgen, &g, w, h, &pl_,
+                 out, nthreads);
+    return 0;
+}
+
+int mc_render_plane_lod(const mc_sample_lods *ls, const mc_plane *pl,
+                        int w, int h, float scale,
+                        const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!ls || !pl || !p || !out || w <= 0 || h <= 0) return -1;
+    int L = mc_render_pick_lod(ls, scale);
+    if (L == 0)
+        return mc_render_plane(&ls->lods[0], pl, w, h, scale, p, out, nthreads);
+    plane_rg g = { *pl, scale, (float)w * 0.5f, (float)h * 0.5f };
+    v3_norm(g.pl.normal);
+    return render_lod(ls, L, plane_rowgen, &g, w, h, p, out, nthreads);
+}
+
+int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
+                       float x0, float y0, float step, int w, int h,
+                       const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!ls || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !p || !out || w <= 0 || h <= 0) return -1;
+    int L = mc_render_pick_lod(ls, step * mc_quad_spacing(q));
+    if (L == 0)
+        return mc_render_quad(&ls->lods[0], q, x0, y0, step, w, h, p, out,
+                              nthreads);
+    quad_rg g = { q, x0, y0, step };
+    return render_lod(ls, L, quad_rowgen, &g, w, h, p, out, nthreads);
+}
+
+// ---------------------------------------------------------------------------
+// 3D resampling (surface-aligned volumes)
+// ---------------------------------------------------------------------------
+typedef struct {
+    const mc_sample_src *src;
+    const mc_quad *q;
+    float x0, y0, step;
+    float t0, dt;
+    int w, h, nlayers;
+    mc_filter f;
+    uint8_t *out;
+    int row0, row1;
+} qvol_band_t;
+
+static void *qvol_band_main(void *ud) {
+    qvol_band_t *b = ud;
+    mc_sampler *s = mc_sampler_new(b->src);
+    float *row = malloc((size_t)b->w * 6 * sizeof(float));
+    const size_t layer = (size_t)b->w * b->h;
+    if (!s || !row) {
+        for (int k = 0; k < b->nlayers; k++)
+            memset(b->out + layer * k + (size_t)b->row0 * b->w, 0,
+                   (size_t)(b->row1 - b->row0) * b->w);
+        free(row); mc_sampler_free(s);
+        return NULL;
+    }
+    float *nrm = row + (size_t)b->w * 3;
+    quad_rg g = { b->q, b->x0, b->y0, b->step };
+    for (int i = b->row0; i < b->row1; i++) {
+        quad_rowgen(&g, i, b->w, row, nrm);
+        for (int j = 0; j < b->w; j++) {
+            const float *P = row + (size_t)j * 3;
+            const float *N = nrm + (size_t)j * 3;
+            uint8_t *o = b->out + (size_t)i * b->w + j;
+            if (!pt_valid(P)) {
+                for (int k = 0; k < b->nlayers; k++) o[layer * k] = 0;
+                continue;
+            }
+            float nz = N[0], ny = N[1], nx = N[2];
+            float n2 = nz * nz + ny * ny + nx * nx;
+            if (n2 >= 1e-12f && (n2 < 0.9998f || n2 > 1.0002f)) {
+                float nl = 1.0f / sqrtf(n2);
+                nz *= nl; ny *= nl; nx *= nl;
+            }
+            float pz = P[0] + b->t0 * nz, py = P[1] + b->t0 * ny,
+                  px = P[2] + b->t0 * nx;
+            const float sz_ = b->dt * nz, sy_ = b->dt * ny, sx_ = b->dt * nx;
+            int k = 0;
+            if (b->f == MC_FILTER_TRILINEAR) {
+                for (; k + 4 <= b->nlayers; k += 4) {
+                    float bz[4], by[4], bx[4], v4[4];
+                    for (int t = 0; t < 4; t++) {
+                        bz[t] = pz; by[t] = py; bx[t] = px;
+                        pz += sz_; py += sy_; px += sx_;
+                    }
+                    mc_s_tri4(s, bz, by, bx, v4);
+                    for (int t = 0; t < 4; t++)
+                        o[layer * (k + t)] = to_u8(v4[t]);
+                }
+            }
+            for (; k < b->nlayers; k++) {
+                o[layer * k] = to_u8(mc_s_sample(s, pz, py, px, b->f));
+                pz += sz_; py += sy_; px += sx_;
+            }
+        }
+    }
+    free(row);
+    mc_sampler_free(s);
+    return NULL;
+}
+
+int mc_sample_quad_volume(const mc_sample_src *src, const mc_quad *q,
+                          float x0, float y0, float step, int w, int h,
+                          float t0, float dt, int nlayers,
+                          mc_filter f, uint8_t *out, int nthreads) {
+    if (!src || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !out || w <= 0 || h <= 0 || nlayers <= 0) return -1;
+    if (nthreads <= 0) {
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        nthreads = nc > 0 ? (int)nc : 1;
+    }
+    if (nthreads > 16) nthreads = 16;
+    if (nthreads > h)  nthreads = h;
+    pthread_t th[16];
+    qvol_band_t bands[16];
+    int per = (h + nthreads - 1) / nthreads;
+    int nb = 0;
+    for (int t = 0; t < nthreads; t++) {
+        int r0 = t * per, r1 = r0 + per > h ? h : r0 + per;
+        if (r0 >= r1) break;
+        bands[nb] = (qvol_band_t){ src, q, x0, y0, step, t0, dt,
+                                   w, h, nlayers, f, out, r0, r1 };
+        if (nthreads == 1 ||
+            pthread_create(&th[nb], NULL, qvol_band_main, &bands[nb]) != 0) {
+            qvol_band_main(&bands[nb]);
+            continue;
+        }
+        nb++;
+    }
+    for (int t = 0; t < nb; t++) pthread_join(th[t], NULL);
+    return 0;
+}
+
+int mc_sample_box(const mc_sample_src *src,
+                  const float origin[3], const float du[3],
+                  const float dv[3], const float dw[3],
+                  int w, int h, int d,
+                  mc_filter f, uint8_t *out, int nthreads) {
+    if (!src || !origin || !du || !dv || !dw || !out ||
+        w <= 0 || h <= 0 || d <= 0) return -1;
+    // each depth slice is a plane render with the layer offset folded into
+    // the origin; comp NONE so no normals are needed
+    mc_render_params p = { .filter = f, .comp = MC_COMP_NONE };
+    for (int k = 0; k < d; k++) {
+        mc_plane pl;
+        for (int c = 0; c < 3; c++) {
+            // mc_plane_gen centers the image; sample with corner semantics
+            pl.origin[c] = origin[c] + (float)k * dw[c] +
+                           ((float)w * 0.5f) * du[c] + ((float)h * 0.5f) * dv[c];
+            pl.normal[c] = 0.0f;
+            pl.u[c] = du[c];
+            pl.v[c] = dv[c];
+        }
+        if (mc_render_plane(src, &pl, w, h, 1.0f, &p,
+                            out + (size_t)k * w * h, nthreads) != 0)
+            return -1;
+    }
+    return 0;
+}

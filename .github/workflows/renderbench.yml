@@ -10,8 +10,8 @@ jobs:
       - run: cat /proc/cpuinfo | grep "model name" | head -1
       - name: build both variants
         run: |
-          clang -I src -O3 -march=x86-64-v3 -o rb_tri8 bench/render_bench.c src/mc_sample.c src/mc_render.c src/matter_compressor.c -lm -lpthread
-          clang -I src -O3 -march=x86-64-v3 -DMC_S_NO_TRI8 -o rb_tri4 bench/render_bench.c src/mc_sample.c src/mc_render.c src/matter_compressor.c -lm -lpthread
+          clang -I src -O3 -march=x86-64-v3 -o rb_tri8 bench/render_bench.c src/matter_compressor.c -lm -lpthread
+          clang -I src -O3 -march=x86-64-v3 -DMC_S_NO_TRI8 -o rb_tri4 bench/render_bench.c src/matter_compressor.c -lm -lpthread
       - name: interleaved A/B x3
         run: |
           for i in 1 2 3; do
