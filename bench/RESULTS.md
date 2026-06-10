@@ -223,3 +223,21 @@ Throughput (M-series, full clocks, 2.4um masked, q=6):
   decode 223 -> 1513 MB/s (6.8x), blob byte-identical to serial.
 - Cross-ISA bitstream identity verified (NEON vs AVX2 archive md5-equal).
 Single-block cold latency: 0.013 ms. Ratio/quality unchanged (33.8x @ 35.83).
+
+## SIMD round 2 (2026-06-10)
+
+Phase profile drove the work: decode = invDCT 52% + range coder 41%;
+encode = coef coder 36% + fwdDCT 32% + mask 16%.
+- NEON 4x4-register-tile transpose for the DCT rotates (fwd 4.4 -> 3.9 us).
+- Fused dequant -> integer iDCT input (float coefficient pass eliminated),
+  integer all the way to the vectorized clamp+dc+air store.
+- NEON dc/mean + dc-subtract (widening pairwise sums).
+- Batched bypass bits (k bits, one renorm + one divide) in EG/EOB/magnitude
+  suffixes: q=1 decode +32%.
+Single-thread (M-series, q): enc/dec MB/s = q1 108/134, q3 135/257,
+q6 146/364, q12 153/471; cold block 0.007-0.023 ms. Parallel chunk:
+678 MB/s enc, 1493 MB/s dec. Cross-ISA archive md5 identity re-verified
+(NEON vs Rosetta AVX2); AVX-512 opt-in path compile-tested.
+Remaining hot spots: the adaptive bin decode itself (serial by nature; the
+rANS alternative was measured and closed) and the mask bins on boundary-heavy
+chunks. Both are at the architecture's serial floor.

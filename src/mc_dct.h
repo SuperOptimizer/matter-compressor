@@ -212,6 +212,34 @@ static inline void mc_dct1d_inv(const mc_fi32 *restrict in, mc_fi32 *restrict ou
 #endif
 
 // cache-blocked rotate (z,y,x)->(x,z,y): dst[(x*S+z)*S+y] = src[(z*S+y)*S+x].
+// Per fixed z this is a 16x16 i32 transpose (src rows y, stride S -> dst rows
+// x, stride S*S); done as 4x4 register tiles on NEON, scalar tiles otherwise.
+#if MC_SIMD_NEON
+static inline void mc_rot(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
+    const int S=MC_DCT_N;
+    for(int z=0;z<S;++z){
+        const mc_fi32 *sp=src+(size_t)z*S*S;
+        mc_fi32 *dp=dst+(size_t)z*S;
+        for(int y=0;y<S;y+=4)
+        for(int x=0;x<S;x+=4){
+            int32x4_t r0=vld1q_s32(sp+(size_t)(y+0)*S+x);
+            int32x4_t r1=vld1q_s32(sp+(size_t)(y+1)*S+x);
+            int32x4_t r2=vld1q_s32(sp+(size_t)(y+2)*S+x);
+            int32x4_t r3=vld1q_s32(sp+(size_t)(y+3)*S+x);
+            int32x4_t t0=vtrn1q_s32(r0,r1), t1=vtrn2q_s32(r0,r1);
+            int32x4_t t2=vtrn1q_s32(r2,r3), t3=vtrn2q_s32(r2,r3);
+            int32x4_t c0=vreinterpretq_s32_s64(vtrn1q_s64(vreinterpretq_s64_s32(t0),vreinterpretq_s64_s32(t2)));
+            int32x4_t c1=vreinterpretq_s32_s64(vtrn1q_s64(vreinterpretq_s64_s32(t1),vreinterpretq_s64_s32(t3)));
+            int32x4_t c2=vreinterpretq_s32_s64(vtrn2q_s64(vreinterpretq_s64_s32(t0),vreinterpretq_s64_s32(t2)));
+            int32x4_t c3=vreinterpretq_s32_s64(vtrn2q_s64(vreinterpretq_s64_s32(t1),vreinterpretq_s64_s32(t3)));
+            vst1q_s32(dp+(size_t)(x+0)*S*S+y, c0);
+            vst1q_s32(dp+(size_t)(x+1)*S*S+y, c1);
+            vst1q_s32(dp+(size_t)(x+2)*S*S+y, c2);
+            vst1q_s32(dp+(size_t)(x+3)*S*S+y, c3);
+        }
+    }
+}
+#else
 #define MC_ROT_TILE 8
 static inline void mc_rot(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
     const int S=MC_DCT_N;
@@ -224,6 +252,7 @@ static inline void mc_rot(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
             for(int y=0;y<S;++y) dp[y]=sp[(size_t)y*S];
         }
 }
+#endif
 // transform all contiguous lines (skipping all-zero lines), in place or out-of-place.
 static inline void mc_lines_fwd_to(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
     const int S=MC_DCT_N; mc_fi32 ol[MC_DCT_N];
@@ -275,6 +304,14 @@ static void mc_dct3_inv(const float *restrict coef, float *restrict blk){
     mc_lines_inv(b);       mc_rot(b,a);
     mc_lines_inv(a);       mc_rot(a,b);
     for(int i=0;i<n;++i) blk[i]=(float)b[i];
+}
+// variant taking PREPARED i32 coefficients (decoder fuses dequantization into
+// the input conversion) and returning the raw i32 spatial result.
+static void mc_dct3_inv_i32(const mc_fi32 *restrict in, mc_fi32 *restrict out){
+    static _Thread_local mc_fi32 a[16*16*16]   __attribute__((aligned(MC_DCT_ALIGN)));
+    mc_lines_inv_to(in,a); mc_rot(a,out);
+    mc_lines_inv(out);     mc_rot(out,a);
+    mc_lines_inv(a);       mc_rot(a,out);
 }
 
 #endif

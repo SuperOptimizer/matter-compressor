@@ -175,15 +175,51 @@ void mc_deblock(mc_u8 *v, int nz, int ny, int nx, float quality){
 // mixed block; the stream carries the mask bins (if mixed) then the coefficients.
 // One stream = one flush (~5B) instead of two streams + a 2B mask length.
 int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
-    int n=N3, any=0; for(int i=0;i<n;++i) any|=vox[i];
-    if(!any){ *len_out=0; return 0; }
-
+    int n=N3, any=0;
     static _Thread_local float blk[N3], coef[N3];
     static _Thread_local mc_i32 lv[N3];
-    long sum=0,cnt=0; for(int i=0;i<n;++i){ if(vox[i]){ sum+=vox[i]; cnt++; } }
+    long sum=0,cnt=0;
+#if MC_SIMD_NEON
+    {   uint32x4_t s32=vdupq_n_u32(0), c32=vdupq_n_u32(0);
+        for(int i=0;i<n;i+=16){
+            uint8x16_t v=vld1q_u8(vox+i);
+            s32=vpadalq_u16(s32,vpaddlq_u8(v));
+            uint8x16_t one=vminq_u8(v,vdupq_n_u8(1));
+            c32=vpadalq_u16(c32,vpaddlq_u8(one));
+        }
+        sum=(long)vaddvq_u32(s32); cnt=(long)vaddvq_u32(c32);
+        any=cnt>0;
+    }
+#else
+    for(int i=0;i<n;++i) any|=vox[i];
+    for(int i=0;i<n;++i){ if(vox[i]){ sum+=vox[i]; cnt++; } }
+#endif
+    if(!any||!cnt){ *len_out=0; return 0; }
     int dc = (int)((sum+cnt/2)/cnt);                  // DC over material only
     int nair = n-(int)cnt;                            // air = vox==0
+#if MC_SIMD_NEON
+    {   int16x8_t vdc=vdupq_n_s16((int16_t)dc);
+        for(int i=0;i<n;i+=16){
+            uint8x16_t v=vld1q_u8(vox+i);
+            uint8x16_t nz=vtstq_u8(v,v);
+            int16x8_t lo=vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v)));
+            int16x8_t hi=vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v)));
+            lo=vsubq_s16(lo,vdc); hi=vsubq_s16(hi,vdc);
+            int16x8_t mlo=vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(nz)));
+            int16x8_t mhi=vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(nz)));
+            // mask: 0x00FF per nonzero after widen -> turn into all-ones/all-zero
+            mlo=vreinterpretq_s16_u16(vtstq_u16(vreinterpretq_u16_s16(mlo),vreinterpretq_u16_s16(mlo)));
+            mhi=vreinterpretq_s16_u16(vtstq_u16(vreinterpretq_u16_s16(mhi),vreinterpretq_u16_s16(mhi)));
+            lo=vandq_s16(lo,mlo); hi=vandq_s16(hi,mhi);   // air -> 0 (== dc-dc)
+            vst1q_f32(blk+i   ,vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))));
+            vst1q_f32(blk+i+4 ,vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))));
+            vst1q_f32(blk+i+8 ,vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))));
+            vst1q_f32(blk+i+12,vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))));
+        }
+    }
+#else
     for(int i=0;i<n;++i) blk[i]=(float)((vox[i]?vox[i]:dc)-dc);
+#endif
     // harmonic (Jacobi) air-fill: relax air voxels to 6-neighbor mean (material
     // fixed). Air-voxel index list + ping-pong buffers: each sweep touches only
     // the air voxels and there is no per-sweep copy (material values are
@@ -313,16 +349,30 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
         memset(dst,(mc_u8)dc,n); return;
     }
     (void)ey;(void)ex;
-    for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],g_step_tab[idx]);
-    mc_dct3_inv(coef,blk);
 #if MC_SIMD_NEON
-    {   // vectorized clamp+dc+air store: 16 voxels per iteration
+    {   // fused dequant -> i32 DCT input (no float coefficient pass), then
+        // integer iDCT and vectorized clamp+dc+air store.
+        static _Thread_local mc_fi32 qin[N3] __attribute__((aligned(64)));
+        static _Thread_local mc_fi32 qout[N3] __attribute__((aligned(64)));
+        float32x4_t bias=vdupq_n_f32(MC_DZ_FRAC-1.0f+0.40f);
+        for(int i=0;i<N3;i+=4){
+            int32x4_t lv=vmovl_s16(vld1_s16(ql+i));
+            uint32x4_t nz=vmvnq_u32(vceqzq_s32(lv));
+            uint32x4_t neg=vcltzq_s32(lv);
+            float32x4_t a=vcvtq_f32_s32(vabsq_s32(lv));
+            float32x4_t r=vmulq_f32(vaddq_f32(a,bias),vld1q_f32(g_step_tab+i));
+            int32x4_t ri=vcvtnq_s32_f32(r);
+            ri=vbslq_s32(neg,vnegq_s32(ri),ri);
+            ri=vandq_s32(ri,vreinterpretq_s32_u32(nz));
+            vst1q_s32(qin+i,ri);
+        }
+        mc_dct3_inv_i32(qin,qout);
         int32x4_t vdc=vdupq_n_s32(dc);
         for(int i=0;i<n;i+=16){
-            int32x4_t a0=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i)),vdc);
-            int32x4_t a1=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i+4)),vdc);
-            int32x4_t a2=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i+8)),vdc);
-            int32x4_t a3=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i+12)),vdc);
+            int32x4_t a0=vaddq_s32(vld1q_s32(qout+i),vdc);
+            int32x4_t a1=vaddq_s32(vld1q_s32(qout+i+4),vdc);
+            int32x4_t a2=vaddq_s32(vld1q_s32(qout+i+8),vdc);
+            int32x4_t a3=vaddq_s32(vld1q_s32(qout+i+12),vdc);
             uint16x8_t p0=vcombine_u16(vqmovun_s32(a0),vqmovun_s32(a1));
             uint16x8_t p1=vcombine_u16(vqmovun_s32(a2),vqmovun_s32(a3));
             uint8x16_t v8=vcombine_u8(vqmovn_u16(p0),vqmovn_u16(p1));
@@ -330,8 +380,11 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
             v8=vbicq_u8(v8,vtstq_u8(am,am));               // air -> 0
             vst1q_u8(dst+i,v8);
         }
+        (void)coef;(void)blk;
     }
 #else
+    for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],g_step_tab[idx]);
+    mc_dct3_inv(coef,blk);
     for(int i=0;i<n;++i){
         int v = air[i] ? 0 : (int)lrintf(blk[i])+dc;  // mask-restore: air -> exactly 0
         if(v<0)v=0; if(v>255)v=255; dst[i]=(mc_u8)v;

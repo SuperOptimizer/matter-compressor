@@ -127,16 +127,37 @@ static int dec_bit(rc_dec *d, ctx_t *c){
 }
 static int dec_bypass(rc_dec *d){ d->range>>=1; int bit=(d->code>=d->range); if(bit)d->code-=d->range; while(d->range<RC_TOP){ rc_u8 b=(d->pos<d->len)?d->buf[d->pos++]:0; d->code=(d->code<<8)|b; d->range<<=8; } return bit; }
 
+// batched bypass: k equiprobable bits in one renorm round (bit-compatible
+// with k single bypasses only when both sides batch identically — they do).
+static void enc_bypass_n(rc_enc *e, rc_u32 v, int k){
+    while(k>16){ enc_bypass_n(e,(v>>(k-16))&0xFFFF,16); k-=16; }
+    if(!k) return;
+    e->range>>=k;
+    e->low+=(rc_u64)(v&((1u<<k)-1))*e->range;
+    while(e->range<RC_TOP){ enc_shift_low(e); e->range<<=8; }
+}
+static rc_u32 dec_bypass_n(rc_dec *d, int k){
+    rc_u32 v=0;
+    while(k>16){ v=(v<<16)|dec_bypass_n(d,16); k-=16; }
+    if(!k) return v;
+    d->range>>=k;
+    rc_u32 q=d->code/d->range;
+    rc_u32 m=(1u<<k)-1; if(q>m)q=m;
+    d->code-=q*d->range;
+    while(d->range<RC_TOP){ rc_u8 b=(d->pos<d->len)?d->buf[d->pos++]:0; d->code=(d->code<<8)|b; d->range<<=8; }
+    return (v<<k)|q;
+}
+
 // Exp-Golomb in bypass bits (order 0), v >= 0.
 static void enc_eg(rc_enc*e,rc_u32 v){
     rc_u32 nb=0,t=v+1; while(t>1){t>>=1;nb++;}
     for(rc_u32 i=0;i<nb;++i)enc_bypass(e,1); enc_bypass(e,0);
-    for(rc_i32 i=(rc_i32)nb-1;i>=0;--i)enc_bypass(e,((v+1)>>i)&1);
+    if(nb) enc_bypass_n(e,(v+1)&((1u<<nb)-1),(int)nb);
 }
 static rc_u32 dec_eg(rc_dec*d){
     rc_u32 nb=0; while(dec_bypass(d))nb++;
-    rc_u32 x=1; for(rc_u32 i=0;i<nb;++i)x=(x<<1)|(rc_u32)dec_bypass(d);
-    return x-1;
+    if(!nb) return 0;
+    return ((1u<<nb)|dec_bypass_n(d,(int)nb))-1;
 }
 
 // --- coefficient context coder (block size S) ---
@@ -165,13 +186,15 @@ static void enc_magnitude(rc_enc*e,atom_ctx*ac,rc_u32 m){
     if(v==0){ RC_TRAIN(RCC_MAG,k,0); enc_bit(e,&mag[k],0); return; }
     RC_TRAIN(RCC_MAG,k,1); enc_bit(e,&mag[k],1); rc_u32 x=v,nbits=0,tt=x+1; while(tt>1){tt>>=1;nbits++;}
     for(rc_u32 i=0;i<nbits;++i)enc_bypass(e,1); enc_bypass(e,0);
-    for(rc_i32 i=(rc_i32)nbits-1;i>=0;--i)enc_bypass(e,((x+1)>>i)&1);
+    if(nbits) enc_bypass_n(e,(x+1)&((1u<<nbits)-1),(int)nbits);
 }
 static rc_u32 dec_magnitude(rc_dec*d,atom_ctx*ac){
     ctx_t*mag=ac->mag; rc_u32 v=0,k=0;
     while(k<(rc_u32)(MAGCTX-1)){ if(dec_bit(d,&mag[k])){v+=1;k++;} else return v+1; }
     if(!dec_bit(d,&mag[k])) return v+1;
-    rc_u32 nbits=0; while(dec_bypass(d))nbits++; rc_u32 x=1; for(rc_u32 i=0;i<nbits;++i)x=(x<<1)|(rc_u32)dec_bypass(d); x-=1; return v+x+1;
+    rc_u32 nbits=0; while(dec_bypass(d))nbits++;
+    rc_u32 x = nbits ? ((1u<<nbits)|dec_bypass_n(d,(int)nbits))-1 : 0;
+    return v+x+1;
 }
 
 // per-size ascending-L1-frequency scan tables, built lazily (indexed by log2 S).
@@ -204,14 +227,14 @@ static void enc_eob(rc_enc*e,eob_ctx*c,rc_u32 v,int n){
     int k=0; while((1u<<k)<=v) k++;                            // MSB+1 (0 for v=0)
     for(int i=0;i<k;++i){ RC_TRAIN(RCC_EOB,i,1); enc_bit(e,&c->pfx[i],1); }
     if(k<kmax){ RC_TRAIN(RCC_EOB,k,0); enc_bit(e,&c->pfx[k],0); }
-    if(k>1) for(int i=k-2;i>=0;--i) enc_bypass(e,(v>>i)&1);    // suffix below the MSB
+    if(k>1) enc_bypass_n(e,v&((1u<<(k-1))-1),k-1);             // suffix below the MSB
 }
 static rc_u32 dec_eob(rc_dec*d,eob_ctx*c,int n){
     int kmax=0; while((1u<<kmax)<=(rc_u32)n) kmax++;
     int k=0; while(k<kmax && dec_bit(d,&c->pfx[k])) k++;
     if(k==0) return 0;
-    rc_u32 v=1; for(int i=0;i<k-1;++i) v=(v<<1)|(rc_u32)dec_bypass(d);
-    return v;
+    if(k==1) return 1;
+    return (1u<<(k-1))|dec_bypass_n(d,k-1);
 }
 
 // encode/decode quantized levels q[S^3] (raster).
