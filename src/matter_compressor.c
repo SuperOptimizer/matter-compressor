@@ -1752,6 +1752,10 @@ static void priors_load(const uint8_t *base){
     mc_codec_set_priors((const uint16_t*)(base+off+8),(const uint16_t*)(base+off+8+8*32*2));
 }
 
+uint64_t mc_archive_data_len(mc_archive *a){
+    return a ? atomic_load_explicit(&a->cursor, memory_order_relaxed) : 0;
+}
+
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx){
     if(!a||lod<0||lod>7) return MC_ABSENT;
     uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);

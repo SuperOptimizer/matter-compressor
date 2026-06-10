@@ -164,6 +164,11 @@ int mc_archive_reserve_index(mc_archive *a, int lod, int cz,int cy,int cx);
 // Coverage of a chunk without decoding.
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx);
 
+// Bytes actually written so far (the append cursor / true EOF), NOT the file's
+// ftruncate'd reservation. Use for an accurate on-disk-size readout while an
+// archive is being filled.
+uint64_t mc_archive_data_len(mc_archive *a);
+
 // Resolve a chunk to its blob offset (0 = absent). Pass to mc_archive_decode_block to
 // decode its 16^3 blocks (resolve once per chunk, decode 4096 blocks).
 uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx);
