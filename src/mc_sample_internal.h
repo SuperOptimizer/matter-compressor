@@ -8,6 +8,8 @@
 #include <math.h>
 #if defined(__aarch64__)
 #include <arm_neon.h>
+#elif defined(__SSE4_1__)
+#include <immintrin.h>
 #endif
 
 #define MC_S_MEMO 256   // covers an oblique 1024-px row's block working set
@@ -168,6 +170,53 @@ static inline float32x4_t mc_s_lerp8x4(const uint8_t *p0, const uint8_t *p1,
     float32x4_t c1 = vaddq_f32(c10, vmulq_f32(vsubq_f32(c11, c10), dy));
     return vaddq_f32(c0, vmulq_f32(vsubq_f32(c1, c0), dz));
 }
+#elif defined(__SSE4_1__)
+static inline uint16_t mc_s_ld16(const uint8_t *p) {
+    uint16_t v; __builtin_memcpy(&v, p, 2); return v;
+}
+static inline __m128 mc_s_lerp8x4(const uint8_t *p0, const uint8_t *p1,
+                                  const uint8_t *p2, const uint8_t *p3,
+                                  size_t sy, size_t sx,
+                                  __m128 dz, __m128 dy, __m128 dx) {
+    // per corner-row: 4 samples' (c0,c1) byte pairs in u16 lanes 0..3
+    __m128i z = _mm_setzero_si128();
+    __m128i g00 = _mm_insert_epi16(z, mc_s_ld16(p0), 0);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p1), 1);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p2), 2);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p3), 3);
+    __m128i g01 = _mm_insert_epi16(z, mc_s_ld16(p0 + sx), 0);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p1 + sx), 1);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p2 + sx), 2);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p3 + sx), 3);
+    __m128i g10 = _mm_insert_epi16(z, mc_s_ld16(p0 + sy), 0);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p1 + sy), 1);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p2 + sy), 2);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p3 + sy), 3);
+    __m128i g11 = _mm_insert_epi16(z, mc_s_ld16(p0 + sy + sx), 0);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p1 + sy + sx), 1);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p2 + sy + sx), 2);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p3 + sy + sx), 3);
+    // split even bytes (x0 corner) / odd bytes (x1 corner) -> u32 -> f32
+    const __m128i me = _mm_set_epi8(-1, -1, -1, 6, -1, -1, -1, 4,
+                                    -1, -1, -1, 2, -1, -1, -1, 0);
+    const __m128i mo = _mm_set_epi8(-1, -1, -1, 7, -1, -1, -1, 5,
+                                    -1, -1, -1, 3, -1, -1, -1, 1);
+#define MC_S_F32E(g) _mm_cvtepi32_ps(_mm_shuffle_epi8(g, me))
+#define MC_S_F32O(g) _mm_cvtepi32_ps(_mm_shuffle_epi8(g, mo))
+    __m128 f000 = MC_S_F32E(g00), f001 = MC_S_F32O(g00);
+    __m128 f010 = MC_S_F32E(g01), f011 = MC_S_F32O(g01);
+    __m128 f100 = MC_S_F32E(g10), f101 = MC_S_F32O(g10);
+    __m128 f110 = MC_S_F32E(g11), f111 = MC_S_F32O(g11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    __m128 c00 = _mm_add_ps(f000, _mm_mul_ps(_mm_sub_ps(f001, f000), dx));
+    __m128 c01 = _mm_add_ps(f010, _mm_mul_ps(_mm_sub_ps(f011, f010), dx));
+    __m128 c10 = _mm_add_ps(f100, _mm_mul_ps(_mm_sub_ps(f101, f100), dx));
+    __m128 c11 = _mm_add_ps(f110, _mm_mul_ps(_mm_sub_ps(f111, f110), dx));
+    __m128 c0 = _mm_add_ps(c00, _mm_mul_ps(_mm_sub_ps(c01, c00), dy));
+    __m128 c1 = _mm_add_ps(c10, _mm_mul_ps(_mm_sub_ps(c11, c10), dy));
+    return _mm_add_ps(c0, _mm_mul_ps(_mm_sub_ps(c1, c0), dz));
+}
 #endif
 
 static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
@@ -220,6 +269,61 @@ static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
             if (allb) {
                 vst1q_f32(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
                                             256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+#endif
+#if defined(__SSE4_1__) && !defined(__aarch64__)
+    __m128 zv = _mm_loadu_ps(pz), yv = _mm_loadu_ps(py), xv = _mm_loadu_ps(px);
+    __m128 zf = _mm_floor_ps(zv), yf = _mm_floor_ps(yv), xf = _mm_floor_ps(xv);
+    __m128i zi = _mm_cvttps_epi32(zf), yi = _mm_cvttps_epi32(yf),
+            xi = _mm_cvttps_epi32(xf);
+    // all-lanes 0 <= c < n-1 (signed compares; negatives fail the >= 0 side)
+    __m128i ok = _mm_and_si128(
+        _mm_cmpgt_epi32(zi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.nz - 1), zi));
+    ok = _mm_and_si128(ok, _mm_and_si128(
+        _mm_cmpgt_epi32(yi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.ny - 1), yi)));
+    ok = _mm_and_si128(ok, _mm_and_si128(
+        _mm_cmpgt_epi32(xi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.nx - 1), xi)));
+    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) {
+        __m128 dz = _mm_sub_ps(zv, zf), dy = _mm_sub_ps(yv, yf),
+               dx = _mm_sub_ps(xv, xf);
+        int32_t z0[4], y0[4], x0[4];
+        _mm_storeu_si128((__m128i *)z0, zi);
+        _mm_storeu_si128((__m128i *)y0, yi);
+        _mm_storeu_si128((__m128i *)x0, xi);
+        if (s->src.dense) {
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            const uint8_t *base = s->src.dense;
+            _mm_storeu_ps(out, mc_s_lerp8x4(
+                base + (size_t)z0[0] * sy + (size_t)y0[0] * sx + x0[0],
+                base + (size_t)z0[1] * sy + (size_t)y0[1] * sx + x0[1],
+                base + (size_t)z0[2] * sy + (size_t)y0[2] * sx + x0[2],
+                base + (size_t)z0[3] * sy + (size_t)y0[3] * sx + x0[3],
+                sy, sx, dz, dy, dx));
+            return;
+        }
+        int in15 = 1;
+        for (int k = 0; k < 4; k++)
+            in15 &= (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
+                    (x0[k] & 15) != 15;
+        if (in15) {
+            const uint8_t *b[4];
+            int allb = 1;
+            for (int k = 0; k < 4; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { allb = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (allb) {
+                _mm_storeu_ps(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
+                                                256, 16, dz, dy, dx));
                 return;
             }
         }

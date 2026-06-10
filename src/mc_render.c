@@ -147,7 +147,30 @@ void mc_render_points(mc_sampler *s,
                              ? to_u8(mc_s_nearest(s, P[0], P[1], P[2])) : 0;
             }
         } else {
-            for (size_t k = 0; k < n; k++) {
+            // 4 pixels per mc_s_tri4 call (SIMD gather+lerp where available)
+            size_t k = 0;
+            for (; k + 4 <= n; k += 4) {
+                const float *P = pts + k * 3;
+                if (pt_valid(P) && pt_valid(P + 3) &&
+                    pt_valid(P + 6) && pt_valid(P + 9)) {
+                    float bz[4] = { P[0], P[3], P[6], P[9]  };
+                    float by[4] = { P[1], P[4], P[7], P[10] };
+                    float bx[4] = { P[2], P[5], P[8], P[11] };
+                    float v4[4];
+                    mc_s_tri4(s, bz, by, bx, v4);
+                    out[k]     = to_u8(v4[0]);
+                    out[k + 1] = to_u8(v4[1]);
+                    out[k + 2] = to_u8(v4[2]);
+                    out[k + 3] = to_u8(v4[3]);
+                } else {
+                    for (size_t q = k; q < k + 4; q++) {
+                        const float *Q = pts + q * 3;
+                        out[q] = pt_valid(Q)
+                            ? to_u8(mc_s_trilinear(s, Q[0], Q[1], Q[2])) : 0;
+                    }
+                }
+            }
+            for (; k < n; k++) {
                 const float *P = pts + k * 3;
                 out[k] = pt_valid(P)
                              ? to_u8(mc_s_trilinear(s, P[0], P[1], P[2])) : 0;
