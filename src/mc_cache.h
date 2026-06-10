@@ -45,6 +45,11 @@ void mc_cache_get_copy(mc_cache *c, int lod, int bz, int by, int bx, mc_u8 *dst)
 // Peek without touching the recently-used bit (residency triage).
 int  mc_cache_contains(mc_cache *c, int lod, int bz, int by, int bx);
 
+// Prefetch every block of chunk (lod, cz,cy,cx) into the cache (decoding the
+// blocks that are not already resident). Renderers call this from IO/worker
+// threads ahead of the viewport so the render threads only ever hit.
+void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx);
+
 // Drop everything (e.g. source archive replaced).
 void mc_cache_clear(mc_cache *c);
 

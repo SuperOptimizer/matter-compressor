@@ -219,6 +219,18 @@ int mc_cache_contains(mc_cache *c, int lod, int bz, int by, int bx){
     return r;
 }
 
+void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
+    for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
+        int gz=cz*16+bz, gy=cy*16+by, gx=cx*16+bx;
+        uint64_t key=bkey(lod,gz,gy,gx);
+        shard_t *sh=shard_of(c,key);
+        pthread_mutex_lock(&sh->mu);
+        int have = map_find(sh,key)!=UINT32_MAX;
+        pthread_mutex_unlock(&sh->mu);
+        if(!have) (void)mc_cache_get(c,lod,gz,gy,gx);
+    }
+}
+
 void mc_cache_clear(mc_cache *c){
     for(int s=0;s<NSHARD;++s){
         shard_t *sh=&c->sh[s];

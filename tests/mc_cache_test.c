@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 static mc_u8 srcv(void *ud, int x,int y,int z){
     (void)ud;
@@ -74,6 +75,23 @@ int main(void){
         fails2,(unsigned long long)st.evictions,st.used,st.slots);
     if(fails2){ fprintf(stderr,"FAIL: tiny-cache mismatch\n"); return 1; }
     if(!st.evictions){ fprintf(stderr,"FAIL: tiny cache never evicted\n"); return 1; }
+    mc_cache_free(c);
+
+    // 3) hit-path throughput (informational) + prefetch coverage
+    c=mc_cache_new_archive(64ull<<20,a);
+    mc_cache_prefetch_chunk(c,0,0,0,0);
+    mc_cache_stats st3; mc_cache_get_stats(c,&st3);
+    struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+    long N=2000000; const mc_u8 *p=0;
+    unsigned rs2=7;
+    for(long i=0;i<N;++i){ rs2^=rs2<<13;rs2^=rs2>>17;rs2^=rs2<<5;
+        p=mc_cache_get(c,0,(int)(rs2%16),(int)((rs2>>8)%16),(int)((rs2>>16)%16)); }
+    clock_gettime(CLOCK_MONOTONIC,&t1);
+    double s=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
+    (void)p;
+    mc_cache_get_stats(c,&st3);
+    printf("hit path: %.1f Mget/s single thread (prefetched chunk, %zu blocks resident)\n",
+        N/1e6/s, st3.used);
     mc_cache_free(c);
     mc_archive_close(a);
     remove(path);

@@ -13,7 +13,13 @@ A small, fast lossy codec + on-disk archive for dense 3D `u8` scalar volumes
 - **archive** (`src/mc_archive.{c,h}` + `mc_archive_read.h`) — the on-disk format:
   a sparse multi-level node tree of dense 256³ chunks, 8 independently
   fetchable/decodable LODs. Source-agnostic: the builder pulls voxels through a
-  caller callback.
+  caller callback. One layout serves both uses: streaming random access
+  (partial-fetch block decode, node-table caching, clustered index after
+  `mc_export`) and full offline download (a single mmap-able file).
+- **cache** (`src/mc_cache.{c,h}`) — in-RAM decoded-block cache for interactive
+  clients (vc3d-style renderers): 4KB blocks in an mmap arena, 64-way sharded
+  hash + CLOCK/NRU eviction, multi-thread safe, chunk prefetch API. ~90M
+  cache-hit gets/s/thread.
 
 Runtime parameters: **quality** (the quant base step; higher = smaller +
 lossier) and an optional **max-error bound** (`mc_set_max_error(tau)`: sparse
@@ -58,6 +64,10 @@ No external dependencies beyond libm (tools: libcurl + libzstd for `mc_fetch`).
   cubes from a fetched volume.
 - `mc_train` — retrain the range-coder context priors on a volume; prints
   tables to paste into `mc_rangecoder.h`.
+- `mc_export` — repack an archive (or a chunk box) verbatim into a fresh file:
+  Morton-ordered chunks, the whole index clustered right after the metadata
+  region (one ranged GET for streaming clients), no append slack.
+- `mc_vs_c3d`, `mc_rans_probe`, `mc_prof` — comparison/measurement harnesses.
 
 ## API
 
