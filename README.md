@@ -27,8 +27,9 @@ dependencies beyond libm/pthreads:
   style surface rendering: generic point-grid renderer with plane and quad
   surface generators, nearest/trilinear filtering, min/mean/max/alpha
   compositing along surface normals. Sources are pluggable (mc_cache,
-  mc_volume, dense arrays); 1024² oblique slice 0.8 ms cache-backed /
-  0.4 ms dense, 9-step trilinear composite 5 / 4 ms (8 threads).
+  mc_volume, dense arrays). Fully in-volume 1024² quad-surface render
+  (8 threads, dense source): slice 1.5 ms, 9-step trilinear composite
+  8.4 ms including surface generation.
 
 ## Performance (Apple M-series reference, real 2.4 µm scroll data)
 

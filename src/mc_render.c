@@ -45,24 +45,11 @@ static rcfg_t make_cfg(const mc_render_params *p) {
     return c;
 }
 
-// Composite one ray: walk pos += dvec for nsteps, reduce. The position is
-// stepped incrementally (3 adds) instead of recomputing P + t*N (3 fmas);
-// the additive t accumulation matches the previous behavior exactly.
-#define RAY_LOOP(INIT, STEP, FINISH)                                          \
-    do {                                                                      \
-        float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,             \
-              px = P[2] + cfg->t0 * nx;                                       \
-        const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny,                   \
-                    sx_ = cfg->dt * nx;                                       \
-        INIT;                                                                 \
-        for (int it = 0; it < cfg->nsteps; it++) {                            \
-            float v = mc_s_sample(s, pz, py, px, cfg->filter);                \
-            STEP;                                                             \
-            pz += sz_; py += sy_; px += sx_;                                  \
-        }                                                                     \
-        FINISH;                                                               \
-    } while (0)
-
+// Composite one ray. Trilinear rays are consumed in chunks of 4 steps via
+// mc_s_tri4 (NEON gather+lerp on aarch64, ~1.4x the scalar core); the
+// accumulation itself stays sequential per chunk, which keeps ALPHA\'s
+// front-to-back order and early-out exact. Positions are P + t*N with t
+// advanced additively, as before.
 static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
                             const rcfg_t *cfg) {
     if (!pt_valid(P)) return 0;
@@ -77,40 +64,71 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
         nz *= nl; ny *= nl; nx *= nl;
     }
 
+    const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
+    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
+          px = P[2] + cfg->t0 * nx;
+    const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
+    float acc = 0.0f, A = 0.0f, mn = 255.0f, mx = 0.0f, sum = 0.0f;
+    int it = 0, done = 0;
+
+    if (cfg->filter == MC_FILTER_TRILINEAR) {
+        for (; it + 4 <= cfg->nsteps && !done; it += 4) {
+            float bz[4], by[4], bx[4], v4[4];
+            for (int k = 0; k < 4; k++) {
+                bz[k] = pz; by[k] = py; bx[k] = px;
+                pz += sz_; py += sy_; px += sx_;
+            }
+            mc_s_tri4(s, bz, by, bx, v4);
+            switch (cfg->comp) {
+            case MC_COMP_MIN:
+                for (int k = 0; k < 4; k++) if (v4[k] < mn) mn = v4[k];
+                break;
+            case MC_COMP_MAX:
+                for (int k = 0; k < 4; k++) if (v4[k] > mx) mx = v4[k];
+                break;
+            case MC_COMP_MEAN:
+                sum += v4[0] + v4[1] + v4[2] + v4[3];
+                break;
+            default:                            // ALPHA
+                for (int k = 0; k < 4 && !done; k++) {
+                    float a = (v4[k] * (1.0f / 255.0f) - a_th) * a_sc;
+                    if (a > 0.0f) {
+                        if (a > 1.0f) a = 1.0f;
+                        acc += (1.0f - A) * a * v4[k];
+                        A   += (1.0f - A) * a;
+                        if (A >= 0.98f) done = 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    for (; it < cfg->nsteps && !done; it++) {
+        float v = mc_s_sample(s, pz, py, px, cfg->filter);
+        switch (cfg->comp) {
+        case MC_COMP_MIN:  if (v < mn) mn = v; break;
+        case MC_COMP_MAX:  if (v > mx) mx = v; break;
+        case MC_COMP_MEAN: sum += v; break;
+        default: {                              // ALPHA
+            float a = (v * (1.0f / 255.0f) - a_th) * a_sc;
+            if (a > 0.0f) {
+                if (a > 1.0f) a = 1.0f;
+                acc += (1.0f - A) * a * v;
+                A   += (1.0f - A) * a;
+                if (A >= 0.98f) done = 1;
+            }
+            break;
+        }
+        }
+        pz += sz_; py += sy_; px += sx_;
+    }
     switch (cfg->comp) {
-    case MC_COMP_MIN: {
-        uint8_t r;
-        RAY_LOOP(float mn = 255.0f, if (v < mn) mn = v, r = to_u8(mn));
-        return r;
-    }
-    case MC_COMP_MAX: {
-        uint8_t r;
-        RAY_LOOP(float mx = 0.0f, if (v > mx) mx = v, r = to_u8(mx));
-        return r;
-    }
-    case MC_COMP_MEAN: {
-        uint8_t r;
-        RAY_LOOP(float sum = 0.0f, sum += v,
-                 r = to_u8(cfg->nsteps ? sum / (float)cfg->nsteps : 0.0f));
-        return r;
-    }
-    case MC_COMP_ALPHA: {
-        uint8_t r;
-        const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
-        RAY_LOOP(float acc = 0.0f; float A = 0.0f,
-                 {
-                     float a = (v * (1.0f / 255.0f) - a_th) * a_sc;
-                     if (a > 0.0f) {
-                         if (a > 1.0f) a = 1.0f;
-                         acc += (1.0f - A) * a * v;
-                         A   += (1.0f - A) * a;
-                         if (A >= 0.98f) break;
-                     }
-                 },
-                 r = to_u8(acc));
-        return r;
-    }
-    default: return 0;
+    case MC_COMP_MIN:  return to_u8(mn);
+    case MC_COMP_MAX:  return to_u8(mx);
+    case MC_COMP_MEAN:
+        return to_u8(cfg->nsteps ? sum / (float)cfg->nsteps : 0.0f);
+    case MC_COMP_ALPHA: return to_u8(acc);
+    default:           return 0;
     }
 }
 
@@ -273,9 +291,6 @@ void mc_plane_gen(const mc_plane *pl, int w, int h, float scale,
 // ---------------------------------------------------------------------------
 // quad surface
 // ---------------------------------------------------------------------------
-static inline const float *qpt(const mc_quad *q, int gx, int gy) {
-    return q->grid + ((size_t)gy * q->gw + gx) * 3;
-}
 static inline int qvalid(const float *p) {
     return !(p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f) &&
            p[0] == p[0] && p[1] == p[1] && p[2] == p[2];
@@ -283,41 +298,75 @@ static inline int qvalid(const float *p) {
 
 void mc_quad_gen(const mc_quad *q, float x0, float y0, float step,
                  int w, int h, float *pts, float *normals) {
-    for (int i = 0; i < h; i++)
+    const int gw = q->gw, gh = q->gh;
+    for (int i = 0; i < h; i++) {
+        float *Prow = pts + (size_t)i * w * 3;
+        float *Nrow = normals ? normals + (size_t)i * w * 3 : NULL;
+        float gy = y0 + (float)i * step;
+        // row-invalid fast fill
+        if (!(gy >= 0.0f) || gy > (float)(gh - 1)) {
+            for (int j = 0; j < w; j++) {
+                Prow[j * 3] = Prow[j * 3 + 1] = Prow[j * 3 + 2] = -1.0f;
+                if (Nrow) Nrow[j * 3] = Nrow[j * 3 + 1] = Nrow[j * 3 + 2] = 0.0f;
+            }
+            continue;
+        }
+        int y0i = (int)gy;
+        if (y0i > gh - 2) y0i = gh - 2;
+        if (y0i < 0) y0i = 0;               // gh == 1
+        float fy = gy - (float)y0i;
+        const float *r0 = q->grid + (size_t)y0i * gw * 3;
+        const float *r1 = q->grid + (size_t)(y0i + (gh > 1)) * gw * 3;
+
+        // per-cell state, reloaded only when the pixel crosses a grid cell
+        int cell = -2, cell_ok = 0;
+        float A[3], B[3], du[3], dv0[3], dv1[3];
         for (int j = 0; j < w; j++) {
-            float *P = pts + ((size_t)i * w + j) * 3;
-            float *N = normals ? normals + ((size_t)i * w + j) * 3 : NULL;
+            float *P = Prow + j * 3;
+            float *N = Nrow ? Nrow + j * 3 : NULL;
             P[0] = P[1] = P[2] = -1.0f;
             if (N) N[0] = N[1] = N[2] = 0.0f;
             float gx = x0 + (float)j * step;
-            float gy = y0 + (float)i * step;
-            if (gx < 0.0f || gy < 0.0f ||
-                gx > (float)(q->gw - 1) || gy > (float)(q->gh - 1)) continue;
-            int x0i = (int)gx, y0i = (int)gy;
-            if (x0i > q->gw - 2) x0i = q->gw - 2;
-            if (y0i > q->gh - 2) y0i = q->gh - 2;
-            if (x0i < 0 || y0i < 0) {       // degenerate 1-wide grids
-                if (q->gw == 1) x0i = 0;
-                if (q->gh == 1) y0i = 0;
+            if (!(gx >= 0.0f) || gx > (float)(gw - 1)) continue;
+            int x0i = (int)gx;
+            if (x0i > gw - 2) x0i = gw - 2;
+            if (x0i < 0) x0i = 0;           // gw == 1
+            if (x0i != cell) {
+                cell = x0i;
+                const float *p00 = r0 + (size_t)x0i * 3;
+                const float *p01 = r0 + (size_t)(x0i + (gw > 1)) * 3;
+                const float *p10 = r1 + (size_t)x0i * 3;
+                const float *p11 = r1 + (size_t)(x0i + (gw > 1)) * 3;
+                cell_ok = qvalid(p00) && qvalid(p01) &&
+                          qvalid(p10) && qvalid(p11);
+                if (cell_ok)
+                    for (int k = 0; k < 3; k++) {
+                        // y-lerped column endpoints: P = A + (B-A)*fx
+                        A[k] = p00[k] + (p10[k] - p00[k]) * fy;
+                        B[k] = p01[k] + (p11[k] - p01[k]) * fy;
+                        // bilinear tangents (du constant per cell row)
+                        du[k] = (p01[k] - p00[k]) * (1.0f - fy) +
+                                (p11[k] - p10[k]) * fy;
+                        dv0[k] = p10[k] - p00[k];
+                        dv1[k] = p11[k] - p01[k];
+                    }
             }
-            float fx = gx - (float)x0i, fy = gy - (float)y0i;
-            const float *p00 = qpt(q, x0i, y0i);
-            const float *p01 = qpt(q, x0i + (q->gw > 1), y0i);
-            const float *p10 = qpt(q, x0i, y0i + (q->gh > 1));
-            const float *p11 = qpt(q, x0i + (q->gw > 1), y0i + (q->gh > 1));
-            if (!qvalid(p00) || !qvalid(p01) || !qvalid(p10) || !qvalid(p11))
-                continue;
-            float du[3], dv[3];
-            for (int k = 0; k < 3; k++) {
-                float a = p00[k] + (p01[k] - p00[k]) * fx;
-                float b = p10[k] + (p11[k] - p10[k]) * fx;
-                P[k] = a + (b - a) * fy;
-                // bilinear tangents (per grid cell, exact for the patch)
-                du[k] = (p01[k] - p00[k]) * (1.0f - fy) + (p11[k] - p10[k]) * fy;
-                dv[k] = (p10[k] - p00[k]) * (1.0f - fx) + (p11[k] - p01[k]) * fx;
+            if (!cell_ok) continue;
+            float fx = gx - (float)x0i;
+            P[0] = A[0] + (B[0] - A[0]) * fx;
+            P[1] = A[1] + (B[1] - A[1]) * fx;
+            P[2] = A[2] + (B[2] - A[2]) * fx;
+            if (N) {
+                float dv[3] = {
+                    dv0[0] + (dv1[0] - dv0[0]) * fx,
+                    dv0[1] + (dv1[1] - dv0[1]) * fx,
+                    dv0[2] + (dv1[2] - dv0[2]) * fx,
+                };
+                v3_cross(du, dv, N);
+                v3_norm(N);
             }
-            if (N) { v3_cross(du, dv, N); v3_norm(N); }
         }
+    }
 }
 
 // ---------------------------------------------------------------------------
