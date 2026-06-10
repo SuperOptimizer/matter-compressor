@@ -53,6 +53,9 @@ struct mc_volume {
     int qh, qt;                // head/tail
     pthread_cond_t qcv;        // signals queued work
     int stop;
+
+    mc_volume_ready_fn ready_cb;   // fired when a background transcode completes
+    void *ready_ud;
 };
 
 // ---------------------------------------------------------------------------
@@ -224,6 +227,7 @@ static void *worker_main(void *ud) {
         int lod, cz, cy, cx;
         runpack(key, &lod, &cz, &cy, &cx);
         ensure_region(v, lod, cz, cy, cx);   // does its own single-flight + dedup
+        if (v->ready_cb) v->ready_cb(v->ready_ud);   // a region became serveable
     }
 }
 
@@ -429,6 +433,11 @@ void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int 
                 if (cancel && *cancel) return;
                 mc_volume_prefetch_shard(v, lod, sz, sy, sx);
             }
+}
+
+void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud) {
+    v->ready_cb = cb;
+    v->ready_ud = ud;
 }
 
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {

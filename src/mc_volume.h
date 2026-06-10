@@ -50,6 +50,12 @@ void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx);
 // polled to abort early.
 void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel);
 
+// Register a callback fired (from a worker thread) each time a background
+// transcode completes a region — lets an interactive client schedule a repaint.
+// `cb` must be cheap and thread-safe (e.g. set a flag / post to the UI loop).
+typedef void (*mc_volume_ready_fn)(void *ud);
+void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud);
+
 typedef struct {
     uint64_t cache_hits, cache_misses;   // mc_cache residency
     uint64_t disk_bytes;                 // .mca append cursor
