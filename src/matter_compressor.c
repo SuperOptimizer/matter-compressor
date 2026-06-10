@@ -1223,6 +1223,10 @@ static uint64_t mc_resolve_chunk(const uint8_t*arc, uint64_t root_off,int cz,int
 // fmap+bitmap+lens+payloads; fmap = rc-coded per-block material fractions
 // (4096 nibbles, 0..15 ~= 0..100%) for rejection-free ML sampling.
 #define MC_BLOB_HDR 14
+// Slot sentinel: a chunk that was VISITED and decodes to all-zero (air). Real
+// blob offsets are always >= MC_HDR (blobs append after the header), so 1 is a
+// safe sentinel. Distinguishes "air, fetched" from "never fetched" (slot 0).
+#define MC_SLOT_ZERO 1ull
 static inline float mc_chunk_q(const uint8_t*arc, uint64_t chunk_off){
     float q; memcpy(&q,arc+chunk_off,4); return q;
 }
@@ -1617,6 +1621,15 @@ static uint64_t w_ensure_shard_slot(mc_archive *w, int lod, int cz,int cy,int cx
 }
 
 // append a finished compressed blob at EOF + publish it in the shard slot (commit word).
+// Mark a chunk's slot as VISITED-but-all-zero (air). Lets a re-run / prefetch
+// tell "fetched, it was air" from "never fetched" — no blob is written.
+static int w_mark_zero(mc_archive *w,int lod,int cz,int cy,int cx){
+    uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
+    if(slot==~0ull) return -1;
+    w_write_u64(w, slot, MC_SLOT_ZERO);
+    return 0;
+}
+
 static int w_install_blob(mc_archive *w,int lod,int cz,int cy,int cx,const u8 *blob,size_t len){
     uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
     if(slot==~0ull) return -1;
@@ -1721,7 +1734,7 @@ int mc_archive_append_chunk_raw_q(mc_archive *a, int lod, int cz,int cy,int cx,
     size_t blen = encode_chunk_blob(vox, stage_put, &st);
     int rc = 0;
     if(blen) rc = w_install_blob(a,lod,cz,cy,cx,st.p,st.len);
-    // all-air chunk (blen==0): no blob, slot stays absent (decodes to zero). rc stays 0.
+    else     rc = w_mark_zero(a,lod,cz,cy,cx);   // air, but record it as VISITED
     free(st.p);
     return rc;
 }
@@ -1790,7 +1803,10 @@ uint64_t mc_archive_data_len(mc_archive *a){
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx){
     if(!a||lod<0||lod>7) return MC_ABSENT;
     uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);
-    return mc_resolve_chunk(a->base, root, cz,cy,cx) ? MC_PRESENT : MC_ABSENT;
+    uint64_t off = mc_resolve_chunk(a->base, root, cz,cy,cx);
+    if(off==0) return MC_ABSENT;
+    if(off==MC_SLOT_ZERO) return MC_ZERO;
+    return MC_PRESENT;
 }
 
 uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
@@ -1807,7 +1823,7 @@ uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
 // publish via a release fence so a resolved chunk_off always points at fully-written
 // bytes.
 void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
-    if(!a||!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    if(!a||chunk_off<=MC_SLOT_ZERO){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     mc_set_quality(mc_chunk_q(a->base,chunk_off));   // thread-local; per-chunk q
     uint64_t boff; uint32_t bl;
     if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
@@ -1841,7 +1857,7 @@ static int auto_threads(int nthreads){
 }
 void mc_archive_decode_chunk(mc_archive *a, uint64_t chunk_off, mc_u8 *out, int nthreads){
     if(!a||!out) return;
-    if(!chunk_off){ memset(out,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK); return; }
+    if(chunk_off<=MC_SLOT_ZERO){ memset(out,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK); return; }
     dchunk_ctx c={.a=a,.chunk_off=chunk_off,.out=out,.q=mc_chunk_q(a->base,chunk_off)};
     atomic_store(&c.next,0);
     int nt=auto_threads(nthreads);
@@ -1933,7 +1949,7 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
 int mc_archive_block_present(mc_archive *a, int lod, int bz, int by, int bx){
     if(!a||lod<0||lod>7||bz<0||by<0||bx<0) return 0;
     uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
-    if(!co) return 0;
+    if(co<=MC_SLOT_ZERO) return 0;
     const u8 *bm=a->base+co+MC_BLOB_HDR+mc_chunk_fmaplen(a->base,co);
     return mc_bit_get(bm,((bz&15)*16+(by&15))*16+(bx&15));
 }
@@ -1941,7 +1957,7 @@ int mc_archive_block_present(mc_archive *a, int lod, int bz, int by, int bx){
 float mc_archive_block_fraction(mc_archive *a, int lod, int bz, int by, int bx){
     if(!a||lod<0||lod>7||bz<0||by<0||bx<0) return 0.0f;
     uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
-    if(!co) return 0.0f;
+    if(co<=MC_SLOT_ZERO) return 0.0f;
     static _Thread_local uint8_t fr[MC_GRID3];
     static _Thread_local uint64_t fr_key=~0ull;
     if(fr_key!=co){
@@ -2115,7 +2131,7 @@ long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
                 if(!shard) continue;
                 for(int n0=0;n0<MC_GRID3;++n0){
                     uint64_t co; memcpy(&co,arc+shard+(size_t)n0*8,8);
-                    if(!co) continue;
+                    if(co<=MC_SLOT_ZERO) continue;
                     total++;
                     uint64_t blen=mc_chunk_blob_len(arc,co);
                     uint64_t want=mc_chunk_stored_hash(arc,co);
@@ -2346,7 +2362,7 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
 }
 
 void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
-    if(!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    if(chunk_off<=MC_SLOT_ZERO){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     if(!r->arc && r->partial){
         if(spartial_decode(r,chunk_off,(bz*16+by)*16+bx,dst)==0) return;
         memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return;

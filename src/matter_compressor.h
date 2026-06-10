@@ -118,7 +118,10 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
 typedef struct mc_archive mc_archive;
 
 // Per-chunk coverage (queried without decoding).
-typedef enum { MC_ABSENT = 0, MC_PRESENT = 1 } mc_cover;
+// Chunk coverage: ABSENT = never fetched (slot 0, must fetch from source);
+// PRESENT = has DCT data; ZERO = fetched and decodes to all-zero (air). The
+// ZERO state lets a re-run / prefetch skip air chunks instead of re-fetching.
+typedef enum { MC_ABSENT = 0, MC_PRESENT = 1, MC_ZERO = 2 } mc_cover;
 
 // Open (or create) an archive at `path` for a volume of edge `dim` (multiple of
 // MC_CHUNK_ALIGN=256) at the given `quality`. If the file exists and is a valid mc
