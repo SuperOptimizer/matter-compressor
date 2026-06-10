@@ -32,6 +32,19 @@ set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
 target_link_libraries(matter_compressor m Threads::Threads)
 
+# The codec is the hot path; build it -O3 -ffast-math -march=native regardless of
+# how a parent project (vendoring via add_subdirectory) sets global flags. The
+# MC_STANDALONE block above already does this for standalone builds; this target-
+# scoped copy guarantees it when vendored too. -DMC_NO_NATIVE=ON for portable builds.
+target_compile_options(matter_compressor PRIVATE -O3 -ffast-math -Wno-stringop-overflow)
+if(NOT MC_NO_NATIVE)
+  include(CheckCCompilerFlag)
+  check_c_compiler_flag(-march=native MC_HAS_MARCH_NATIVE)
+  if(MC_HAS_MARCH_NATIVE)
+    target_compile_options(matter_compressor PRIVATE -march=native)
+  endif()
+endif()
+
 # Tests + native flags only when built standalone (vendoring consumers don't want our
 # test exes added to their build).
 if(MC_STANDALONE)
