@@ -133,6 +133,33 @@ int main(void){
     printf("ml: OK (fractions %.2f/%.2f, %d sampled boxes, region+batch reads exact)\n",f_mat,f_air,n1);
     mc_archive_close(a);
 
+    // 6) robustness: decode randomly corrupted chunks — garbage is fine,
+    // crashes/OOB are not (run under ASan in CI for full effect).
+    remove(path);
+    a=mc_archive_open_dims(path,256,256,256,6.0f);
+    for(size_t i=0;i<sizeof chunk;++i) chunk[i]=(mc_u8)((i%41)?30+(i%170):0);
+    mc_archive_append_chunk_raw_q(a,0,0,0,0,chunk,3.0f);
+    uint64_t cof=mc_archive_chunk_offset(a,0,0,0,0);
+    unsigned rs6=7;
+    static mc_u8 sink[4096];
+    for(int trial=0;trial<200;++trial){
+        rs6^=rs6<<13; rs6^=rs6>>17; rs6^=rs6<<5;
+        uint64_t off=cof+16+(rs6%200000);
+        mc_u8 *base=(mc_u8*)0;
+        (void)base;
+        // flip a byte in the live mapping via the archive fd path: use the
+        // mmap through a second handle is overkill — corrupt via file I/O.
+        FILE *cf=fopen(path,"rb+");
+        fseek(cf,(long)off,SEEK_SET);
+        int b6=fgetc(cf); fseek(cf,(long)off,SEEK_SET); fputc((b6^0x5A)&0xFF,cf); fclose(cf);
+        for(int bz6=0;bz6<16;bz6+=5)for(int by6=0;by6<16;by6+=5)for(int bx6=0;bx6<16;bx6+=5)
+            mc_archive_decode_block(a,cof,bz6,by6,bx6,sink);
+        FILE *cf2=fopen(path,"rb+");
+        fseek(cf2,(long)off,SEEK_SET); fputc(b6,cf2); fclose(cf2);
+    }
+    printf("fuzz: OK (200 corrupted-chunk decode rounds, no crash)\n");
+    mc_archive_close(a);
+
     free(arc); remove(path);
     printf("mc_v6: OK\n");
     return 0;
