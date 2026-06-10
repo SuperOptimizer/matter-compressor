@@ -1,5 +1,6 @@
 // mc_volume — see mc_volume.h. Streaming + transcode + cache + prefetch over a
 // local .mca, source = mc_zarr, decode = vendored c3d (+ mc_zarr's blosc/raw).
+#define _GNU_SOURCE                  // pthread_setname_np
 #include "mc_volume.h"
 #include "mc_zarr.h"
 #include "c3d.h"
@@ -198,6 +199,7 @@ done:
 // Decode-pool worker: drain decode items, decode off the download thread.
 static void *decoder_main(void *ud) {
     mc_volume *v = ud;
+    pthread_setname_np(pthread_self(), "mc-decode");   // distinguish in profilers
     for (;;) {
         pthread_mutex_lock(&v->mu);
         while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
@@ -258,6 +260,7 @@ static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
 // Download thread: pop the newest request, download its shard (-> decode queue).
 static void *dl_main(void *ud) {
     mc_volume *v = ud;
+    pthread_setname_np(pthread_self(), "mc-download");   // distinguish in profilers
     for (;;) {
         pthread_mutex_lock(&v->mu);
         while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
