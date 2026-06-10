@@ -36,6 +36,12 @@ struct mc_sample_src {
     const uint8_t *(*block)(const mc_sample_src *src,
                             int bz, int by, int bx, uint8_t *tmp);
     int nz, ny, nx;                       // voxel dims of the sampled level
+    // Optional direct path: when set, samplers address voxels straight off
+    // this base pointer (voxel (z,y,x) at dense[z*dsy + y*dsx + x]) and
+    // never call block(). mc_sample_src_dense sets it; blocked sources
+    // leave it NULL.
+    const uint8_t *dense;
+    size_t dsy, dsx;
 };
 
 // Ready-made sources:
