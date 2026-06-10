@@ -4,7 +4,7 @@
 #include "mc_zarr.h"
 #include "c3d.h"
 #include "matter_compressor.h"
-#include "../tools/vendor/libs3/libs3.h"
+#include "libs3.h"   // include dir provides it (tools/vendor/libs3 or VC's libs/libs3)
 
 #include <stdio.h>
 #include <stdlib.h>
