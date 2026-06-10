@@ -23,6 +23,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct mc_zarr mc_zarr;
 
 // Byte source. `key` is an object key relative to the level root (e.g. "c/3/0/1"
@@ -67,5 +71,9 @@ int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
 // 1 if the chunk is absent (air) with *raw NULL. <0 on error.
 int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx,
                        uint8_t **raw, size_t *len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

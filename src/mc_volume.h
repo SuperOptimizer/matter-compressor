@@ -19,6 +19,10 @@
 #include <stddef.h>
 #include "mc_sample.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct mc_volume mc_volume;
 
 // Open a remote volume rooted at `url` (an NGFF multiscales zarr group; levels
@@ -70,5 +74,9 @@ typedef struct {
     uint64_t regions_inflight;           // single-flight depth right now
 } mc_volume_stats;
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
