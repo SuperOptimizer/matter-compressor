@@ -45,4 +45,27 @@ if(MC_STANDALONE)
   add_executable(mc_append_roundtrip tests/mc_append_roundtrip.c)
   target_link_libraries(mc_append_roundtrip matter_compressor)
   add_test(NAME append_roundtrip COMMAND mc_append_roundtrip)
+
+  add_executable(mc_stream_partial tests/mc_stream_partial.c)
+  target_link_libraries(mc_stream_partial matter_compressor)
+  add_test(NAME stream_partial COMMAND mc_stream_partial)
+
+  # tools: benchmark harness (no extra deps) + zarr fetcher (libcurl + libzstd).
+  add_executable(mc_bench tools/mc_bench.c)
+  target_link_libraries(mc_bench matter_compressor)
+
+  # fysics-style aggressive air masking preprocessor (no deps)
+  add_executable(mc_mask tools/mc_mask.c)
+
+  find_package(CURL QUIET)
+  find_library(ZSTD_LIB zstd HINTS /opt/homebrew/lib /usr/local/lib)
+  find_path(ZSTD_INC zstd.h HINTS /opt/homebrew/include /usr/local/include)
+  if(CURL_FOUND AND ZSTD_LIB AND ZSTD_INC)
+    add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
+    target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})
+    set_property(TARGET mc_fetch PROPERTY C_STANDARD 23)
+    target_link_libraries(mc_fetch CURL::libcurl ${ZSTD_LIB})
+  else()
+    message(STATUS "mc_fetch skipped (need libcurl + libzstd)")
+  endif()
 endif()
