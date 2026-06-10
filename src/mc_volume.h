@@ -17,6 +17,7 @@
 #define MC_VOLUME_H
 #include <stdint.h>
 #include <stddef.h>
+#include "mc_sample.h"
 
 typedef struct mc_volume mc_volume;
 
@@ -55,6 +56,12 @@ void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int 
 // `cb` must be cheap and thread-safe (e.g. set a flag / post to the UI loop).
 typedef void (*mc_volume_ready_fn)(void *ud);
 void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud);
+
+// Sampling source over one level (see mc_sample.h / mc_render.h).
+// blocking=0: try_block semantics — absent regions sample as 0 and kick one
+//             deduped background transcode (interactive render path).
+// blocking=1: absent regions are transcoded synchronously first (batch path).
+mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking);
 
 typedef struct {
     uint64_t cache_hits, cache_misses;   // mc_cache residency

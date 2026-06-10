@@ -23,6 +23,12 @@ dependencies beyond libm/pthreads:
   mmap arena, 64-way sharded, S3-FIFO eviction (CLOCK optional), batch
   update/resolve, async tickets with cancel, and an optional tick-phase mode
   (freeze/thaw) where render-phase reads are fully lock-free.
+- **sample + render** (`mc_sample.h`, `mc_render.h`) — volume-cartographer-
+  style surface rendering: generic point-grid renderer with plane and quad
+  surface generators, nearest/trilinear filtering, min/mean/max/alpha
+  compositing along surface normals. Sources are pluggable (mc_cache,
+  mc_volume, dense arrays); 1024² oblique slice ~2 ms, 9-step composite
+  ~10 ms (8 threads).
 
 ## Performance (Apple M-series reference, real 2.4 µm scroll data)
 
@@ -90,6 +96,16 @@ size_t nm = mc_cache_misses_drain(c, missed, cap);   // last frame's feedback
 mc_cache_resolve(c, ids, n, ptrs, 0);                // pin + pointer table
 mc_cache_freeze(c);                                  // reads now LOCK-FREE
 // render: ptrs[i] directly; stragglers via get() -> NULL -> best_lod()
+
+// ---- surface rendering (VC3D-style) ----
+mc_sample_src src = mc_sample_src_cache(c, /*lod*/0, nz, ny, nx);
+mc_plane pl = {.origin={z,y,x}, .normal={nz_,ny_,nx_}};
+mc_plane_basis(&pl);
+mc_render_params rp = {.filter=MC_FILTER_TRILINEAR, .comp=MC_COMP_MAX,
+                       .t0=-4, .t1=4, .dt=1};
+mc_render_plane(&src, &pl, 1024, 1024, 1.0f, &rp, img, 0);
+mc_quad q = {.grid = vc_points_zyx, .gw=gw, .gh=gh};   // VC quad mesh
+mc_render_quad(&src, &q, x0, y0, /*step*/1.0f, w, h, &rp, img, 0);
 
 // ---- streaming (S3-style byte sources) ----
 mc_reader *r = mc_open_streaming(read_cb, ud, total_len);

@@ -391,6 +391,24 @@ int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
 }
 
 // ---------------------------------------------------------------------------
+// sampling source
+// ---------------------------------------------------------------------------
+static const uint8_t *vol_block(const mc_sample_src *src,
+                                int bz, int by, int bx, uint8_t *tmp) {
+    mc_volume *v = src->ud;
+    int r = src->aux2 ? mc_volume_get_block(v, src->aux, bz, by, bx, tmp)
+                      : mc_volume_try_block(v, src->aux, bz, by, bx, tmp);
+    return r == 1 ? tmp : NULL;
+}
+
+mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking) {
+    mc_sample_src s = {0};
+    s.ud = v; s.aux = lod; s.aux2 = blocking; s.block = vol_block;
+    mc_volume_shape(v, lod, &s.nz, &s.ny, &s.nx);
+    return s;
+}
+
+// ---------------------------------------------------------------------------
 // prefetch
 // ---------------------------------------------------------------------------
 typedef struct { mc_volume *v; int lod; } shard_ctx;

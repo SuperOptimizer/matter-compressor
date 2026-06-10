@@ -59,7 +59,9 @@ endif()
 
 # core library: codec + archive (deps: libm + pthread for the appendable writer)
 add_library(matter_compressor STATIC
-  src/matter_compressor.c)
+  src/matter_compressor.c
+  src/mc_sample.c
+  src/mc_render.c)
 target_include_directories(matter_compressor PUBLIC src)
 set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
@@ -102,6 +104,10 @@ if(MC_STANDALONE)
   add_executable(mc_cache_test tests/mc_cache_test.c)
   target_link_libraries(mc_cache_test matter_compressor)
   add_test(NAME cache COMMAND mc_cache_test)
+
+  add_executable(mc_render_test tests/mc_render_test.c)
+  target_link_libraries(mc_render_test matter_compressor)
+  add_test(NAME render COMMAND mc_render_test)
 
   # archive repacker: Morton order + clustered index for streaming + offline
   add_executable(mc_export tools/mc_export.c)
