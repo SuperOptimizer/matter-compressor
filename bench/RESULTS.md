@@ -204,3 +204,22 @@ optional max-error corrections + optional decode-side deblock; archive v5
 (self-contained blocks, partial-fetch streaming, node-table caching, Morton/
 clustered-index export); mc_cache with S3-FIFO (default) / CLOCK eviction.
 Verified at parity after cleanup: q=6 33.8x @ 35.83 dB, q=12 51.4x, 4/4 tests.
+
+## v6 + throughput round (2026-06-10)
+
+Format v6: per-axis dims (256-padded), per-chunk q stored in each blob
+(thread-local quality state -> lock-free mixed-q decode), xxh64 integrity per
+chunk + mc_verify, per-volume trained-prior blobs, rate control
+(mc_archive_append_chunk_target: 1/16 sample + one power-law step; target 30x
+-> 28.5x on real data, q adapting 3.6-6.1/chunk, ~6% encode overhead).
+
+Throughput (M-series, full clocks, 2.4um masked, q=6):
+- SIMD kernels (NEON measured, AVX2 verified bit-identical under Rosetta,
+  AVX-512 opt-in compile-tested, SVE skipped by design — every hot kernel is
+  a fixed 8-lane i32 problem that two NEON q-regs / one ymm saturate):
+  fwdDCT 9.3 -> 4.4 us/blk, invDCT 7.3 -> 6.0 us/blk, vectorized clamp/store.
+  Codec-only: encode 124 -> 146 MB/s, decode ~240 -> 313 MB/s.
+- Parallel whole-chunk helpers: encode 120 -> 617 MB/s (5.1x),
+  decode 223 -> 1513 MB/s (6.8x), blob byte-identical to serial.
+- Cross-ISA bitstream identity verified (NEON vs AVX2 archive md5-equal).
+Single-block cold latency: 0.013 ms. Ratio/quality unchanged (33.8x @ 35.83).

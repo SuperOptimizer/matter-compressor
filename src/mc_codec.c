@@ -315,10 +315,28 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
     (void)ey;(void)ex;
     for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],g_step_tab[idx]);
     mc_dct3_inv(coef,blk);
+#if MC_SIMD_NEON
+    {   // vectorized clamp+dc+air store: 16 voxels per iteration
+        int32x4_t vdc=vdupq_n_s32(dc);
+        for(int i=0;i<n;i+=16){
+            int32x4_t a0=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i)),vdc);
+            int32x4_t a1=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i+4)),vdc);
+            int32x4_t a2=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i+8)),vdc);
+            int32x4_t a3=vaddq_s32(vcvtnq_s32_f32(vld1q_f32(blk+i+12)),vdc);
+            uint16x8_t p0=vcombine_u16(vqmovun_s32(a0),vqmovun_s32(a1));
+            uint16x8_t p1=vcombine_u16(vqmovun_s32(a2),vqmovun_s32(a3));
+            uint8x16_t v8=vcombine_u8(vqmovn_u16(p0),vqmovn_u16(p1));
+            uint8x16_t am=vld1q_u8(air+i);
+            v8=vbicq_u8(v8,vtstq_u8(am,am));               // air -> 0
+            vst1q_u8(dst+i,v8);
+        }
+    }
+#else
     for(int i=0;i<n;++i){
         int v = air[i] ? 0 : (int)lrintf(blk[i])+dc;  // mask-restore: air -> exactly 0
         if(v<0)v=0; if(v>255)v=255; dst[i]=(mc_u8)v;
     }
+#endif
     if(flags&2){                                      // sparse max-error corrections
         rc_u32 ncorr=dec_eg(&d)+1, pos=0;
         for(rc_u32 c=0;c<ncorr;++c){
