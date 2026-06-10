@@ -16,9 +16,10 @@ typedef uint32_t rc_u32; typedef uint64_t rc_u64;
 
 typedef struct { rc_u8 *buf; size_t cap, len; rc_u64 low; rc_u32 range; rc_u8 cache; rc_u64 cache_size; } rc_enc;
 typedef struct { const rc_u8 *buf; size_t len, pos; rc_u32 code, range; } rc_dec;
-typedef struct { uint16_t p0; } ctx_t;
-static inline void ctx_init(ctx_t *c){ c->p0 = 1u<<11; }
-static inline void ctx_init_p(ctx_t *c, uint16_t p0){ c->p0 = p0; }
+typedef struct { uint16_t p0; uint8_t sh; } ctx_t;   // sh = adaptation shift (PARA)
+static inline void ctx_init(ctx_t *c){ c->p0 = 1u<<11; c->sh = 4; }
+static inline void ctx_init_p(ctx_t *c, uint16_t p0){ c->p0 = p0; c->sh = 4; }
+static inline void ctx_init_ps(ctx_t *c, uint16_t p0, uint8_t sh){ c->p0 = p0; c->sh = sh; }
 #define RC_TOP (1u<<24)
 
 // ---- trained context priors -------------------------------------------------
@@ -71,6 +72,8 @@ static void rc_prior_build(float q){
         g_pri[c][s]=(uint16_t)(RC_PLO[c][s]+(RC_PHI[c][s]-RC_PLO[c][s])*w+0.5f);
     g_pri_q=q;
 }
+// per-class adaptation shifts (PARA-style; tuned on corpus): smaller = faster
+static const uint8_t RC_SHIFT[8]={4,4,4,4,4,4,4,4};   // SIG MAG EOB MASK MASKU MASKA FLAG DC
 #define RC_PRIOR_SIG   g_pri[0]
 #define RC_PRIOR_MAG   g_pri[1]
 #define RC_PRIOR_EOB   g_pri[2]
@@ -92,8 +95,8 @@ static void enc_shift_low(rc_enc *e){
 }
 static void enc_bit(rc_enc *e, ctx_t *c, int bit){
     rc_u32 r0=(e->range>>12)*c->p0;
-    if(bit==0){ e->range=r0; c->p0=(uint16_t)(c->p0+((4096-c->p0)>>4)); }
-    else { e->low+=r0; e->range-=r0; c->p0=(uint16_t)(c->p0-(c->p0>>4)); }
+    if(bit==0){ e->range=r0; c->p0=(uint16_t)(c->p0+((4096-c->p0)>>c->sh)); }
+    else { e->low+=r0; e->range-=r0; c->p0=(uint16_t)(c->p0-(c->p0>>c->sh)); }
     while(e->range<RC_TOP){ enc_shift_low(e); e->range<<=8; }
 }
 static void enc_bypass(rc_enc *e, int bit){ e->range>>=1; if(bit) e->low+=e->range; while(e->range<RC_TOP){ enc_shift_low(e); e->range<<=8; } }
@@ -102,8 +105,8 @@ static void enc_flush(rc_enc *e){ for(int i=0;i<5;++i) enc_shift_low(e); }
 static void dec_init(rc_dec *d,const rc_u8*buf,size_t len){ d->buf=buf;d->len=len;d->pos=0;d->code=0;d->range=0xFFFFFFFFu; for(int i=0;i<5;++i){ rc_u8 b=(d->pos<d->len)?d->buf[d->pos++]:0; d->code=(d->code<<8)|b; } }
 static int dec_bit(rc_dec *d, ctx_t *c){
     rc_u32 r0=(d->range>>12)*c->p0; int bit;
-    if(d->code<r0){ d->range=r0;bit=0; c->p0=(uint16_t)(c->p0+((4096-c->p0)>>4)); }
-    else { d->code-=r0; d->range-=r0; bit=1; c->p0=(uint16_t)(c->p0-(c->p0>>4)); }
+    if(d->code<r0){ d->range=r0;bit=0; c->p0=(uint16_t)(c->p0+((4096-c->p0)>>c->sh)); }
+    else { d->code-=r0; d->range-=r0; bit=1; c->p0=(uint16_t)(c->p0-(c->p0>>c->sh)); }
     while(d->range<RC_TOP){ rc_u8 b=(d->pos<d->len)?d->buf[d->pos++]:0; d->code=(d->code<<8)|b; d->range<<=8; }
     return bit;
 }
@@ -138,8 +141,8 @@ typedef struct {
                                // own magnitude distribution)
 } atom_ctx;
 static void atom_ctx_init(atom_ctx *a){
-    for(int i=0;i<NB_BANDS*4;++i) ctx_init_p(&a->sig[i],RC_PRIOR_SIG[i]);
-    for(int i=0;i<MAGCTX;++i)     ctx_init_p(&a->mag[i],RC_PRIOR_MAG[i]);
+    for(int i=0;i<NB_BANDS*4;++i) ctx_init_ps(&a->sig[i],RC_PRIOR_SIG[i],RC_SHIFT[0]);
+    for(int i=0;i<MAGCTX;++i)     ctx_init_ps(&a->mag[i],RC_PRIOR_MAG[i],RC_SHIFT[1]);
 }
 static void enc_magnitude(rc_enc*e,atom_ctx*ac,rc_u32 m){
     ctx_t*mag=ac->mag; rc_u32 v=m-1,k=0;
@@ -180,7 +183,7 @@ static inline int band_of_S(rc_u32 idx,int S){
 // low bits in bypass. v in [0, n]; prefix k = MSB position + 1 (0 -> v==0).
 #define EOB_CTX 14
 typedef struct { ctx_t pfx[EOB_CTX]; } eob_ctx;
-static void eob_ctx_init(eob_ctx*c){ for(int i=0;i<EOB_CTX;++i) ctx_init_p(&c->pfx[i],RC_PRIOR_EOB[i]); }
+static void eob_ctx_init(eob_ctx*c){ for(int i=0;i<EOB_CTX;++i) ctx_init_ps(&c->pfx[i],RC_PRIOR_EOB[i],RC_SHIFT[2]); }
 static void enc_eob(rc_enc*e,eob_ctx*c,rc_u32 v,int n){
     int kmax=0; while((1u<<kmax)<=(rc_u32)n) kmax++;          // 13 for n=4096
     int k=0; while((1u<<k)<=v) k++;                            // MSB+1 (0 for v=0)

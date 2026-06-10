@@ -143,7 +143,10 @@ Ranked by impact/complexity for this codec (AV2 paper arXiv:2601.02712 was the
 key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
 1. 3D LFNST/IST-style trained secondary transform on the low-band corner
    (dense trained matvec, 64→32, always-on first). Est 1–3% ratio.
-2. PARA per-context adaptation-rate tuning (per-class shift offsets). ~free.
+2. PARA per-context adaptation-rate tuning — IMPLEMENTED (per-context shift in
+   ctx_t, per-class table). Coordinate descent on the corpus found shift 4
+   already optimal for every class (the earlier global 5→4 change captured the
+   gain); the infrastructure stays for future corpora.
 3. ATC-style split entropy: adaptive bins on the LF corner + static rANS on
    the HF bulk — recovers most of rANS's +1.6% loss, keeps ~2× decode.
 4. TCQ trellis quantization (parity-driven 4–9 state lattice; distinct

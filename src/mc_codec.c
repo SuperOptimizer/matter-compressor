@@ -116,9 +116,9 @@ static inline mc_i32 rdoq_level(float a, float step, int b, mc_i32 m){
 // ~3-6x on boundary blocks (most blocks of a masked scroll volume).
 #define MSUB 4
 static void enc_blockmask(rc_enc *e, const mc_u8 *vox){
-    ctx_t ctx[8]; for(int i=0;i<8;++i) ctx_init_p(&ctx[i],RC_PRIOR_MASK[i]);
-    ctx_t cu[4];  for(int i=0;i<4;++i) ctx_init_p(&cu[i],RC_PRIOR_MASKU[i]);
-    ctx_t ca[2];  for(int i=0;i<2;++i) ctx_init_p(&ca[i],RC_PRIOR_MASKA[i]);
+    ctx_t ctx[8]; for(int i=0;i<8;++i) ctx_init_ps(&ctx[i],RC_PRIOR_MASK[i],RC_SHIFT[3]);
+    ctx_t cu[4];  for(int i=0;i<4;++i) ctx_init_ps(&cu[i],RC_PRIOR_MASKU[i],RC_SHIFT[4]);
+    ctx_t ca[2];  for(int i=0;i<2;++i) ctx_init_ps(&ca[i],RC_PRIOR_MASKA[i],RC_SHIFT[5]);
     const int S=MC_BLK, G=S/MSUB;
     static _Thread_local mc_u8 air[N3];
     mc_u8 sc[4*4*4];                       // subcube class: 0=material,1=air,2=mixed
@@ -155,9 +155,9 @@ static void enc_blockmask(rc_enc *e, const mc_u8 *vox){
     }
 }
 static void dec_blockmask(rc_dec *d, mc_u8 *air){
-    ctx_t ctx[8]; for(int i=0;i<8;++i) ctx_init_p(&ctx[i],RC_PRIOR_MASK[i]);
-    ctx_t cu[4];  for(int i=0;i<4;++i) ctx_init_p(&cu[i],RC_PRIOR_MASKU[i]);
-    ctx_t ca[2];  for(int i=0;i<2;++i) ctx_init_p(&ca[i],RC_PRIOR_MASKA[i]);
+    ctx_t ctx[8]; for(int i=0;i<8;++i) ctx_init_ps(&ctx[i],RC_PRIOR_MASK[i],RC_SHIFT[3]);
+    ctx_t cu[4];  for(int i=0;i<4;++i) ctx_init_ps(&cu[i],RC_PRIOR_MASKU[i],RC_SHIFT[4]);
+    ctx_t ca[2];  for(int i=0;i<2;++i) ctx_init_ps(&ca[i],RC_PRIOR_MASKA[i],RC_SHIFT[5]);
     const int S=MC_BLK, G=S/MSUB;
     mc_u8 sc[4*4*4];
     for(int sz=0;sz<G;++sz)for(int sy=0;sy<G;++sy)for(int sx=0;sx<G;++sx){
@@ -347,8 +347,8 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
 
     rc_enc e; enc_init(&e,scratch,sizeof scratch);
     {   // header bins: mixed, has-corr, qpd, dc (trained priors)
-        ctx_t cf[4]; for(int i=0;i<4;++i) ctx_init_p(&cf[i],RC_PRIOR_FLAG[i]);
-        ctx_t cd[8]; for(int i=0;i<8;++i) ctx_init_p(&cd[i],RC_PRIOR_DC[i]);
+        ctx_t cf[4]; for(int i=0;i<4;++i) ctx_init_ps(&cf[i],RC_PRIOR_FLAG[i],RC_SHIFT[6]);
+        ctx_t cd[8]; for(int i=0;i<8;++i) ctx_init_ps(&cd[i],RC_PRIOR_DC[i],RC_SHIFT[7]);
         RC_TRAIN(RCC_FLAG,0,nair>0);  enc_bit(&e,&cf[0],nair>0);
         RC_TRAIN(RCC_FLAG,1,ncorr>0); enc_bit(&e,&cf[1],ncorr>0);
         RC_TRAIN(RCC_FLAG,2,(qpd>>1)&1); enc_bit(&e,&cf[2],(qpd>>1)&1);
@@ -381,8 +381,8 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
     static _Thread_local rc_i16 ql[N3];
     rc_dec d; dec_init(&d,p,plen);
     {   // header bins (must mirror the encoder exactly)
-        ctx_t cf[4]; for(int i=0;i<4;++i) ctx_init_p(&cf[i],RC_PRIOR_FLAG[i]);
-        ctx_t cd[8]; for(int i=0;i<8;++i) ctx_init_p(&cd[i],RC_PRIOR_DC[i]);
+        ctx_t cf[4]; for(int i=0;i<4;++i) ctx_init_ps(&cf[i],RC_PRIOR_FLAG[i],RC_SHIFT[6]);
+        ctx_t cd[8]; for(int i=0;i<8;++i) ctx_init_ps(&cd[i],RC_PRIOR_DC[i],RC_SHIFT[7]);
         flags |= dec_bit(&d,&cf[0]) ? 1 : 0;
         flags |= dec_bit(&d,&cf[1]) ? 2 : 0;
         int q1=dec_bit(&d,&cf[2]), q0=dec_bit(&d,&cf[3]);
