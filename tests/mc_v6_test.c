@@ -71,7 +71,27 @@ int main(void){
     buf[ca+2000]^=0x55;
     if(mc_verify_archive(buf,(size_t)flen,0)!=1){ fprintf(stderr,"FAIL: tamper not detected\n"); return 1; }
     printf("verify: OK (clean passes, tamper detected)\n");
-    free(buf); free(arc); remove(path);
+    free(buf);
+
+    // 4) parallel chunk encode/decode == serial, and verify still passes
+    remove(path);
+    a=mc_archive_open_dims(path,512,256,256,6.0f);
+    for(size_t i=0;i<sizeof chunk;++i) chunk[i]=(mc_u8)((i%37)?30+(i%170):0);
+    if(mc_archive_append_chunk_raw_q(a,0,0,0,0,chunk,6.0f)!=0) return 1;       // serial
+    if(mc_archive_append_chunk_par(a,0,0,0,1,chunk,6.0f,0)!=0) return 1;       // parallel
+    uint64_t cs=mc_archive_chunk_offset(a,0,0,0,0), cp=mc_archive_chunk_offset(a,0,0,0,1);
+    static mc_u8 outs[256*256*256], outp[256*256*256];
+    mc_archive_decode_chunk(a,cs,outs,1);       // serial decode
+    mc_archive_decode_chunk(a,cp,outp,0);       // parallel decode
+    if(memcmp(outs,outp,sizeof outs)!=0){ fprintf(stderr,"FAIL: par chunk != serial chunk\n"); return 1; }
+    mc_archive_close(a);
+    FILE *f4=fopen(path,"rb"); fseek(f4,0,SEEK_END); long fl4=ftell(f4); fseek(f4,0,SEEK_SET);
+    uint8_t *b4=malloc((size_t)fl4); fread(b4,1,(size_t)fl4,f4); fclose(f4);
+    if(mc_verify_archive(b4,(size_t)fl4,0)!=0){ fprintf(stderr,"FAIL: verify after par append\n"); return 1; }
+    free(b4);
+    printf("parallel: OK (par==serial, verify clean)\n");
+
+    free(arc); remove(path);
     printf("mc_v6: OK\n");
     return 0;
 }

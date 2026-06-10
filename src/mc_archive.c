@@ -26,6 +26,7 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #if defined(__unix__) || defined(__APPLE__)
   #include <sys/mman.h>
@@ -514,6 +515,115 @@ void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,in
     uint64_t boff; uint32_t bl;
     if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     mc_dec_block(a->base+boff,bl,dst);
+}
+
+// ---- parallel whole-chunk helpers ------------------------------------------
+typedef struct {
+    mc_archive *a; uint64_t chunk_off; mc_u8 *out; float q;
+    _Atomic uint32_t next;
+} dchunk_ctx;
+static void *dchunk_worker(void *p){
+    dchunk_ctx *c=p;
+    mc_set_quality(c->q);                       // thread-local
+    mc_u8 blk[MC_BLK*MC_BLK*MC_BLK];
+    for(;;){
+        uint32_t bi=atomic_fetch_add_explicit(&c->next,1,memory_order_relaxed);
+        if(bi>=MC_GRID3) break;
+        int bz=bi>>8, by=(bi>>4)&15, bx=bi&15;
+        mc_archive_decode_block(c->a,c->chunk_off,bz,by,bx,blk);
+        for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)
+            memcpy(c->out+((size_t)(bz*16+z)*MC_CHUNK+(by*16+y))*MC_CHUNK+(size_t)bx*16,
+                   blk+((size_t)z*16+y)*16,16);
+    }
+    return NULL;
+}
+static int auto_threads(int nthreads){
+    if(nthreads>0) return nthreads>16?16:nthreads;
+    long nc=sysconf(_SC_NPROCESSORS_ONLN);
+    int nt=(int)(nc>0?nc:4); return nt>16?16:nt;
+}
+void mc_archive_decode_chunk(mc_archive *a, uint64_t chunk_off, mc_u8 *out, int nthreads){
+    if(!a||!out) return;
+    if(!chunk_off){ memset(out,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK); return; }
+    dchunk_ctx c={.a=a,.chunk_off=chunk_off,.out=out,.q=mc_chunk_q(a->base,chunk_off)};
+    atomic_store(&c.next,0);
+    int nt=auto_threads(nthreads);
+    if(nt<=1){ dchunk_worker(&c); return; }
+    pthread_t th[16];
+    for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,dchunk_worker,&c);
+    for(int t=0;t<nt;++t) pthread_join(th[t],NULL);
+}
+
+// parallel encode: stripes of blocks into per-worker buffers, stitched in
+// bitmap order so the blob is byte-identical to the serial path.
+#define ENC_STRIPES 16
+typedef struct {
+    const mc_u8 *vox; float q;
+    mc_buf bufs[ENC_STRIPES];
+    uint16_t blen[MC_GRID3];
+    uint8_t  bm[MC_BITMAP_BYTES];
+    pthread_mutex_t bm_mu;
+    _Atomic uint32_t next;
+} echunk_ctx;
+static void *echunk_worker(void *p){
+    echunk_ctx *c=p;
+    mc_set_quality(c->q);
+    static _Thread_local u8 blk[MC_BLK*MC_BLK*MC_BLK];
+    for(;;){
+        uint32_t s=atomic_fetch_add_explicit(&c->next,1,memory_order_relaxed);
+        if(s>=ENC_STRIPES) break;
+        uint32_t b0=s*(MC_GRID3/ENC_STRIPES), b1=b0+(MC_GRID3/ENC_STRIPES);
+        for(uint32_t bi=b0;bi<b1;++bi){
+            int bz=(int)(bi>>8), by=(int)((bi>>4)&15), bx=(int)(bi&15);
+            if(!gather_blk256(c->vox,bz,by,bx,blk)) continue;
+            uint32_t len=0;
+            if(mc_enc_block(blk,&c->bufs[s],&len)){
+                c->blen[bi]=(uint16_t)len;
+                pthread_mutex_lock(&c->bm_mu);
+                mc_bit_set(c->bm,bi);
+                pthread_mutex_unlock(&c->bm_mu);
+            }
+        }
+    }
+    return NULL;
+}
+int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
+                                const mc_u8 vox[256*256*256], float q, int nthreads){
+    if(!a||lod<0||lod>7||!vox) return -1;
+    echunk_ctx *c=calloc(1,sizeof *c);
+    c->vox=vox; c->q=q>0?q:a->quality;
+    pthread_mutex_init(&c->bm_mu,NULL);
+    atomic_store(&c->next,0);
+    int nt=auto_threads(nthreads); if(nt>ENC_STRIPES)nt=ENC_STRIPES;
+    if(nt<=1) echunk_worker(c);
+    else {
+        pthread_t th[16];
+        for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,echunk_worker,c);
+        for(int t=0;t<nt;++t) pthread_join(th[t],NULL);
+    }
+    int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(c->bm[i]);
+    int rc=0;
+    if(npresent){
+        // stitch: stripes hold payloads in ascending-bi order within the stripe,
+        // so concatenating stripes in order matches the serial blob layout.
+        stage_t st={0};
+        static _Thread_local uint16_t lens16[MC_GRID3];
+        int nl=0;
+        for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(c->bm,bi)) lens16[nl++]=c->blen[bi];
+        float qq=c->q; uint64_t h=0;
+        stage_put(&st,&qq,4); stage_put(&st,&h,8);          // hash patched below
+        stage_put(&st,c->bm,MC_BITMAP_BYTES);
+        stage_put(&st,lens16,(size_t)nl*2);
+        for(int s=0;s<ENC_STRIPES;++s) if(c->bufs[s].len) stage_put(&st,c->bufs[s].p,c->bufs[s].len);
+        h=mc_chunk_compute_hash(st.p,(uint64_t)st.len);     // same bytes => same hash as serial
+        memcpy(st.p+4,&h,8);
+        rc=w_install_blob(a,lod,cz,cy,cx,st.p,st.len);
+        free(st.p);
+    }
+    for(int s=0;s<ENC_STRIPES;++s) free(c->bufs[s].p);
+    pthread_mutex_destroy(&c->bm_mu);
+    free(c);
+    return rc;
 }
 
 void mc_archive_close(mc_archive *a){

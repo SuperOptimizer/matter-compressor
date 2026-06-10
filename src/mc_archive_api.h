@@ -104,6 +104,16 @@ uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx);
 // appends.
 void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst);
 
+// Decode a WHOLE 256^3 chunk into `out` (z,y,x raster), using an internal
+// worker pool over the chunk's 4096 independent blocks (nthreads = 0 -> one
+// per core, capped 16; 1 = serial). chunk_off==0 zero-fills.
+void mc_archive_decode_chunk(mc_archive *a, uint64_t chunk_off, mc_u8 *out, int nthreads);
+
+// Parallel append: encode the chunk's blocks with an internal worker pool,
+// then install the assembled blob (identical bytes to the serial path).
+int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
+                                const mc_u8 vox[256*256*256], float q, int nthreads);
+
 // Flush + close (msync, persist header, truncate to exact length).
 void mc_archive_close(mc_archive *a);
 
