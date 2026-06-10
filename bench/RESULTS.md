@@ -270,3 +270,53 @@ frame's own inserts until the next thaw. DUAL MODE: clients that never call
 freeze() get the original always-thread-safe multi-reader/multi-writer
 behavior unchanged (pins are inert until the first freeze; eviction sweeps
 are bounded so pathological pin states can never livelock).
+
+## Toolchain study (M-series, q=6, same-moment A/B)
+
+apple clang 17: 134/342 enc/dec MB/s · brew clang 22: 133/338 ·
+clang+LTO(+lld): ~130/287 (LTO = -15% decode, both clang versions — the
+codec is a single TU so LTO adds only harmful code-layout churn; do NOT
+enable IPO/-flto) · gcc 15: 97/354 (-28% encode; ship clang everywhere).
+Bitstreams identical across all toolchains.
+
+## PGO study
+
+PGO (+3.5-4% decode) and PGO+LTO (+5% decode, q6 344->362, q12 446->470)
+on brew clang 22 — with real branch profiles the code-layout churn that made
+plain LTO harmful (-15%) becomes a win. Encode neutral. Recipe:
+  clang -O3 -ffast-math -march=native -fprofile-instr-generate ... -> run
+  mc_bench over representative volumes -> llvm-profdata merge ->
+  rebuild with -fprofile-instr-use=merged.profdata -flto -fuse-ld=lld.
+Ratio/quality bit-identical. Recommended for fleet builds where the ~2-step
+build is acceptable; plain clang -O3 -march=native remains the simple default.
+
+## ThinLTO + toolchain policy (final)
+
+ThinLTO without profiles regresses identically to full LTO (~-15% decode:
+link-time inliner mispredicts the branch-dense rc loop; alignment flags do
+not recover it — only profiles do). Policy: ThinLTO ONLY with PGO. CMake now
+has MC_PGO_GEN / MC_PGO_USE / MC_THINLTO plus cmake/homebrew-llvm.cmake
+(brew clang + lld + llvm-ar end-to-end). Full pipeline verified: 5/5 tests,
+q6 367 dec / q12 478 dec MB/s single-thread (+6-7% over plain -O3), ratio
+bit-identical.
+
+## Disassembly review (objdump + sample, M-series)
+
+Sample profile attribution: mc_enc_block (incl. inlined coder+fill+quant),
+mc_dec_block (rc decode), mc_dct1d_inv, mc_lines_fwd, mc_rot — as expected.
+Instruction-level findings:
+- iDCT: fully unrolled, sparse cbz skips, paired NEON MLAs — tight. Found
+  redundant adrp+add per table row -> hoisted to single bases (kept; ~neutral
+  on M-series, helps weaker addressing on other uarchs).
+- mc_dec_block carried 8 opaque TLV-accessor calls (macOS thread-locals) with
+  state spills around them -> consolidated ALL per-thread scratch into one
+  mc_tls_t captured once at entry (8 -> 4 calls; rest are step_tab_build's).
+  MEASURED NEUTRAL on macOS (TLV calls are per-block, ~ns against 12us
+  blocks) — but kept: on Linux/ELF shared-object builds (Graviton fleet)
+  general-dynamic TLS pays a real __tls_get_addr call per access, where one
+  capture per block matters.
+- The rc bin loop itself (lsr/mul/subs/csel + byte renorm) is minimal — no
+  wasted instructions; the serial dependency chain is the entire cost,
+  confirming the architecture analysis at the instruction level.
+Verdict: codegen is clean; no further single-thread headroom in the hot
+loops beyond what PGO already captures.

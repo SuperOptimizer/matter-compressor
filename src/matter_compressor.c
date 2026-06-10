@@ -127,20 +127,23 @@ static inline void mc_dct1d_fwd(const mc_fi32 *restrict in, mc_fi32 *restrict ou
 #if MC_SIMD_NEON
 static inline void mc_dct1d_inv(const mc_fi32 *restrict in, mc_fi32 *restrict out){
     const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1);
+    const mc_fi32 *ce=&g_cm_e[0][0], *co=&g_cm_o[0][0];   // one base each: the
+    // unrolled loop below indexes with immediates instead of re-materializing
+    // adrp+add per table row (objdump finding).
     int32x4_t ae0=vdupq_n_s32(rnd), ae1=vdupq_n_s32(rnd);
     int32x4_t ao0=vdupq_n_s32(0),  ao1=vdupq_n_s32(0);
     for(int j=0;j<8;++j){
         mc_fi32 ve=in[2*j];
         if(ve){
             int32x4_t v=vdupq_n_s32(ve);
-            ae0=vmlaq_s32(ae0,vld1q_s32(&g_cm_e[j][0]),v);
-            ae1=vmlaq_s32(ae1,vld1q_s32(&g_cm_e[j][4]),v);
+            ae0=vmlaq_s32(ae0,vld1q_s32(ce+j*8),v);
+            ae1=vmlaq_s32(ae1,vld1q_s32(ce+j*8+4),v);
         }
         mc_fi32 vo=in[2*j+1];
         if(vo){
             int32x4_t v=vdupq_n_s32(vo);
-            ao0=vmlaq_s32(ao0,vld1q_s32(&g_cm_o[j][0]),v);
-            ao1=vmlaq_s32(ao1,vld1q_s32(&g_cm_o[j][4]),v);
+            ao0=vmlaq_s32(ao0,vld1q_s32(co+j*8),v);
+            ao1=vmlaq_s32(ao1,vld1q_s32(co+j*8+4),v);
         }
     }
     int32x4_t s0=vshrq_n_s32(vaddq_s32(ae0,ao0),MC_DCT_Q);
@@ -290,11 +293,16 @@ static inline void mc_lines_inv(mc_fi32 *restrict blk){
 
 // 3D forward/inverse on a 16^3 block (float in/out for the codec's quant path).
 // Each pass: transform contiguous lines, then rotate. 3 rotates return to (z,y,x).
+typedef struct {
+    mc_fi32 in[16*16*16] __attribute__((aligned(MC_DCT_ALIGN)));
+    mc_fi32 a [16*16*16] __attribute__((aligned(MC_DCT_ALIGN)));
+    mc_fi32 b [16*16*16] __attribute__((aligned(MC_DCT_ALIGN)));
+} mc_dct_tls_t;
+static _Thread_local mc_dct_tls_t g_dct_tls;
 static void mc_dct3_fwd(const float *restrict blk, float *restrict coef){
     const int n=MC_DCT_N*MC_DCT_N*MC_DCT_N;
-    static _Thread_local mc_fi32 in[16*16*16]  __attribute__((aligned(MC_DCT_ALIGN)));
-    static _Thread_local mc_fi32 a[16*16*16]   __attribute__((aligned(MC_DCT_ALIGN)));
-    static _Thread_local mc_fi32 b[16*16*16]   __attribute__((aligned(MC_DCT_ALIGN)));
+    mc_dct_tls_t *D=&g_dct_tls;
+    mc_fi32 *in=D->in, *a=D->a, *b=D->b;
     for(int i=0;i<n;++i) in[i]=(mc_fi32)lrintf(blk[i]);
     mc_lines_fwd_to(in,a); mc_rot(a,b);
     mc_lines_fwd(b);       mc_rot(b,a);
@@ -303,9 +311,8 @@ static void mc_dct3_fwd(const float *restrict blk, float *restrict coef){
 }
 static void mc_dct3_inv(const float *restrict coef, float *restrict blk){
     const int n=MC_DCT_N*MC_DCT_N*MC_DCT_N;
-    static _Thread_local mc_fi32 in[16*16*16]  __attribute__((aligned(MC_DCT_ALIGN)));
-    static _Thread_local mc_fi32 a[16*16*16]   __attribute__((aligned(MC_DCT_ALIGN)));
-    static _Thread_local mc_fi32 b[16*16*16]   __attribute__((aligned(MC_DCT_ALIGN)));
+    mc_dct_tls_t *D=&g_dct_tls;
+    mc_fi32 *in=D->in, *a=D->a, *b=D->b;
     for(int i=0;i<n;++i) in[i]=(mc_fi32)lrintf(coef[i]);
     mc_lines_inv_to(in,a); mc_rot(a,b);
     mc_lines_inv(b);       mc_rot(b,a);
@@ -315,7 +322,7 @@ static void mc_dct3_inv(const float *restrict coef, float *restrict blk){
 // variant taking PREPARED i32 coefficients (decoder fuses dequantization into
 // the input conversion) and returning the raw i32 spatial result.
 static void mc_dct3_inv_i32(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    static _Thread_local mc_fi32 a[16*16*16]   __attribute__((aligned(MC_DCT_ALIGN)));
+    mc_fi32 *a=g_dct_tls.a;
     mc_lines_inv_to(in,a); mc_rot(a,out);
     mc_lines_inv(out);     mc_rot(out,a);
     mc_lines_inv(a);       mc_rot(a,out);
@@ -666,6 +673,29 @@ static uint64_t mc_xxh64(const void *data, size_t len, uint64_t seed){
 // Quality state is THREAD-LOCAL: format v6 stores q per chunk, so concurrent
 // decodes of different-q chunks each keep their own step/prior tables (rebuilt
 // only when the thread's q actually changes — once per chunk at most).
+// Consolidated per-thread codec scratch. On macOS/ELF every _Thread_local
+// access can compile to an opaque TLV-accessor CALL; scattered through the
+// hot functions those calls forced the range-coder state to spill to the
+// stack around each one (objdump: 8 blr + 102 sp-stores in mc_dec_block).
+// One struct -> one TLV access at function entry -> hot loops run call-free
+// with the coder state held in registers.
+typedef struct {
+    // decode
+    mc_u8  air[N3];
+    rc_i16 ql[N3];
+    float  coef[N3], blk[N3];
+    mc_fi32 qin[N3] __attribute__((aligned(64)));
+    mc_fi32 qout[N3] __attribute__((aligned(64)));
+    // encode
+    float  eblk[N3], ecoef[N3];
+    mc_i32 lv[N3];
+    rc_u8  scratch[N3*4+1024];
+    uint16_t cpos[N3]; mc_i32 cdel[N3];
+    float  rcoef[N3], rblk[N3];
+    uint16_t ai[N3]; uint8_t arc_[N3];
+} mc_tls_t;
+static _Thread_local mc_tls_t g_tls;
+
 static _Thread_local float g_quality = 8.0f;
 static int   g_max_err = 0;            // 0 = corrections off
 // per-coefficient quant step table (quality * hf_weight), rebuilt when quality
@@ -854,8 +884,10 @@ void mc_dec_fracmap(const uint8_t *in, uint32_t len, uint8_t *frac){
 // One stream = one flush (~5B) instead of two streams + a 2B mask length.
 int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     int n=N3, any=0;
-    static _Thread_local float blk[N3], coef[N3];
-    static _Thread_local mc_i32 lv[N3];
+    mc_tls_t *T=&g_tls;                 // single TLV access for all scratch
+    step_tab_build();
+    float *blk=T->eblk, *coef=T->ecoef;
+    mc_i32 *lv=T->lv;
     long sum=0,cnt=0;
 #if MC_SIMD_NEON
     {   uint32x4_t s32=vdupq_n_u32(0), c32=vdupq_n_u32(0);
@@ -903,8 +935,7 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     // the air voxels and there is no per-sweep copy (material values are
     // identical in both buffers).
     if(nair>0){
-        static _Thread_local float tmp[N3]; (void)tmp;
-        static _Thread_local uint16_t ai[N3]; static _Thread_local uint8_t arc_[N3];
+        uint16_t *ai=T->ai; uint8_t *arc_=T->arc_;
         int S=MC_BLK, na=0;
         for(int z=0;z<S;++z)for(int y=0;y<S;++y)for(int x=0;x<S;++x){
             int i=(z*S+y)*S+x; if(vox[i]) continue;
@@ -912,7 +943,6 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
             arc_[na]=(uint8_t)((z?1:0)|(z<S-1?2:0)|(y?4:0)|(y<S-1?8:0)|(x?16:0)|(x<S-1?32:0));
             na++;
         }
-        (void)tmp;
         // Coarse-to-fine init: solve the fill on the 4^3 subcube grid first
         // (each cell = mean of its material voxels, air cells relaxed), then
         // seed fine air voxels from their cell before the fine SOR sweeps.
@@ -957,15 +987,16 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     }
     mc_dct3_fwd(blk,coef);
     for(int idx=0;idx<N3;++idx) lv[idx]=quant_one(coef[idx],g_step_tab[idx]);
-    static _Thread_local rc_i16 ql[N3];
-    static _Thread_local rc_u8 scratch[N3*4+1024];
+    rc_i16 *ql=T->ql;
+    rc_u8 *scratch=T->scratch;
+    const size_t scratch_cap=sizeof T->scratch;
     for(int i=0;i<n;++i){ mc_i32 v=lv[i]; ql[i]=(rc_i16)(v>32767?32767:v<-32768?-32768:v); }
 
     // max-error corrections: locally reconstruct and list voxels with |err| > tau.
-    static _Thread_local uint16_t cpos[N3]; static _Thread_local mc_i32 cdel[N3];
+    uint16_t *cpos=T->cpos; mc_i32 *cdel=T->cdel;
     int ncorr=0;
     if(g_max_err>0){
-        static _Thread_local float rcoef[N3], rblk[N3];
+        float *rcoef=T->rcoef, *rblk=T->rblk;
         for(int idx=0;idx<N3;++idx) rcoef[idx]=deq_one(ql[idx],g_step_tab[idx]);
         mc_dct3_inv(rcoef,rblk);
         for(int i=0;i<n;++i){
@@ -977,7 +1008,7 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
         }
     }
 
-    rc_enc e; enc_init(&e,scratch,sizeof scratch);
+    rc_enc e; enc_init(&e,scratch,scratch_cap);
     {   // header bins: mixed, has-corr, dc (trained priors)
         ctx_t cf[2]; for(int i=0;i<2;++i) ctx_init_p(&cf[i],RC_PRIOR_FLAG[i]);
         ctx_t cd[8]; for(int i=0;i<8;++i) ctx_init_p(&cd[i],RC_PRIOR_DC[i]);
@@ -998,7 +1029,7 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     }
     enc_flush(&e);
     uint32_t slen=(uint32_t)e.len;
-    if(slen>sizeof scratch){ fprintf(stderr,"mc_enc_block: scratch overflow (%u)\n",slen); abort(); }
+    if(slen>scratch_cap){ fprintf(stderr,"mc_enc_block: scratch overflow (%u)\n",slen); abort(); }
 
     mc_buf_put(out,scratch,slen);
     *len_out = slen;
@@ -1007,8 +1038,10 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
 
 void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
     int n=N3, dc=0, flags=0;
-    static _Thread_local mc_u8 air[N3];
-    static _Thread_local rc_i16 ql[N3];
+    mc_tls_t *T=&g_tls;                 // single TLV access for all scratch
+    step_tab_build();                   // (touches its own TLVs) before hot loops
+    mc_u8 *air=T->air;
+    rc_i16 *ql=T->ql;
     rc_dec d; dec_init(&d,p,plen);
     {   // header bins (must mirror the encoder exactly)
         ctx_t cf[2]; for(int i=0;i<2;++i) ctx_init_p(&cf[i],RC_PRIOR_FLAG[i]);
@@ -1020,8 +1053,7 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
     if(flags&1) dec_blockmask(&d,air);
     else        memset(air,0,n);
     int ext[3]; dec_block_coefs_ext(&d,ql,MC_BLK,ext);
-    static _Thread_local float coef[N3], blk[N3];
-    step_tab_build();
+    float *coef=T->coef, *blk=T->blk;
     int ez=ext[0],ey=ext[1],ex=ext[2];
     if(ez<0 && !(flags&1) && !(flags&2)){                   // constant block: dc fill
         memset(dst,(mc_u8)dc,n); return;
@@ -1030,8 +1062,7 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
 #if MC_SIMD_NEON
     {   // fused dequant -> i32 DCT input (no float coefficient pass), then
         // integer iDCT and vectorized clamp+dc+air store.
-        static _Thread_local mc_fi32 qin[N3] __attribute__((aligned(64)));
-        static _Thread_local mc_fi32 qout[N3] __attribute__((aligned(64)));
+        mc_fi32 *qin=T->qin, *qout=T->qout;
         float32x4_t bias=vdupq_n_f32(MC_DZ_FRAC-1.0f+0.40f);
         for(int i=0;i<N3;i+=4){
             int32x4_t lv=vmovl_s16(vld1_s16(ql+i));

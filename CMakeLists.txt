@@ -24,6 +24,32 @@ if(MC_STANDALONE)
   endif()
 endif()
 
+# Optional ThinLTO + PGO. MEASURED POLICY (bench/RESULTS.md): LTO of either
+# flavor WITHOUT profiles costs ~15% decode (link-time inliner mispredicts the
+# branch-dense range-coder loop); WITH profiles it gains ~5%. So: ThinLTO only
+# together with MC_PGO_USE. Flow:
+#   1. cmake -DMC_PGO_GEN=ON; build; run mc_bench on representative volumes
+#      with LLVM_PROFILE_FILE=prof/%p.profraw
+#   2. llvm-profdata merge -output=merged.profdata prof/*.profraw
+#   3. cmake -DMC_THINLTO=ON -DMC_PGO_USE=/abs/path/merged.profdata; rebuild
+option(MC_THINLTO "ThinLTO (pair with MC_PGO_USE; alone it is a regression)" OFF)
+option(MC_PGO_GEN "instrumented build for PGO profile collection" OFF)
+set(MC_PGO_USE "" CACHE FILEPATH "merged .profdata to optimize with")
+if(MC_PGO_GEN)
+  add_compile_options(-fprofile-instr-generate)
+  add_link_options(-fprofile-instr-generate)
+endif()
+if(MC_PGO_USE)
+  add_compile_options(-fprofile-instr-use=${MC_PGO_USE} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+endif()
+if(MC_THINLTO)
+  if(NOT MC_PGO_USE)
+    message(WARNING "MC_THINLTO without MC_PGO_USE measured ~15% SLOWER decode — supply profiles")
+  endif()
+  add_compile_options(-flto=thin)
+  add_link_options(-flto=thin)
+endif()
+
 # core library: codec + archive (deps: libm + pthread for the appendable writer)
 add_library(matter_compressor STATIC
   src/matter_compressor.c)
