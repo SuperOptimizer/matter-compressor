@@ -67,7 +67,7 @@ No external dependencies beyond libm (tools: libcurl + libzstd for `mc_fetch`).
 - `mc_export` — repack an archive (or a chunk box) verbatim into a fresh file:
   Morton-ordered chunks, the whole index clustered right after the metadata
   region (one ranged GET for streaming clients), no append slack.
-- `mc_vs_c3d`, `mc_rans_probe`, `mc_prof` — comparison/measurement harnesses.
+- `mc_vs_c3d`, `mc_prof` — comparison/measurement harnesses.
 
 ## API
 

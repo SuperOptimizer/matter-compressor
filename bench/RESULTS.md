@@ -159,7 +159,7 @@ key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
    was for full replacement, not this split. A future attempt needs zero-RUN
    symbols in the alphabet (cuts symbol count 5-10x -> real decode win) or
    per-chunk shared rANS streams (amortized states, breaks block independence).
-   Trainer (tools/mc_rans_tab.c) + tables (src/mc_rans_tab.h) kept.
+   (Experiment code removed in the v5 cleanup; see git history.)
    RETRY with a ZERO-RUN alphabet (syms: levels 1..52, escape, 2^k-runs with
    rc-side ext bits; quality-dependent split) reached ratio PARITY at every q
    — but a same-clocks A/B showed decode parity too. The full dial: split=64
@@ -173,7 +173,7 @@ key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
    lattice decode) lands 3–8% below the dead-zone RD curve at every lambda
    (0.08–0.2). Same failure mode as RDOQ: lattice-packing gains assume dense
    high-rate coefficients; scroll blocks are sparse and sig-flag-dominated.
-   Code kept behind MC_TCQ=0.
+   (Code removed in the v5 cleanup; see git history.)
 5. HPEZ-style per-chunk parameter auto-tuning by sampling (encode-only).
 6. Cache: S3-FIFO eviction — IMPLEMENTED as mc_cache's default policy
    (small/main slot-id rings + ghost fingerprint table per shard; CLOCK kept
@@ -191,3 +191,16 @@ INR/learned codecs (no random access, GPU-bound), SIEVE, hash-sharding.
 External anchor: synchrotron studies find 3–4× lossy safe for reconstruction
 quality, 6–8× for phase-retrieved data — our q=1 (~9×) and q=3 (~21×) tiers
 bracket that on already-reconstructed volumes.
+
+## v5 cleanup (final shape)
+
+All measured-and-rejected experiment code was deleted (RDOQ, TCQ, AQ+its
+reserved stream bits, LFNST + trainer, rANS stages + trainer/probe, PARA
+shift plumbing). Everything lives in git history. The shipped configuration:
+16^3 integer DCT + tuned dead-zone quant (band-weighted step table) + adaptive
+binary range coder with q-interpolated trained priors + two-level per-block
+air masks + SOR air-fill (coarse-to-fine init) + adaptive last-sig EOB +
+optional max-error corrections + optional decode-side deblock; archive v5
+(self-contained blocks, partial-fetch streaming, node-table caching, Morton/
+clustered-index export); mc_cache with S3-FIFO (default) / CLOCK eviction.
+Verified at parity after cleanup: q=6 33.8x @ 35.83 dB, q=12 51.4x, 4/4 tests.
