@@ -1,6 +1,10 @@
 // mc_rans_tab — train the static per-band rANS symbol tables for the HF
-// coefficient stage (scan positions >= 64). Prints src/mc_rans_tab.h:
-// freq[4 q-buckets][8 bands][65 syms] normalized to 4096.
+// coefficient stage (scan positions >= 64), ZERO-RUN alphabet:
+//   sym 0..51  = zigzag level 1..52
+//   sym 52     = level escape (zz>=53; EG extension in the rc stream)
+//   sym 53+k   = zero-run of length 2^k + ext (k in [0,11]; k rc-bypass bits)
+// Run symbols use the band of the run's END position (what a backward decode
+// sees first). Prints freq[4 q-buckets][8 bands][65] normalized to 4096.
 // usage: mc_rans_tab <vol.bin[,vol2]> <dim>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,10 +45,20 @@ int main(int argc,char**argv){
                 step_tab_build();
                 for(int i=0;i<N3;++i) ql[i]=(rc_i16)quant_one(coef[i],g_step_tab[i]);
                 rc_u32 eob=0; for(rc_u32 p=N3;p-->0;){ if(ql[scan[p]]){eob=p+1;break;} }
-                for(rc_u32 p=64;p<eob;++p){
-                    rc_u32 idx=scan[p]; int b=band_of_S(idx,MC_BLK);
-                    uint32_t zz=zigzag32(ql[idx]);
-                    hist[qb][b][zz<64?zz:64]+=1.0;
+                rc_u32 p=64;
+                while(p<eob){
+                    uint32_t zz=zigzag32(ql[scan[p]]);
+                    if(zz==0){
+                        rc_u32 run=1; while(p+run<eob && ql[scan[p+run]]==0) run++;
+                        int k=0; while((rc_u32)(2u<<k)<=run) k++;   // run in [2^k, 2^(k+1))
+                        int b=band_of_S(scan[p+run-1],MC_BLK);
+                        hist[qb][b][53+k]+=1.0;
+                        p+=run;
+                    } else {
+                        int b=band_of_S(scan[p],MC_BLK);
+                        hist[qb][b][zz<=52?zz-1:52]+=1.0;
+                        p++;
+                    }
                 }
             }
             free(vol);

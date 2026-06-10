@@ -160,6 +160,14 @@ key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
    symbols in the alphabet (cuts symbol count 5-10x -> real decode win) or
    per-chunk shared rANS streams (amortized states, breaks block independence).
    Trainer (tools/mc_rans_tab.c) + tables (src/mc_rans_tab.h) kept.
+   RETRY with a ZERO-RUN alphabet (syms: levels 1..52, escape, 2^k-runs with
+   rc-side ext bits; quality-dependent split) reached ratio PARITY at every q
+   — but a same-clocks A/B showed decode parity too. The full dial: split=64
+   gives +6% decode for −8% ratio; split=768/q6 gives parity/parity. Adaptive
+   bins on p~0.97 contexts renormalize rarely and are already as fast as rANS
+   symbol decode at these bin counts. QUESTION CLOSED: no free decode win in
+   the entropy stage; c3d's 3x comes from wavelet+fixed-rate design choices,
+   not rANS per se.
 4. TCQ trellis quantization — IMPLEMENTED + MEASURED, REJECTED: 4-state
    VVC-style dependent quant (Viterbi encoder, parity-tracked half-step
    lattice decode) lands 3–8% below the dead-zone RD curve at every lambda
