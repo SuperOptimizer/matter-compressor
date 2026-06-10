@@ -1,0 +1,26 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]   # x86-64 AVX2, Graviton-class NEON, Apple NEON
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: cmake -B build -S . -DMC_NO_NATIVE=ON && cmake --build build -j
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+  asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: build+fuzz under ASan/UBSan
+        run: |
+          clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -w -Isrc \
+            tests/mc_v6_test.c src/matter_compressor.c -lm -lpthread -o v6_asan
+          ./v6_asan
+          clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -w -Isrc \
+            tests/mc_cache_test.c src/matter_compressor.c -lm -lpthread -o cache_asan
+          ./cache_asan
