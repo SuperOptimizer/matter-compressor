@@ -1512,6 +1512,7 @@ struct mc_archive {
     _Atomic uint64_t file_len; // current ftruncate'd file size
     int dim;
     float quality;
+    uint64_t reserve;          // mmap reservation size (dims-derived, <= MC_RESERVE)
     pthread_mutex_t grow_mu;   // serializes ftruncate only; decode is lock-free
 };
 
@@ -1523,6 +1524,11 @@ static int w_ensure(mc_archive *w, uint64_t need){
     if(need > fl){
         uint64_t nf = fl;
         while(nf < need) nf += MC_GROW_STEP;
+        if(nf > w->reserve){   // past the mmap reservation: fail cleanly, not SIGBUS
+            fprintf(stderr,"mc_archive: grow beyond reservation (%llu > %llu)\n",
+                    (unsigned long long)nf,(unsigned long long)w->reserve);
+            pthread_mutex_unlock(&w->grow_mu); return -1;
+        }
         if(ftruncate(w->fd, (off_t)nf) != 0){ pthread_mutex_unlock(&w->grow_mu); return -1; }
         atomic_store_explicit(&w->file_len, nf, memory_order_release);
     }
@@ -1599,6 +1605,20 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
 mc_archive *mc_archive_open(const char *path, int dim, float quality){
     return mc_archive_open_dims(path,dim,dim,dim,quality);
 }
+// reservation sized from the volume: worst-case compressed bytes are bounded by
+// ~raw size; 1.5x headroom + 1 GiB floor, capped at MC_RESERVE. A blanket 10 TiB
+// map breaks sanitizer shadow memory and small-volume test runners.
+static uint64_t reserve_for_dims(int nx,int ny,int nz){
+    uint64_t need=0, dz=(uint64_t)nz, dy=(uint64_t)ny, dx=(uint64_t)nx;
+    for(int l=0;l<8;++l){
+        uint64_t pz=(dz+255)/256*256, py=(dy+255)/256*256, px=(dx+255)/256*256;
+        need += pz*py*px;
+        dz=(dz+1)/2; dy=(dy+1)/2; dx=(dx+1)/2;
+    }
+    uint64_t r = need + need/2 + (1ull<<30);
+    return r > MC_RESERVE ? MC_RESERVE : r;
+}
+
 mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float quality){
     if(nx<=0||ny<=0||nz<=0){ fprintf(stderr,"mc_archive_open: bad dims\n"); return NULL; }
     int dim=nx;  // legacy field below; per-axis dims live in the header
@@ -1607,6 +1627,7 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
     if(fd<0){ perror("mc_archive_open: open"); return NULL; }
     struct stat sb; if(fstat(fd,&sb)!=0){ perror("fstat"); close(fd); return NULL; }
     int fresh = (sb.st_size==0);
+    uint64_t reserve = reserve_for_dims(nx,ny,nz);
     uint64_t init_len;
     if(fresh){
         init_len = MC_META_END;   // header + metadata region; data appends after.
@@ -1614,11 +1635,11 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
     } else {
         init_len = (uint64_t)sb.st_size;
     }
-    u8 *base = mmap(NULL, MC_RESERVE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_NORESERVE, fd, 0);
+    u8 *base = mmap(NULL, reserve, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_NORESERVE, fd, 0);
     if(base==MAP_FAILED){ perror("mmap"); close(fd); return NULL; }
 
     mc_archive *w = calloc(1,sizeof *w);
-    w->fd=fd; w->base=base; w->dim=dim; w->quality=quality;
+    w->fd=fd; w->base=base; w->dim=dim; w->quality=quality; w->reserve=reserve;
     pthread_mutex_init(&w->grow_mu,NULL);
     atomic_store(&w->file_len, init_len);
 
@@ -1640,7 +1661,7 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
         uint32_t ux,uy,uz; memcpy(&ux,base+MCH_NX,4); memcpy(&uy,base+MCH_NY,4); memcpy(&uz,base+MCH_NZ,4);
         if(magic!=MC_MAGIC || ver!=MC_VERSION || (int)ux!=nx || (int)uy!=ny || (int)uz!=nz){
             fprintf(stderr,"mc_archive_open: %s is not a matching mc archive (magic/ver/dims)\n",path);
-            munmap(base,MC_RESERVE); close(fd); free(w); return NULL;
+            munmap(base,reserve); close(fd); free(w); return NULL;
         }
         uint64_t totlen; memcpy(&totlen,base+MCH_TOTLEN,8);
         if(totlen < MC_META_END) totlen=MC_META_END;
@@ -2024,7 +2045,7 @@ void mc_archive_close(mc_archive *a){
     uint64_t cur = atomic_load(&a->cursor);
     w_write_u64(a, MCH_TOTLEN, cur);
     msync(a->base, cur, MS_SYNC);
-    munmap(a->base, MC_RESERVE);
+    munmap(a->base, a->reserve);
     if(ftruncate(a->fd,(off_t)cur)!=0) perror("mc_archive_close: ftruncate");
     close(a->fd);
     pthread_mutex_destroy(&a->grow_mu);
