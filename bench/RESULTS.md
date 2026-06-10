@@ -278,3 +278,14 @@ clang+LTO(+lld): ~130/287 (LTO = -15% decode, both clang versions — the
 codec is a single TU so LTO adds only harmful code-layout churn; do NOT
 enable IPO/-flto) · gcc 15: 97/354 (-28% encode; ship clang everywhere).
 Bitstreams identical across all toolchains.
+
+## PGO study
+
+PGO (+3.5-4% decode) and PGO+LTO (+5% decode, q6 344->362, q12 446->470)
+on brew clang 22 — with real branch profiles the code-layout churn that made
+plain LTO harmful (-15%) becomes a win. Encode neutral. Recipe:
+  clang -O3 -ffast-math -march=native -fprofile-instr-generate ... -> run
+  mc_bench over representative volumes -> llvm-profdata merge ->
+  rebuild with -fprofile-instr-use=merged.profdata -flto -fuse-ld=lld.
+Ratio/quality bit-identical. Recommended for fleet builds where the ~2-step
+build is acceptable; plain clang -O3 -march=native remains the simple default.
