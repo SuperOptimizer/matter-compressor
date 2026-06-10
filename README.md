@@ -157,6 +157,11 @@ cmake --build build
 
 SIMD: NEON on ARM (Graviton, Apple M, X1 Elite), AVX2 at the x86-64-v3
 baseline, AVX-512 opt-in (`-DMC_ENABLE_AVX512` + `-march=x86-64-v4`).
+The sampler/renderer ships NEON + SSE4.1 4-wide and AVX2 8-wide kernels
+(8-wide for adjacent-pixel slices only — measured 1.6x slower for
+z-strided ray composites on Zen 3); AVX-512 adds nothing for this fleet
+(consumer Intel has it fused off, Zen 4 double-pumps 256-bit), and SVE
+only exceeds NEON width on Graviton 3 — both skipped on measurement.
 Vendoring via `add_subdirectory` keeps full optimization flags.
 
 ## Tools
