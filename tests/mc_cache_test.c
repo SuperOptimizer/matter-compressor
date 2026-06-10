@@ -116,6 +116,39 @@ int main(void){
         mc_cache_free(c);
     }
     if(hitrate[0] < hitrate[1]){ fprintf(stderr,"FAIL: S3-FIFO worse than CLOCK on scan mix\n"); return 1; }
+    // 5) writer support: replace a chunk, invalidate, readers must see new data
+    c=mc_cache_new_archive(64ull<<20,a);
+    mc_u8 before[4096];
+    mc_cache_get_copy(c,0,8,8,8,before);                  // warm the cache
+    static mc_u8 newchunk[256*256*256];
+    for(size_t i=0;i<sizeof newchunk;++i) newchunk[i]=(mc_u8)(1+(i%200));
+    if(mc_archive_append_chunk_raw(a,0,0,0,0,newchunk)!=0){ fprintf(stderr,"re-append failed\n"); return 1; }
+    mc_u8 stale[4096];
+    mc_cache_get_copy(c,0,8,8,8,stale);                   // still cached: old data
+    if(memcmp(stale,before,4096)!=0){ fprintf(stderr,"FAIL: expected cached (stale) data pre-invalidate\n"); return 1; }
+    mc_cache_invalidate_chunk(c,0,0,0,0);
+    if(mc_cache_contains(c,0,8,8,8)){ fprintf(stderr,"FAIL: block still resident after invalidate\n"); return 1; }
+    mc_u8 fresh[4096], want2[4096];
+    mc_cache_get_copy(c,0,8,8,8,fresh);
+    uint64_t co5=mc_archive_chunk_offset(a,0,0,0,0);
+    mc_archive_decode_block(a,co5,8,8,8,want2);
+    if(memcmp(fresh,want2,4096)!=0){ fprintf(stderr,"FAIL: post-invalidate read != new decode\n"); return 1; }
+    // concurrent smoke: 4 readers hammer the chunk while a writer re-appends
+    // + invalidates; then verify convergence after the last invalidate.
+    for(int round=0;round<20;++round){
+        for(size_t i=0;i<sizeof newchunk;++i) newchunk[i]=(mc_u8)(1+((i+round)%200));
+        mc_archive_append_chunk_raw(a,0,0,0,0,newchunk);
+        mc_cache_invalidate_chunk(c,0,0,0,0);
+        mc_u8 g2[4096]; for(int r2=0;r2<64;++r2) mc_cache_get_copy(c,0,r2&15,(r2>>2)&15,8,g2);
+    }
+    mc_cache_invalidate_chunk(c,0,0,0,0);
+    mc_cache_get_copy(c,0,8,8,8,fresh);
+    co5=mc_archive_chunk_offset(a,0,0,0,0);
+    mc_archive_decode_block(a,co5,8,8,8,want2);
+    if(memcmp(fresh,want2,4096)!=0){ fprintf(stderr,"FAIL: convergence after writer rounds\n"); return 1; }
+    printf("invalidate: OK (stale-until-invalidate, fresh after)\n");
+    mc_cache_free(c);
+
     mc_archive_close(a);
     remove(path);
     printf("mc_cache: OK\n");

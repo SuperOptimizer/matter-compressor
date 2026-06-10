@@ -156,6 +156,7 @@ static uint32_t reclaim_slot(shard_t *sh){
     }
     for(;;){
         uint32_t i=sh->hand; sh->hand=(sh->hand+1)%sh->nslot;
+        if(sh->slot_key[i]==EMPTY_KEY) return i;            // invalidated: reuse
         if(sh->slot_ref[i]){ sh->slot_ref[i]=0; continue; }
         map_delete(sh,sh->slot_key[i]);
         sh->evictions++;
@@ -194,6 +195,7 @@ static uint32_t s3_reclaim(shard_t *sh){
         uint32_t small_len=ring_len(sh->fs_head,sh->fs_tail,sh->fs_cap);
         if(small_len >= sh->nslot/10+1){
             uint32_t s=sh->fs[sh->fs_head]; sh->fs_head=(sh->fs_head+1)%sh->fs_cap;
+            if(sh->slot_key[s]==EMPTY_KEY) return s;        // invalidated: reuse
             if(sh->slot_ref[s]>0){             // promote to main
                 sh->slot_ref[s]=0; sh->slot_inmain[s]=1;
                 sh->fm[sh->fm_tail]=s; sh->fm_tail=(sh->fm_tail+1)%sh->fm_cap;
@@ -205,11 +207,13 @@ static uint32_t s3_reclaim(shard_t *sh){
         }
         if(ring_len(sh->fm_head,sh->fm_tail,sh->fm_cap)==0){   // degenerate: force small
             uint32_t s=sh->fs[sh->fs_head]; sh->fs_head=(sh->fs_head+1)%sh->fs_cap;
+            if(sh->slot_key[s]==EMPTY_KEY) return s;        // invalidated: reuse
             ghost_put(sh,s3_fp(sh->slot_key[s]));
             map_delete(sh,sh->slot_key[s]); sh->evictions++;
             return s;
         }
         uint32_t s=sh->fm[sh->fm_head]; sh->fm_head=(sh->fm_head+1)%sh->fm_cap;
+        if(sh->slot_key[s]==EMPTY_KEY) return s;            // invalidated: reuse
         if(sh->slot_ref[s]>0){                 // re-insert with decremented freq
             sh->slot_ref[s]--;
             sh->fm[sh->fm_tail]=s; sh->fm_tail=(sh->fm_tail+1)%sh->fm_cap;
@@ -328,6 +332,26 @@ void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
         int have = map_find(sh,key)!=UINT32_MAX;
         pthread_mutex_unlock(&sh->mu);
         if(!have) (void)mc_cache_get(c,lod,gz,gy,gx);
+    }
+}
+
+// remove one key if present (shard lock held by caller paths below)
+static void shard_remove_key(shard_t *sh, uint64_t key){
+    uint32_t mi=map_find(sh,key);
+    if(mi==UINT32_MAX) return;
+    uint32_t slot=sh->map_slot[mi];
+    map_delete(sh,key);
+    sh->slot_key[slot]=EMPTY_KEY;       // slot stays in its FIFO ring; the
+    sh->slot_ref[slot]=0;               // reclaim path skips empty keys
+    sh->evictions++;
+}
+void mc_cache_invalidate_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
+    for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
+        uint64_t key=bkey(lod,cz*16+bz,cy*16+by,cx*16+bx);
+        shard_t *sh=shard_of(c,key);
+        pthread_mutex_lock(&sh->mu);
+        shard_remove_key(sh,key);
+        pthread_mutex_unlock(&sh->mu);
     }
 }
 

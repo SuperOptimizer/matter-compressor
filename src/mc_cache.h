@@ -17,6 +17,14 @@
 //     reused by a later eviction; a stale frame is possible, a UAF is not
 //     (same contract as vc's BlockCache). Use mc_cache_get_copy when the
 //     caller needs a stable snapshot.
+//
+// THREAD-SAFETY CONTRACT: all operations are safe from any number of threads
+// (per-shard mutexes; decode runs outside the locks with a double-checked
+// insert). mc_cache_get's pointer may be overwritten by a concurrent
+// eviction (torn read, never UAF) — use mc_cache_get_copy where that
+// matters. Writers that REPLACE a chunk in the source must call
+// mc_cache_invalidate_chunk afterwards; the mc_reader binding serializes
+// decode (mc_reader is single-threaded), the mc_archive binding does not.
 // ============================================================================
 #ifndef MC_CACHE_H
 #define MC_CACHE_H
@@ -57,6 +65,11 @@ int  mc_cache_contains(mc_cache *c, int lod, int bz, int by, int bx);
 // blocks that are not already resident). Renderers call this from IO/worker
 // threads ahead of the viewport so the render threads only ever hit.
 void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx);
+
+// Invalidate every cached block of chunk (lod, cz,cy,cx). Writers call this
+// after re-appending/replacing a chunk so readers stop seeing stale blocks.
+// Thread-safe against concurrent gets/inserts.
+void mc_cache_invalidate_chunk(mc_cache *c, int lod, int cz, int cy, int cx);
 
 // Drop everything (e.g. source archive replaced).
 void mc_cache_clear(mc_cache *c);
