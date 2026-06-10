@@ -203,6 +203,46 @@ int main(void){
     printf("best_lod+async: OK\n");
     mc_cache_free(c);
 
+    // 8) tick-phase contract: thaw->resolve, freeze->lock-free reads + miss
+    // feedback, thaw->drain; pins protect the frame's set; legacy mode
+    // (never frozen) already covered by tests 1-7.
+    c=mc_cache_new_archive(64ull<<20,a);
+    static mc_block_id ws8[256]; static const mc_u8 *ptr8[256];
+    for(int i=0;i<256;++i) ws8[i]=(mc_block_id){0,i%16,(i/16)%16,5};
+    size_t dec8=mc_cache_resolve(c,ws8,256,ptr8,0);
+    for(int i=0;i<256;++i) if(!ptr8[i]){ fprintf(stderr,"FAIL: resolve NULL ptr\n"); return 1; }
+    mc_cache_freeze(c);
+    // frozen hit: same pointer, no locks; content matches direct decode
+    const mc_u8 *p8=mc_cache_get(c,0,3,3,5);
+    if(p8!=ptr8[3+3*16]){ fprintf(stderr,"FAIL: frozen get != resolved ptr\n"); return 1; }
+    uint64_t co8=mc_archive_chunk_offset(a,0,0,0,0);
+    mc_u8 want8[4096];
+    mc_archive_decode_block(a,co8,3,3,5,want8);
+    if(memcmp(p8,want8,4096)!=0){ fprintf(stderr,"FAIL: frozen content\n"); return 1; }
+    // frozen miss: NULL + recorded; get_copy read-through still correct
+    if(mc_cache_get(c,0,9,9,9)!=NULL){ fprintf(stderr,"FAIL: frozen miss not NULL\n"); return 1; }
+    mc_u8 rt8[4096];
+    mc_cache_get_copy(c,0,9,9,8,rt8);
+    mc_archive_decode_block(a,co8,9,9,8,want8);
+    if(memcmp(rt8,want8,4096)!=0){ fprintf(stderr,"FAIL: frozen read-through\n"); return 1; }
+    // frozen writes refused
+    if(mc_cache_update(c,ws8,256,0)!=0){ fprintf(stderr,"FAIL: frozen update not refused\n"); return 1; }
+    mc_cache_thaw(c);
+    static mc_block_id missed[1024];
+    size_t nm8=mc_cache_misses_drain(c,missed,1024);
+    int found99=0,found98=0;
+    for(size_t i=0;i<nm8;++i){
+        if(missed[i].lod==0&&missed[i].bz==9&&missed[i].by==9&&missed[i].bx==9) found99=1;
+        if(missed[i].lod==0&&missed[i].bz==9&&missed[i].by==9&&missed[i].bx==8) found98=1;
+    }
+    if(!found99||!found98){ fprintf(stderr,"FAIL: misses not recorded (%zu)\n",nm8); return 1; }
+    mc_cache_update(c,missed,nm8,0);
+    mc_cache_freeze(c);
+    if(mc_cache_get(c,0,9,9,9)==NULL){ fprintf(stderr,"FAIL: drained miss not resident next frame\n"); return 1; }
+    mc_cache_thaw(c);
+    printf("tick-phase: OK (resolve %zu decoded, %zu misses fed back)\n",dec8,nm8);
+    mc_cache_free(c);
+
     mc_archive_close(a);
     remove(path);
     printf("mc_cache: OK\n");

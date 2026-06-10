@@ -256,3 +256,17 @@ chunks. Both are at the architecture's serial floor.
 - Cache: mc_cache_best_lod (page-table render-now-refine-later pattern) and
   async update tickets (submit / poll / cancel / wait) for speculative
   prefetch during camera motion.
+
+## tick-phase cache contract (vc3d game-loop model)
+
+mc_cache_freeze/thaw: while frozen the cache is immutable — get/get_copy/
+contains/best_lod skip all shard locks (bare hash probe; no writer can
+exist), never touch eviction state; misses do NOT insert (get returns NULL
+-> fall back to best_lod; get_copy decodes read-through) and are recorded in
+a lock-free feedback ring drained at thaw (GigaVoxels miss-queue pattern).
+mc_cache_resolve: batch update + arena-pointer table — render-phase access is
+ptrs[i], no hash, no lock; resolved slots are epoch-pinned against the
+frame's own inserts until the next thaw. DUAL MODE: clients that never call
+freeze() get the original always-thread-safe multi-reader/multi-writer
+behavior unchanged (pins are inert until the first freeze; eviction sweeps
+are bounded so pathological pin states can never livelock).

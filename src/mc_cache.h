@@ -103,6 +103,31 @@ void mc_cache_ticket_cancel(mc_cache_ticket *t);
 void mc_cache_ticket_wait(mc_cache_ticket *t);
 void mc_cache_ticket_free(mc_cache_ticket *t);
 
+// ---- tick-phase contract (vc3d game-loop model) ----------------------------
+// thaw():   write phase — update/resolve/invalidate/prefetch allowed; reads
+//           take shard locks as usual. Increments the pin epoch.
+// freeze(): read phase — the cache is immutable. get/get_copy/contains/
+//           best_lod skip ALL locks (no writer can exist) and do not touch
+//           eviction state. Misses do NOT insert: get returns NULL (fall back
+//           to mc_cache_best_lod), get_copy decodes directly into the caller
+//           buffer; both record the miss in the feedback queue.
+// Write-phase calls made while frozen are refused (return error / no-op) —
+// the contract is load-bearing for the lock-free reads.
+void mc_cache_freeze(mc_cache *c);
+void mc_cache_thaw(mc_cache *c);
+
+// Resolve: batch update + pointer table, the render-phase fast path. Ensures
+// every ids[i] is resident (decoding misses in parallel), fills ptrs[i] with
+// its arena address, and epoch-pins those slots so this frame's own inserts
+// cannot evict them. Pointers stay valid until the next thaw(). Thawed phase
+// only. Returns blocks newly decoded.
+size_t mc_cache_resolve(mc_cache *c, const mc_block_id *ids, size_t n,
+                        const mc_u8 **ptrs, int nthreads);
+
+// Drain the frozen-phase miss queue (call after thaw; feed into the next
+// update/resolve batch). Duplicates possible — update() handles them.
+size_t mc_cache_misses_drain(mc_cache *c, mc_block_id *out, size_t cap);
+
 // Drop everything (e.g. source archive replaced).
 void mc_cache_clear(mc_cache *c);
 
