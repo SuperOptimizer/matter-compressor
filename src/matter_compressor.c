@@ -1,4 +1,6 @@
 #define _GNU_SOURCE                  // pthread_setname_np (linux)
+#include <pthread.h>
+#include <stdatomic.h>
 // ============================================================================
 // matter_compressor.c — single-file implementation: codec + archive + cache.
 // Unified from mc_dct.h / mc_rangecoder.h / mc_xxhash.h / mc_codec.c /
@@ -531,7 +533,10 @@ static rc_u32 dec_magnitude(rc_dec*d,atom_ctx*ac){
 }
 
 // per-size ascending-L1-frequency scan tables, built lazily (indexed by log2 S).
-static uint16_t *g_scanS[6]; static int g_scanS_ready[6];
+// Build is serialized: concurrent encode workers used to race the ready flag,
+// double-build, and leak the losing table (caught by LeakSanitizer).
+static uint16_t *g_scanS[6]; static _Atomic int g_scanS_ready[6];
+static pthread_mutex_t g_scanS_mu = PTHREAD_MUTEX_INITIALIZER;
 static int scanS_cmp_S;
 static int scanS_cmp(const void*pa,const void*pb){
     rc_u32 a=*(const rc_u32*)pa,b=*(const rc_u32*)pb; int S=scanS_cmp_S;
@@ -540,11 +545,18 @@ static int scanS_cmp(const void*pa,const void*pb){
 }
 static void scanS_build(int S){
     int l=0,t=S; while(t>1){t>>=1;l++;}
-    if(g_scanS_ready[l]) return;
-    int n=S*S*S; rc_u32 *ord=malloc(n*sizeof(rc_u32)); for(int i=0;i<n;++i)ord[i]=i;
-    scanS_cmp_S=S; qsort(ord,n,sizeof(rc_u32),scanS_cmp);
-    g_scanS[l]=malloc(n*sizeof(uint16_t)); for(int i=0;i<n;++i)g_scanS[l][i]=(uint16_t)ord[i];
-    free(ord); g_scanS_ready[l]=1;
+    if(atomic_load_explicit(&g_scanS_ready[l],memory_order_acquire)) return;
+    pthread_mutex_lock(&g_scanS_mu);
+    if(!atomic_load_explicit(&g_scanS_ready[l],memory_order_relaxed)){
+        int n=S*S*S; rc_u32 *ord=malloc(n*sizeof(rc_u32)); for(int i=0;i<n;++i)ord[i]=i;
+        scanS_cmp_S=S; qsort(ord,n,sizeof(rc_u32),scanS_cmp);
+        uint16_t *tab=malloc(n*sizeof(uint16_t));
+        for(int i=0;i<n;++i)tab[i]=(uint16_t)ord[i];
+        free(ord);
+        g_scanS[l]=tab;
+        atomic_store_explicit(&g_scanS_ready[l],1,memory_order_release);
+    }
+    pthread_mutex_unlock(&g_scanS_mu);
 }
 static inline int band_of_S(rc_u32 idx,int S){
     rc_u32 cz=idx/(S*S),cy=(idx/S)%S,cx=idx%S, freq=cz+cy+cx;
