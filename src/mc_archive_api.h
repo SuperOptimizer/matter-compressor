@@ -65,6 +65,13 @@ int mc_archive_append_chunk_raw(mc_archive *a, int lod, int cz,int cy,int cx,
 int mc_archive_append_chunk_compressed(mc_archive *a, int lod, int cz,int cy,int cx,
                                        const uint8_t *blob, size_t len);
 
+// Pre-create the index path (root/inner/shard tables) for a chunk WITHOUT
+// writing any chunk data. Exporters call this for every chunk first, so all
+// index tables are allocated contiguously right after the metadata region and
+// a streaming reader can fetch the entire index with one ranged read; chunk
+// blobs then follow in append order (e.g. Morton). Returns 0 on success.
+int mc_archive_reserve_index(mc_archive *a, int lod, int cz,int cy,int cx);
+
 // Coverage of a chunk without decoding.
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx);
 

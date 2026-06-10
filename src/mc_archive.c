@@ -372,6 +372,11 @@ int mc_archive_append_chunk_compressed(mc_archive *a, int lod, int cz,int cy,int
     return w_install_blob(a,lod,cz,cy,cx,blob,len);
 }
 
+int mc_archive_reserve_index(mc_archive *a, int lod, int cz,int cy,int cx){
+    if(!a||lod<0||lod>7) return -1;
+    return w_ensure_shard_slot(a,lod,cz,cy,cx)==~0ull ? -1 : 0;
+}
+
 int mc_archive_append_chunk_raw(mc_archive *a, int lod, int cz,int cy,int cx, const mc_u8 vox[256*256*256]){
     if(!a||lod<0||lod>7||!vox) return -1;
     mc_set_quality(a->quality);
@@ -443,6 +448,7 @@ const char *mc_metadata(const uint8_t *arc, size_t *out_len){
     return (const char*)(arc+off);
 }
 
+#define MC_RD_NODE_CACHE 64    // cached node tables per streaming reader (64*32KB = 2MB)
 struct mc_reader {
     const uint8_t *arc;        // flat mode: archive buffer; streaming: NULL
     size_t len;
@@ -454,6 +460,12 @@ struct mc_reader {
     int partial;
     u8 hdr[MC_BITMAP_BYTES + MC_GRID3*2]; uint64_t hdr_off; int hdr_np;
     u8 *pbuf; size_t pbuf_cap;
+    // streaming node-table cache: resolving a chunk needs 3 dependent 32KB
+    // table reads; without a cache every resolve re-fetches them (3 GETs per
+    // chunk over S3). FIFO of the last MC_RD_NODE_CACHE tables.
+    uint64_t ntab_off[MC_RD_NODE_CACHE];
+    u8 *ntab[MC_RD_NODE_CACHE];
+    int ntab_next;
 };
 
 mc_reader *mc_open(const uint8_t *arc, size_t len){
@@ -479,7 +491,9 @@ mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len){
     return r;
 }
 
-void mc_close(mc_reader *r){ if(!r)return; free(r->cbuf); free(r->pbuf); free(r); }
+void mc_close(mc_reader *r){ if(!r)return;
+    for(int i=0;i<MC_RD_NODE_CACHE;++i) free(r->ntab[i]);
+    free(r->cbuf); free(r->pbuf); free(r); }
 // Partial-fetch mode (streaming readers only): decode a block by fetching just
 // the chunk's bitmap+length table (cached per chunk, <=8.7KB) plus that block's
 // own payload, instead of the whole chunk blob. Wins cold random-access latency
@@ -487,13 +501,24 @@ void mc_close(mc_reader *r){ if(!r)return; free(r->cbuf); free(r->pbuf); free(r)
 void mc_reader_set_partial_fetch(mc_reader *r, int on){ if(r){ r->partial=on; r->hdr_off=~0ull; } }
 void mc_reader_set_quality(mc_reader *r, float q){ (void)r; mc_set_quality(q); }
 
-// streaming chunk-offset resolve: pull node tables on demand (each is MC_NODE_BYTES).
+// streaming chunk-offset resolve: pull node tables on demand (each is
+// MC_NODE_BYTES), memoized in the reader's FIFO node-table cache so repeated
+// resolves (scans, neighborhoods) cost zero extra reads.
+static const u8 *sfetch_node(mc_reader *r, uint64_t off){
+    for(int i=0;i<MC_RD_NODE_CACHE;++i)
+        if(r->ntab[i] && r->ntab_off[i]==off) return r->ntab[i];
+    int slot=r->ntab_next; r->ntab_next=(slot+1)%MC_RD_NODE_CACHE;
+    if(!r->ntab[slot]) r->ntab[slot]=malloc(MC_NODE_BYTES);
+    if(sread(r,off,MC_NODE_BYTES,r->ntab[slot])!=0){ free(r->ntab[slot]); r->ntab[slot]=0; return NULL; }
+    r->ntab_off[slot]=off;
+    return r->ntab[slot];
+}
 static uint64_t sresolve_chunk(mc_reader *r,int lod,int cz,int cy,int cx){
     uint64_t node = r->roots[lod];
-    u8 tbl[MC_NODE_BYTES];
     for(int nib=MC_TREE_LEVELS-1; nib>=0; --nib){
         if(!node) return 0;
-        if(sread(r,node,MC_NODE_BYTES,tbl)!=0) return 0;
+        const u8 *tbl=sfetch_node(r,node);
+        if(!tbl) return 0;
         int idx=(mc_nib(cz,nib)*16+mc_nib(cy,nib))*16+mc_nib(cx,nib);
         uint64_t child; memcpy(&child,tbl+(size_t)idx*8,8);
         node=child;
