@@ -72,6 +72,23 @@ int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
 int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx,
                        uint8_t **raw, size_t *len);
 
+// One present inner chunk of a shard: global coords + its byte range in the
+// shard object. (v2: off/len describe the standalone chunk object, range from 0.)
+typedef struct {
+    int cz, cy, cx;       // global inner-chunk coords
+    uint64_t off, len;    // payload byte range within the shard object's key
+} mc_zarr_range;
+
+// Read a shard's index footer (ONE ranged read) and return the byte ranges of
+// every PRESENT inner chunk, plus the shard object key (for batched GETs). The
+// caller fetches the payloads however it likes (e.g. a parallel s3 batch), then
+// decodes. `key` is filled with the shard object key (relative to the level).
+// On success *out is a malloc'd array of *n entries (caller frees), return 0.
+// All-air / absent shard -> *n = 0, *out NULL, return 0. <0 on error.
+// (v2: returns the single chunk's key + {off=0,len=0-means-whole-object}.)
+int mc_zarr_shard_index(mc_zarr *z, int cz, int cy, int cx,
+                        char key_out[64], mc_zarr_range **out, int *n);
+
 #ifdef __cplusplus
 }
 #endif

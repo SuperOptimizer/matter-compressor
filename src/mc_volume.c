@@ -11,14 +11,29 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 #define MAXLOD 8
 #define CHUNK 256
 #define BLK 16
 #define PER (CHUNK / BLK)   // 16 blocks per chunk axis
 
-static void *worker_main(void *ud);
+static void *decoder_main(void *ud);
+static void *dl_main(void *ud);
 static const uint8_t *zero256(void);   // shared 32-aligned 256^3 zero buffer
+
+// ---- timing log (MCV_LOG=1 to enable) -------------------------------------
+static int g_log = -1;
+static double mcv_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;   // ms
+}
+#define MCVLOG(...) do { \
+    if (g_log < 0) g_log = getenv("MCV_LOG") ? 1 : 0; \
+    if (g_log) { fprintf(stderr, "[mcv %10.1f] ", mcv_now()); \
+                 fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } \
+} while (0)
 
 // ---------------------------------------------------------------------------
 // per-level source (one mc_zarr + its S3 key prefix)
@@ -40,23 +55,43 @@ struct mc_volume {
 
     atomic_uint_fast64_t net_bytes;
 
-    // region single-flight: key = (lod<<60)|(cz<<40)|(cy<<20)|cx, self-bounding.
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    uint64_t *inflight;        // open-addressed set
-    size_t inflight_cap, inflight_n;
+    pthread_mutex_t mu;        // guards the decode queue + request stack
+    pthread_cond_t cv;         // request-stack not-empty (wakes download threads)
 
-    // background transcode workers for the async render path (try_block).
-    pthread_t workers[8];
-    int nworkers;
-    uint64_t queue[256];       // pending region keys (ring)
-    int qh, qt;                // head/tail
-    pthread_cond_t qcv;        // signals queued work
+    // Decode pipeline: download threads enqueue raw payloads here; a pool of
+    // decode workers drains them (decode -> re-encode -> append). This keeps the
+    // network saturated (downloaders never wait on CPU) and CPU saturated
+    // (decoders run in parallel), instead of serializing download+decode.
+    pthread_t decoders[32];
+    int ndecoders;
+    struct decode_item *dq;    // bounded ring of pending decode items
+    int dq_cap, dq_head, dq_tail;
+    pthread_cond_t dq_ne;      // not-empty (wake a decoder)
+    pthread_cond_t dq_nf;      // not-full  (wake a blocked producer)
     int stop;
 
-    mc_volume_ready_fn ready_cb;   // fired when a background transcode completes
+    // Interactive download-request stack (LIFO): a render miss pushes "fetch the
+    // shard around region R". Download threads pop the NEWEST request (current
+    // view) first; when full, the OLDEST (stalest, camera moved on) is dropped.
+    uint64_t *reqstk;          // region keys
+    int rs_cap, rs_n;
+    pthread_t dlthreads[16];
+    int ndl;
+
+    mc_volume_ready_fn ready_cb;   // fired when a region becomes serveable
     void *ready_ud;
 };
+
+// One unit of decode work: the sub^3 cube of source chunks covering one 256^3
+// region. For c3d (sub=1) nsub==1; for v2 (sub=2) up to 8. Owns the raw bytes.
+typedef struct decode_item {
+    int lod, rz, ry, rx;       // target 256^3 region coords
+    int sub;                   // 1 (c3d) or 2 (v2)
+    int nsub;                  // number of valid sub-chunks
+    int oz[8], oy[8], ox[8];   // sub-chunk voxel offsets within the region
+    uint8_t *raw[8];           // owned compressed bytes (freed by the decoder)
+    size_t rlen[8];
+} decode_item;
 
 // ---------------------------------------------------------------------------
 // s3 byte source for mc_zarr (prepends the level prefix to the object key)
@@ -87,64 +122,10 @@ static int s3_read(void *ud, const char *key, uint64_t off, uint64_t len,
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// single-flight set (open addressing, grows; tiny — only in-flight regions)
-// ---------------------------------------------------------------------------
+// pack a region (lod,cz,cy,cx) into a 64-bit key.
 static uint64_t rkey(int lod, int cz, int cy, int cx) {
     return ((uint64_t)(lod & 7) << 60) | ((uint64_t)(cz & 0xFFFFF) << 40) |
            ((uint64_t)(cy & 0xFFFFF) << 20) | (uint64_t)(cx & 0xFFFFF);
-}
-static uint64_t kmix(uint64_t k) {
-    k ^= k >> 33; k *= 0xFF51AFD7ED558CCDULL; k ^= k >> 33;
-    k *= 0xC4CEB9FE1A85EC53ULL; k ^= k >> 33; return k;
-}
-// must hold mu. 1 if present.
-static int infl_has(mc_volume *v, uint64_t key) {
-    if (!v->inflight_cap) return 0;
-    size_t m = v->inflight_cap - 1, i = kmix(key) & m;
-    for (size_t p = 0; p <= m; ++p, i = (i + 1) & m) {
-        if (v->inflight[i] == 0) return 0;
-        if (v->inflight[i] == key) return 1;
-    }
-    return 0;
-}
-static void infl_grow(mc_volume *v) {
-    size_t nc = v->inflight_cap ? v->inflight_cap * 2 : 64;
-    uint64_t *na = calloc(nc, sizeof *na);
-    if (!na) return;
-    size_t m = nc - 1;
-    for (size_t j = 0; j < v->inflight_cap; ++j) {
-        uint64_t k = v->inflight[j];
-        if (!k) continue;
-        size_t i = kmix(k) & m;
-        while (na[i]) i = (i + 1) & m;
-        na[i] = k;
-    }
-    free(v->inflight);
-    v->inflight = na;
-    v->inflight_cap = nc;
-}
-static void infl_add(mc_volume *v, uint64_t key) {
-    if ((v->inflight_n + 1) * 4 >= v->inflight_cap * 3) infl_grow(v);
-    size_t m = v->inflight_cap - 1, i = kmix(key) & m;
-    while (v->inflight[i]) i = (i + 1) & m;
-    v->inflight[i] = key;
-    v->inflight_n++;
-}
-static void infl_del(mc_volume *v, uint64_t key) {
-    size_t m = v->inflight_cap - 1, i = kmix(key) & m;
-    for (size_t p = 0; p <= m; ++p, i = (i + 1) & m) {
-        if (v->inflight[i] == key) { v->inflight[i] = 0; v->inflight_n--; break; }
-        if (v->inflight[i] == 0) break;
-    }
-    // rehash the run after the hole (open-addressing delete).
-    size_t j = (i + 1) & m;
-    while (v->inflight[j]) {
-        uint64_t k = v->inflight[j];
-        v->inflight[j] = 0; v->inflight_n--;
-        infl_add(v, k);
-        j = (j + 1) & m;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,85 +158,72 @@ static void blit_sub(uint8_t *region, const uint8_t *src, int edge,
                    src + ((size_t)z * edge + y) * edge, (size_t)edge);
 }
 
-// transcode the 256^3 mca region (cz,cy,cx) of lod. The source inner-chunk edge
-// is 256 (c3d: 1:1) or 128 (v2: assemble the 2x2x2 cube of 8 source chunks into
-// one 256^3 region before encoding it as a single mca chunk).
-static int transcode_region(mc_volume *v, int lod, int cz, int cy, int cx) {
-    level_t *lv = &v->lv[lod];
-    const char *codec = mc_zarr_inner_codec(lv->z);
-    const int edge = mc_zarr_inner_edge(lv->z);        // 256 or 128
-    const int sub = CHUNK / edge;                      // 1 (c3d) or 2 (v2)
-
+// Decode one item (the sub^3 cube for a region) -> assemble 256^3 -> append.
+// Frees the item's raw buffers. Runs on a decode-pool thread (off the download
+// thread). The c3d decode + mc re-encode are the CPU cost we keep off the net.
+static void decode_one(mc_volume *v, decode_item *it) {
+    const char *codec = mc_zarr_inner_codec(v->lv[it->lod].z);
+    const int edge = CHUNK / it->sub;
+    if (it->nsub == 0) {                               // all air -> ZERO
+        mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, zero256());
+        return;
+    }
     uint8_t *dense = NULL;
-    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) return -1;
-
-    if (sub == 1) {                                    // c3d: one source chunk == region
-        uint8_t *raw = NULL;
-        size_t rlen = 0;
-        int st = mc_zarr_read_inner(lv->z, cz, cy, cx, &raw, &rlen);
-        if (st < 0) { free(dense); return -1; }
-        if (st == 1) {                                 // air -> ZERO
-            free(dense);
-            mc_archive_append_chunk_raw(v->arc, lod, cz, cy, cx, zero256());
-            return 0;
-        }
-        decode_inner(codec, raw, rlen, dense, CHUNK);
-        free(raw);
-    } else {                                           // v2: assemble the sub^3 cube
+    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) goto done;
+    if (it->sub == 1) {                                // c3d: chunk == region
+        decode_inner(codec, it->raw[0], it->rlen[0], dense, CHUNK);
+    } else {                                           // v2: blit the cube
         memset(dense, 0, (size_t)CHUNK * CHUNK * CHUNK);
         uint8_t *tile = malloc((size_t)edge * edge * edge);
-        if (!tile) { free(dense); return -1; }
-        int present = 0;
-        for (int dz = 0; dz < sub; ++dz)
-            for (int dy = 0; dy < sub; ++dy)
-                for (int dx = 0; dx < sub; ++dx) {
-                    uint8_t *raw = NULL;
-                    size_t rlen = 0;
-                    int st = mc_zarr_read_inner(lv->z, cz * sub + dz, cy * sub + dy,
-                                                cx * sub + dx, &raw, &rlen);
-                    if (st < 0) { free(raw); free(tile); free(dense); return -1; }
-                    if (st == 1) continue;             // this sub-chunk is air -> leave zeros
-                    decode_inner(codec, raw, rlen, tile, edge);
-                    free(raw);
-                    blit_sub(dense, tile, edge, dz * edge, dy * edge, dx * edge);
-                    ++present;
-                }
-        free(tile);
-        if (!present) {                                // whole region air -> ZERO
-            free(dense);
-            mc_archive_append_chunk_raw(v->arc, lod, cz, cy, cx, zero256());
-            return 0;
+        if (tile) {
+            for (int k = 0; k < it->nsub; ++k) {
+                decode_inner(codec, it->raw[k], it->rlen[k], tile, edge);
+                blit_sub(dense, tile, edge, it->oz[k], it->oy[k], it->ox[k]);
+            }
+            free(tile);
         }
     }
-    int rc = mc_archive_append_chunk_raw(v->arc, lod, cz, cy, cx, dense);
+    double td = mcv_now();
+    mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, dense);
+    MCVLOG("decoded   lod%d region(%d,%d,%d) appended (decode+enc %.0fms)",
+           it->lod, it->rz, it->ry, it->rx, mcv_now() - td);
     free(dense);
-    return rc == 0 ? 1 : -1;
+done:
+    for (int k = 0; k < it->nsub; ++k) free(it->raw[k]);
 }
 
-// ensure region present in the .mca (single-flight). returns coverage after.
-static mc_cover ensure_region(mc_volume *v, int lod, int cz, int cy, int cx) {
-    mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
-    if (cov != MC_ABSENT) return cov;
-    uint64_t key = rkey(lod, cz, cy, cx);
-    pthread_mutex_lock(&v->mu);
-    while (infl_has(v, key)) {
-        pthread_cond_wait(&v->cv, &v->mu);
-        cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
-        if (cov != MC_ABSENT) { pthread_mutex_unlock(&v->mu); return cov; }
+// Decode-pool worker: drain decode items, decode off the download thread.
+static void *decoder_main(void *ud) {
+    mc_volume *v = ud;
+    for (;;) {
+        pthread_mutex_lock(&v->mu);
+        while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
+        if (v->stop && v->dq_head == v->dq_tail) { pthread_mutex_unlock(&v->mu); return NULL; }
+        decode_item it = v->dq[v->dq_head];
+        v->dq_head = (v->dq_head + 1) % v->dq_cap;
+        pthread_cond_signal(&v->dq_nf);                // a slot freed
+        pthread_mutex_unlock(&v->mu);
+        decode_one(v, &it);
+        if (v->ready_cb) v->ready_cb(v->ready_ud);     // region became serveable
     }
-    // re-check under lock: another thread may have just finished.
-    cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
-    if (cov != MC_ABSENT) { pthread_mutex_unlock(&v->mu); return cov; }
-    infl_add(v, key);
-    pthread_mutex_unlock(&v->mu);
+}
 
-    transcode_region(v, lod, cz, cy, cx);
-
+// Producer: push a decode item, BLOCKING if the queue is full (backpressure ->
+// bounded RAM; the download thread waits for decoders to catch up). Takes
+// ownership of the item's raw buffers.
+static void decode_push(mc_volume *v, const decode_item *it) {
     pthread_mutex_lock(&v->mu);
-    infl_del(v, key);
-    pthread_cond_broadcast(&v->cv);
+    int next = (v->dq_tail + 1) % v->dq_cap;
+    int blocked = (next == v->dq_head);
+    while (next == v->dq_head && !v->stop) pthread_cond_wait(&v->dq_nf, &v->mu);
+    if (v->stop) { pthread_mutex_unlock(&v->mu);
+        for (int k = 0; k < it->nsub; ++k) free(it->raw[k]); return; }
+    v->dq[v->dq_tail] = *it;
+    v->dq_tail = next;
+    int depth = (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap;
+    pthread_cond_signal(&v->dq_ne);
     pthread_mutex_unlock(&v->mu);
-    return mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    if (blocked) MCVLOG("decode_q  FULL (backpressure: decoders behind) depth=%d", depth);
 }
 
 // unpack a region key.
@@ -266,38 +234,56 @@ static void runpack(uint64_t k, int *lod, int *cz, int *cy, int *cx) {
     *cx = (int)(k & 0xFFFFF);
 }
 
-// background worker: drain the queue, transcode each region via single-flight.
-static void *worker_main(void *ud) {
+// Push an interactive download request (region key) onto the LIFO stack. Newest
+// on top. If full, drop the BOTTOM (stalest). Deduped against the stack. Wakes a
+// download thread. (cv doubles as the stack's not-empty signal.)
+static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
+    uint64_t key = rkey(lod, cz, cy, cx);
+    pthread_mutex_lock(&v->mu);
+    for (int i = 0; i < v->rs_n; ++i)
+        if (v->reqstk[i] == key) { pthread_mutex_unlock(&v->mu); return; }   // already queued
+    if (v->rs_n == v->rs_cap) {                         // full -> drop bottom
+        memmove(&v->reqstk[0], &v->reqstk[1], (size_t)(v->rs_cap - 1) * sizeof(uint64_t));
+        v->rs_n--;
+    }
+    v->reqstk[v->rs_n++] = key;                         // push on top
+    MCVLOG("req_push  lod%d region(%d,%d,%d) stack_depth=%d", lod, cz, cy, cx, v->rs_n);
+    pthread_cond_signal(&v->cv);
+    pthread_mutex_unlock(&v->mu);
+}
+
+// Download thread: pop the newest request, download its shard (-> decode queue).
+static void *dl_main(void *ud) {
     mc_volume *v = ud;
     for (;;) {
         pthread_mutex_lock(&v->mu);
-        while (v->qh == v->qt && !v->stop) pthread_cond_wait(&v->qcv, &v->mu);
-        if (v->stop && v->qh == v->qt) { pthread_mutex_unlock(&v->mu); return NULL; }
-        uint64_t key = v->queue[v->qh];
-        v->qh = (v->qh + 1) & 255;
+        while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
+        if (v->stop && v->rs_n == 0) { pthread_mutex_unlock(&v->mu); return NULL; }
+        uint64_t key = v->reqstk[--v->rs_n];           // pop top (newest)
         pthread_mutex_unlock(&v->mu);
         int lod, cz, cy, cx;
-        runpack(key, &lod, &cz, &cy, &cx);
-        ensure_region(v, lod, cz, cy, cx);   // does its own single-flight + dedup
-        if (v->ready_cb) v->ready_cb(v->ready_ud);   // a region became serveable
+        runpack(key, &lod, &cz, &cy, &cx);             // region coords
+        MCVLOG("dl_pop    lod%d region(%d,%d,%d) -> download shard", lod, cz, cy, cx);
+        const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
+        mc_volume_prefetch_shard(v, lod, cz * sub, cy * sub, cx * sub);  // source coord
     }
 }
 
-// enqueue a region for async transcode (non-blocking; drops if queue full or
-// already queued/in-flight). caller holds NOTHING.
-static void enqueue_region(mc_volume *v, int lod, int cz, int cy, int cx) {
-    uint64_t key = rkey(lod, cz, cy, cx);
-    pthread_mutex_lock(&v->mu);
-    if (infl_has(v, key)) { pthread_mutex_unlock(&v->mu); return; }   // already working
-    int next = (v->qt + 1) & 255;
-    if (next == v->qh) { pthread_mutex_unlock(&v->mu); return; }      // queue full, drop
-    // dedup against pending queue entries.
-    for (int i = v->qh; i != v->qt; i = (i + 1) & 255)
-        if (v->queue[i] == key) { pthread_mutex_unlock(&v->mu); return; }
-    v->queue[v->qt] = key;
-    v->qt = next;
-    pthread_cond_signal(&v->qcv);
-    pthread_mutex_unlock(&v->mu);
+// Blocking fill of one region (get_block / CLI): download its shard synchronously
+// through the same decode queue, then wait for that region's coverage to resolve.
+static mc_cover ensure_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    if (cov != MC_ABSENT) return cov;
+    const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
+    mc_volume_prefetch_shard(v, lod, cz * sub, cy * sub, cx * sub);   // pushes to decode queue
+    // wait for the decoders to drain enough that this region is covered.
+    for (int spin = 0; spin < 100000; ++spin) {
+        cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+        if (cov != MC_ABSENT) return cov;
+        struct timespec ts = {0, 1000000};             // 1ms
+        nanosleep(&ts, NULL);
+    }
+    return mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,28 +363,51 @@ mc_volume *mc_volume_open(const char *url, const char *cache_dir,
         s3_client_free(v->s3); free(v); return NULL;
     }
 
-    // background transcode workers for the async render path.
-    pthread_cond_init(&v->qcv, NULL);
-    v->nworkers = 4;
-    for (int i = 0; i < v->nworkers; ++i)
-        pthread_create(&v->workers[i], NULL, worker_main, v);
+    // Pipeline: a few download threads (network-bound, pop the LIFO request
+    // stack) feed a bounded decode queue drained by a decode pool (CPU-bound).
+    pthread_cond_init(&v->dq_ne, NULL);
+    pthread_cond_init(&v->dq_nf, NULL);
+    v->dq_cap = 256;                                   // bounded decode queue
+    v->dq = calloc((size_t)v->dq_cap, sizeof *v->dq);
+    v->rs_cap = 512;                                   // LIFO request stack
+    v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
+
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    v->ndecoders = nproc > 2 ? (nproc < 32 ? (int)nproc : 32) : 2;
+    for (int i = 0; i < v->ndecoders; ++i)
+        pthread_create(&v->decoders[i], NULL, decoder_main, v);
+    v->ndl = 8;                                        // download threads (latency-bound)
+    for (int i = 0; i < v->ndl; ++i)
+        pthread_create(&v->dlthreads[i], NULL, dl_main, v);
+    MCVLOG("open      %s  decoders=%d dl_threads=%d dq_cap=%d", url, v->ndecoders, v->ndl, v->dq_cap);
     return v;
 }
 
 void mc_volume_free(mc_volume *v) {
     if (!v) return;
-    // stop workers.
+    // stop download + decode threads.
     pthread_mutex_lock(&v->mu);
     v->stop = 1;
-    pthread_cond_broadcast(&v->qcv);
+    pthread_cond_broadcast(&v->cv);      // wake download threads
+    pthread_cond_broadcast(&v->dq_ne);   // wake decoders
+    pthread_cond_broadcast(&v->dq_nf);   // wake blocked producers
     pthread_mutex_unlock(&v->mu);
-    for (int i = 0; i < v->nworkers; ++i) pthread_join(v->workers[i], NULL);
-    pthread_cond_destroy(&v->qcv);
+    for (int i = 0; i < v->ndl; ++i) pthread_join(v->dlthreads[i], NULL);
+    for (int i = 0; i < v->ndecoders; ++i) pthread_join(v->decoders[i], NULL);
+    // drain any remaining decode items (free their raw buffers).
+    while (v->dq_head != v->dq_tail) {
+        decode_item *it = &v->dq[v->dq_head];
+        for (int k = 0; k < it->nsub; ++k) free(it->raw[k]);
+        v->dq_head = (v->dq_head + 1) % v->dq_cap;
+    }
+    pthread_cond_destroy(&v->dq_ne);
+    pthread_cond_destroy(&v->dq_nf);
     if (v->cache) mc_cache_free(v->cache);
     if (v->arc) mc_archive_close(v->arc);
     for (int i = 0; i < v->nlods; ++i) if (v->lv[i].z) mc_zarr_free(v->lv[i].z);
     if (v->s3) s3_client_free(v->s3);
-    free(v->inflight);
+    free(v->dq);
+    free(v->reqstk);
     pthread_mutex_destroy(&v->mu);
     pthread_cond_destroy(&v->cv);
     free(v);
@@ -424,7 +433,7 @@ int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
     int cz = bz / PER, cy = by / PER, cx = bx / PER;
     mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
     if (cov == MC_ABSENT) {
-        enqueue_region(v, lod, cz, cy, cx);   // async, deduped; render falls to coarser LOD
+        req_push(v, lod, cz, cy, cx);   // LIFO download request; render falls to coarser LOD
         memset(dst, 0, BLK * BLK * BLK);
         return 0;
     }
@@ -469,29 +478,111 @@ mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking) {
 }
 
 // ---------------------------------------------------------------------------
-// prefetch — region-at-a-time (NO whole-shard download). Each 256^3 region is
-// transcoded by reading only its source inner-chunk(s) via ranged GETs (one for
-// c3d, the 2x2x2 cube for v2). Same path as the interactive fill (ensure_region),
-// so coverage + single-flight dedup apply. (cz,cy,cx) is a source inner-chunk in
-// the target shard; we walk the shard's 256^3 regions.
+// prefetch — batch a whole shard's present inner chunks in ONE parallel
+// s3_get_batch (many concurrent GETs over pooled connections), then decode +
+// assemble into 256^3 regions and append. This is the throughput path: the
+// parallelism lives in libs3's connection pool, so a FEW prefetch driver
+// threads saturate bandwidth without a thread-per-GET explosion. RAM is bounded
+// by one shard's compressed chunks (a fraction of the decoded shard).
+// (cz,cy,cx) is any source inner-chunk in the target shard.
 // ---------------------------------------------------------------------------
+// Download a shard's present chunks (one parallel s3_get_batch) and PUSH each
+// region's raw payload(s) to the decode queue — NO decode on this (download)
+// thread. Decoders drain the queue in parallel, so the network stays saturated.
+// Backpressure in decode_push bounds RAM. (cz,cy,cx) = source inner-chunk coord.
 void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
     if (lod < 0 || lod >= v->nlods) return;
-    mc_zarr *z = v->lv[lod].z;
-    if (mc_zarr_shard_all_air(z, cz, cy, cx) == 1) return;
-    const int edge = mc_zarr_inner_edge(z);            // 256 or 128
+    level_t *lv = &v->lv[lod];
+    mc_zarr *z = lv->z;
+    const int edge = mc_zarr_inner_edge(z);            // 256 (c3d) or 128 (v2)
     const int sub = CHUNK / edge;                      // source chunks per region axis
-    const int per = mc_zarr_shard_edge(z) / edge;      // source chunks per shard axis
-    const int rper = per / sub;                        // 256^3 regions per shard axis
-    int gz, gy, gx;
-    mc_zarr_inner_grid(z, &gz, &gy, &gx);
-    const int rgz = (gz + sub - 1) / sub, rgy = (gy + sub - 1) / sub, rgx = (gx + sub - 1) / sub;
-    // shard origin in REGION coords.
-    const int rz0 = (cz / per) * rper, ry0 = (cy / per) * rper, rx0 = (cx / per) * rper;
-    for (int rz = rz0; rz < rz0 + rper && rz < rgz; ++rz)
-        for (int ry = ry0; ry < ry0 + rper && ry < rgy; ++ry)
-            for (int rx = rx0; rx < rx0 + rper && rx < rgx; ++rx)
-                ensure_region(v, lod, rz, ry, rx);     // ranged per-chunk reads, append per region
+
+    char shard_key[64];
+    mc_zarr_range *ranges = NULL;
+    int nr = 0;
+    double t0 = mcv_now();
+    if (mc_zarr_shard_index(z, cz, cy, cx, shard_key, &ranges, &nr) < 0) {
+        MCVLOG("shard_idx lod%d src(%d,%d,%d) FAILED", lod, cz, cy, cx); return;
+    }
+    MCVLOG("shard_idx lod%d src(%d,%d,%d) -> %d present chunks (footer %.0fms)",
+           lod, cz, cy, cx, nr, mcv_now() - t0);
+    if (nr == 0) { free(ranges); return; }             // all air
+
+    char shard_url[1280];
+    snprintf(shard_url, sizeof shard_url, "%s/%s", lv->prefix, shard_key);
+    uint64_t got = 0;
+    int nbatch = 0;
+
+    // Download the shard's chunks in batches of MC_BATCH (bounded buffering),
+    // then hand each region's raw bytes to the decode pool. v2 groups the sub^3
+    // cube per region; c3d is 1:1.
+    enum { MC_BATCH = 48 };
+    s3_range_req reqs[MC_BATCH];
+    s3_response resp[MC_BATCH];
+    int idx[MC_BATCH];
+    for (int base = 0; base < nr; ) {
+        int nq = 0;
+        while (base < nr && nq < MC_BATCH) {
+            mc_zarr_range *rg = &ranges[base++];
+            int rz = rg->cz / sub, ry = rg->cy / sub, rx = rg->cx / sub;
+            if (mc_archive_chunk_coverage(v->arc, lod, rz, ry, rx) != MC_ABSENT) continue;
+            reqs[nq] = (s3_range_req){shard_url, rg->off, rg->len};
+            idx[nq] = base - 1;
+            ++nq;
+        }
+        if (nq == 0) continue;
+        memset(resp, 0, sizeof resp);
+        double tb = mcv_now();
+        s3_get_batch(v->s3, reqs, (size_t)nq, 32, resp);   // partial ok; check each
+        { int ok = 0; uint64_t bytes = 0;
+          for (int i = 0; i < nq; ++i) if (s3_response_ok(&resp[i])) { ok++; bytes += resp[i].body_len; }
+          MCVLOG("batch#%d  lod%d nq=%d ok=%d %.2fMB in %.0fms = %.1f MB/s",
+                 nbatch++, lod, nq, ok, bytes/1048576.0, mcv_now()-tb,
+                 bytes/1048576.0/((mcv_now()-tb)/1000.0)); }
+
+        if (sub == 1) {                                // c3d: one chunk == one region
+            for (int i = 0; i < nq; ++i) {
+                mc_zarr_range *rg = &ranges[idx[i]];
+                if (s3_response_ok(&resp[i]) && rg->len && resp[i].body_len >= rg->len) {
+                    decode_item it = {lod, rg->cz, rg->cy, rg->cx, 1, 1, {0},{0},{0}, {0},{0}};
+                    it.raw[0] = malloc(rg->len);
+                    if (it.raw[0]) { memcpy(it.raw[0], resp[i].body, rg->len); it.rlen[0] = rg->len;
+                        got += rg->len; decode_push(v, &it); }
+                }
+                s3_response_free(&resp[i]);
+            }
+        } else {                                       // v2: regroup the cube per region
+            // Build one decode_item per distinct region in this batch.
+            for (int i = 0; i < nq; ++i) {
+                if (idx[i] < 0) continue;              // already consumed into a cube
+                mc_zarr_range *r0 = &ranges[idx[i]];
+                int rz = r0->cz / sub, ry = r0->cy / sub, rx = r0->cx / sub;
+                decode_item it = {lod, rz, ry, rx, sub, 0, {0},{0},{0}, {0},{0}};
+                for (int j = i; j < nq; ++j) {
+                    if (idx[j] < 0) continue;
+                    mc_zarr_range *rg = &ranges[idx[j]];
+                    if (rg->cz / sub != rz || rg->cy / sub != ry || rg->cx / sub != rx) continue;
+                    if (s3_response_ok(&resp[j]) && resp[j].body_len >= rg->len && it.nsub < 8) {
+                        size_t rlen = rg->len ? rg->len : resp[j].body_len;
+                        uint8_t *buf = malloc(rlen);
+                        if (buf) { memcpy(buf, resp[j].body, rlen);
+                            int k = it.nsub++;
+                            it.raw[k] = buf; it.rlen[k] = rlen;
+                            it.oz[k] = (rg->cz % sub) * edge;
+                            it.oy[k] = (rg->cy % sub) * edge;
+                            it.ox[k] = (rg->cx % sub) * edge;
+                            got += rlen;
+                        }
+                    }
+                    idx[j] = -1;                       // consumed
+                }
+                decode_push(v, &it);                   // nsub may be 0 -> ZERO region
+            }
+            for (int i = 0; i < nq; ++i) s3_response_free(&resp[i]);
+        }
+    }
+    atomic_fetch_add_explicit(&v->net_bytes, got, memory_order_relaxed);
+    free(ranges);
 }
 
 void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel) {
@@ -520,5 +611,5 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     out->cache_misses = cs.misses;
     out->disk_bytes = v->arc ? mc_archive_data_len(v->arc) : 0;
     out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed);
-    out->regions_inflight = v->inflight_n;
+    out->regions_inflight = (uint64_t)v->rs_n;
 }

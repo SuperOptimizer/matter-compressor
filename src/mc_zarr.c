@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <zstd.h>
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,16 @@ static uint8_t *blosc_decode(const uint8_t *src, size_t srclen, size_t *out_len)
 // ---------------------------------------------------------------------------
 enum { ZV3 = 3, ZV2 = 2 };
 
+// Cached shard index footer: the (offset,len) table is immutable per shard, so
+// read the 64KB footer ONCE and reuse it for all of a shard's inner chunks.
+// Without this, fetching a shard's 4096 chunks one-at-a-time re-reads 64KB *4096.
+#define MC_FOOTER_CACHE 64
+typedef struct {
+    uint64_t shard_id;     // (sz<<40)|(sy<<20)|sx, ~0 = empty slot
+    uint8_t *idx;          // malloc'd footer bytes (n_inner*16)
+    uint64_t lru;          // last-use tick
+} footer_ent;
+
 struct mc_zarr {
     mc_zarr_read_fn read;
     void *ud;
@@ -93,6 +104,10 @@ struct mc_zarr {
     int per;                // inner chunks per shard axis = shard_edge/inner_edge
     char codec[16];         // "c3d" | "blosc" | "raw"
     char sep;               // v2 dimension separator ('.' default, or '/')
+
+    pthread_mutex_t fmu;    // guards the footer cache
+    footer_ent fcache[MC_FOOTER_CACHE];
+    uint64_t ftick;
 };
 
 // fetch a whole object by key; returns malloc'd buf or NULL (sets *len).
@@ -124,6 +139,7 @@ mc_zarr *mc_zarr_open(mc_zarr_read_fn read, void *ud) {
 
     mc_zarr *z = calloc(1, sizeof *z);
     if (!z) { free(j); return NULL; }
+    pthread_mutex_init(&z->fmu, NULL);
     z->read = read;
     z->ud = ud;
 
@@ -178,7 +194,12 @@ mc_zarr *mc_zarr_open(mc_zarr_read_fn read, void *ud) {
     return z;
 }
 
-void mc_zarr_free(mc_zarr *z) { free(z); }
+void mc_zarr_free(mc_zarr *z) {
+    if (!z) return;
+    for (int i = 0; i < MC_FOOTER_CACHE; ++i) free(z->fcache[i].idx);
+    pthread_mutex_destroy(&z->fmu);
+    free(z);
+}
 
 void mc_zarr_shape(const mc_zarr *z, int *nz, int *ny, int *nx) {
     if (nz) *nz = z->shape[0];
@@ -228,6 +249,60 @@ static size_t inner_linear(const mc_zarr *z, int cz, int cy, int cx) {
     return ((size_t)rz * z->per + ry) * z->per + rx;
 }
 
+// Get the shard's index footer (n_inner*16 bytes), cached. Reads it once per
+// shard via one ranged GET, then serves all the shard's chunks from RAM.
+// Returns a borrowed pointer valid until the entry is evicted; copy out the
+// (off,len) you need while you still need them (callers do this immediately).
+// NULL if the shard is absent (all air) or on error.
+static const uint8_t *footer_get(mc_zarr *z, int cz, int cy, int cx) {
+    if (z->version != ZV3) return NULL;
+    uint64_t sid = ((uint64_t)(cz / z->per) << 40) |
+                   ((uint64_t)(cy / z->per) << 20) | (uint64_t)(cx / z->per);
+    pthread_mutex_lock(&z->fmu);
+    for (int i = 0; i < MC_FOOTER_CACHE; ++i)
+        if (z->fcache[i].idx && z->fcache[i].shard_id == sid) {
+            z->fcache[i].lru = ++z->ftick;
+            const uint8_t *p = z->fcache[i].idx;
+            pthread_mutex_unlock(&z->fmu);
+            return p;
+        }
+    pthread_mutex_unlock(&z->fmu);
+
+    // miss: fetch the footer (outside the lock — it's one ranged GET).
+    char key[64];
+    chunk_key(z, cz, cy, cx, key);
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    size_t idx_bytes = n_inner * 16;
+    uint8_t *idx = NULL;
+    size_t got = 0;
+    if (z->read(z->ud, key, 0, idx_bytes, &idx, &got) < 0 || !idx || got < idx_bytes) {
+        free(idx);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&z->fmu);
+    // re-check (another thread may have inserted it); if so, drop ours.
+    int victim = 0;
+    uint64_t oldest = ~0ull;
+    for (int i = 0; i < MC_FOOTER_CACHE; ++i) {
+        if (z->fcache[i].idx && z->fcache[i].shard_id == sid) {
+            free(idx);
+            z->fcache[i].lru = ++z->ftick;
+            const uint8_t *p = z->fcache[i].idx;
+            pthread_mutex_unlock(&z->fmu);
+            return p;
+        }
+        if (!z->fcache[i].idx) { victim = i; oldest = 0; }
+        else if (z->fcache[i].lru < oldest) { oldest = z->fcache[i].lru; victim = i; }
+    }
+    free(z->fcache[victim].idx);
+    z->fcache[victim].idx = idx;
+    z->fcache[victim].shard_id = sid;
+    z->fcache[victim].lru = ++z->ftick;
+    pthread_mutex_unlock(&z->fmu);
+    return idx;
+}
+
 int mc_zarr_shard_all_air(mc_zarr *z, int cz, int cy, int cx) {
     if (z->version != ZV3) {
         // v2: "all air" == the single chunk object is absent.
@@ -239,19 +314,13 @@ int mc_zarr_shard_all_air(mc_zarr *z, int cz, int cy, int cx) {
         free(b);
         return n == 0 ? 1 : 0;
     }
-    char key[64];
-    chunk_key(z, cz, cy, cx, key);
     size_t n_inner = (size_t)z->per * z->per * z->per;
-    size_t idx_bytes = n_inner * 16;
-    uint8_t *idx = NULL;
-    size_t got = 0;
-    if (z->read(z->ud, key, 0, idx_bytes, &idx, &got) < 0) return -1;
-    if (!idx || got < idx_bytes) { free(idx); return idx ? 0 : 1; }   // absent shard = air
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 1;   // absent shard = air
     for (size_t i = 0; i < n_inner; ++i) {
         uint64_t off, nb;
-        if (index_entry(idx, n_inner, i, &off, &nb) == 0) { free(idx); return 0; }
+        if (index_entry(idx, n_inner, i, &off, &nb) == 0) return 0;
     }
-    free(idx);
     return 1;
 }
 
@@ -284,17 +353,13 @@ int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx, uint8_t **raw, size_t
         return 0;
     }
 
-    // v3: read index footer, then the one inner chunk's payload range.
+    // v3: get the (cached) index footer, then the one inner chunk's payload range.
     size_t n_inner = (size_t)z->per * z->per * z->per;
-    size_t idx_bytes = n_inner * 16;
-    uint8_t *idx = NULL;
-    size_t got = 0;
-    if (z->read(z->ud, key, 0, idx_bytes, &idx, &got) < 0) return -1;
-    if (!idx || got < idx_bytes) { free(idx); return 1; }    // absent shard = air
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 1;                                      // absent shard = air
     size_t lin = inner_linear(z, cz, cy, cx);
     uint64_t off, nb;
     int st = index_entry(idx, n_inner, lin, &off, &nb);
-    free(idx);
     if (st != 0) return st < 0 ? -1 : 1;                     // missing or oob -> air
     uint8_t *payload = NULL;
     size_t plen = 0;
@@ -323,11 +388,8 @@ int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
     char key[64];
     chunk_key(z, cz, cy, cx, key);
     size_t n_inner = (size_t)z->per * z->per * z->per;
-    size_t idx_bytes = n_inner * 16;
-    uint8_t *idx = NULL;
-    size_t got = 0;
-    if (z->read(z->ud, key, 0, idx_bytes, &idx, &got) < 0) return -1;
-    if (!idx || got < idx_bytes) { free(idx); return 0; }   // absent shard = all air
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 0;   // absent shard = all air
     int sz0 = (cz / z->per) * z->per, sy0 = (cy / z->per) * z->per, sx0 = (cx / z->per) * z->per;
     for (int iz = 0; iz < z->per; ++iz)
         for (int iy = 0; iy < z->per; ++iy)
@@ -340,11 +402,48 @@ int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
                     continue;
                 uint8_t *payload = NULL;
                 size_t plen = 0;
-                if (z->read(z->ud, key, off, nb, &payload, &plen) < 0) { free(idx); return -1; }
+                if (z->read(z->ud, key, off, nb, &payload, &plen) < 0) return -1;
                 if (payload && plen >= nb)
                     sink(sink_ud, gz, gy, gx, payload, (size_t)nb);   // c3d raw bytes
                 free(payload);
             }
-    free(idx);
+    return 0;
+}
+
+int mc_zarr_shard_index(mc_zarr *z, int cz, int cy, int cx,
+                        char key_out[64], mc_zarr_range **out, int *n) {
+    *out = NULL;
+    *n = 0;
+    if (z->version == ZV2) {
+        // a v2 "shard" is one chunk object; whole-object fetch (off/len = 0).
+        chunk_key(z, cz, cy, cx, key_out);
+        mc_zarr_range *r = malloc(sizeof *r);
+        if (!r) return -1;
+        r[0] = (mc_zarr_range){cz, cy, cx, 0, 0};
+        *out = r;
+        *n = 1;
+        return 0;
+    }
+    chunk_key(z, cz, cy, cx, key_out);
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 0;                                     // absent shard = all air
+    mc_zarr_range *arr = malloc(n_inner * sizeof *arr);
+    if (!arr) return -1;
+    int sz0 = (cz / z->per) * z->per, sy0 = (cy / z->per) * z->per, sx0 = (cx / z->per) * z->per;
+    int cnt = 0;
+    for (int iz = 0; iz < z->per; ++iz)
+        for (int iy = 0; iy < z->per; ++iy)
+            for (int ix = 0; ix < z->per; ++ix) {
+                size_t lin = ((size_t)iz * z->per + iy) * z->per + ix;
+                uint64_t off, nb;
+                if (index_entry(idx, n_inner, lin, &off, &nb) != 0) continue;
+                int gz = sz0 + iz, gy = sy0 + iy, gx = sx0 + ix;
+                if (gz >= z->inner_grid[0] || gy >= z->inner_grid[1] || gx >= z->inner_grid[2])
+                    continue;
+                arr[cnt++] = (mc_zarr_range){gz, gy, gx, off, nb};
+            }
+    *out = arr;
+    *n = cnt;
     return 0;
 }
