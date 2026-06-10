@@ -4,17 +4,23 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]   # x86-64 AVX2, Graviton-class NEON, Apple NEON
+        include:
+          # x86 at the project's deployment floor (x86-64-v3: AVX2+FMA).
+          # Baseline x86-64 (SSE2, no FMA) is NOT a target and rounds
+          # fp-contracted expressions differently -> bitstream divergence.
+          - { os: ubuntu-24.04,     cflags: "-march=x86-64-v3" }
+          - { os: ubuntu-24.04-arm, cflags: "" }   # NEON baseline (Graviton-class)
+          - { os: macos-15,         cflags: "" }   # Apple NEON
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: build
-        run: cmake -B build -S . -DMC_NO_NATIVE=ON && cmake --build build -j
+        run: cmake -B build -S . -DMC_NO_NATIVE=ON -DCMAKE_C_FLAGS="${{ matrix.cflags }}" && cmake --build build -j
       - name: test
         run: ctest --test-dir build --output-on-failure
       - name: deterministic archive digest
         run: |
-          cc -O3 -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
+          cc -O3 -ffast-math ${{ matrix.cflags }} -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
           mkdir -p digest && ./detarc | tee digest/${{ matrix.os }}.txt
       - uses: actions/upload-artifact@v4
         with: { name: "digest-${{ matrix.os }}", path: digest/ }

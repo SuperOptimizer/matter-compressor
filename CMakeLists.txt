@@ -24,6 +24,12 @@ if(MC_STANDALONE)
   endif()
 endif()
 
+# DETERMINISM FLOOR: archives are byte-identical across targets WITH FMA
+# (aarch64 NEON, x86-64-v3+ AVX2) — the project's actual fleet. Pre-FMA x86
+# (baseline SSE2) rounds fp-contracted float expressions in the encoder's
+# air-fill differently and produces equally-valid but non-identical
+# bitstreams. Build x86 at -march=x86-64-v3 or newer.
+
 # Optional ThinLTO + PGO. MEASURED POLICY (bench/RESULTS.md): LTO of either
 # flavor WITHOUT profiles costs ~15% decode (link-time inliner mispredicts the
 # branch-dense range-coder loop); WITH profiles it gains ~5%. So: ThinLTO only
