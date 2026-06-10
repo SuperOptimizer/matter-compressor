@@ -4,7 +4,7 @@
 //
 // build: cc -O3 -march=native -w -o build/mc_vs_c3d tools/mc_vs_c3d.c \
 //          build/libmatter_compressor.a /tmp/c3d/build/libc3d.a -lm -lpthread -I/tmp/c3d
-#include "../src/mc_archive_api.h"
+#include "../src/matter_compressor.h"
 #include "c3d.h"
 #include <stdio.h>
 #include <stdlib.h>

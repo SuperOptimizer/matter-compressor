@@ -12,8 +12,7 @@
 //   e.g. mc_bench /tmp/vesuvius_512.bin 512 256 1,3,6,12 8
 // Synthetic mode: mc_bench --synth <testdim> <q1>[,...]
 // ============================================================================
-#include "../src/mc_archive_api.h"
-#include "../src/mc_codec.h"
+#include "../src/matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

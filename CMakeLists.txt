@@ -26,9 +26,7 @@ endif()
 
 # core library: codec + archive (deps: libm + pthread for the appendable writer)
 add_library(matter_compressor STATIC
-  src/mc_codec.c
-  src/mc_archive.c
-  src/mc_cache.c)
+  src/matter_compressor.c)
 target_include_directories(matter_compressor PUBLIC src)
 set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
@@ -61,7 +59,8 @@ if(MC_STANDALONE)
 
   # archive repacker: Morton order + clustered index for streaming + offline
   add_executable(mc_export tools/mc_export.c)
-  target_link_libraries(mc_export matter_compressor)
+  target_include_directories(mc_export PRIVATE src)
+  target_link_libraries(mc_export m Threads::Threads)
 
   # tools: benchmark harness (no extra deps) + zarr fetcher (libcurl + libzstd).
   add_executable(mc_bench tools/mc_bench.c)

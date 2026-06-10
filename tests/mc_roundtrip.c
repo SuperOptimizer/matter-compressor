@@ -1,7 +1,6 @@
 // mc_roundtrip — build an archive from a synthetic volume, decode it back, verify
 // air voxels restore to 0 and material reconstructs within tolerance. No external deps.
-#include "mc_archive_api.h"
-#include "mc_archive.h"
+#include "matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>

@@ -1,8 +1,7 @@
 // mc_cache test: build a small archive, hammer the cache from N threads with
 // a zipf-ish revisit pattern, verify every cached block equals a direct
 // decode, then check hit rate and that a tiny cache evicts correctly.
-#include "../src/mc_archive_api.h"
-#include "../src/mc_cache.h"
+#include "../src/matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

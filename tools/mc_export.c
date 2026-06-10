@@ -13,9 +13,7 @@
 //   box is in LOD0 256^3-chunk coords; omitted = whole archive. Coarser LODs
 //   are exported with the box scaled accordingly.
 // ============================================================================
-#include "../src/mc_archive_api.h"
-#include "../src/mc_archive.h"
-#include "../src/mc_archive_read.h"
+#include "../src/matter_compressor.c"   // white-box: header/format internals
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

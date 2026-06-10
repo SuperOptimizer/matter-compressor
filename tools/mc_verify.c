@@ -1,6 +1,6 @@
 // mc_verify — integrity-check every chunk of an archive (xxh64, format v6).
 // usage: mc_verify <archive.mc>
-#include "../src/mc_archive_api.h"
+#include "../src/matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>

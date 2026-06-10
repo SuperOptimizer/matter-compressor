@@ -1,7 +1,7 @@
 // partial-fetch streaming test: build a small archive, decode blocks through a
 // byte-counting file callback in both streaming modes, verify identical voxels
 // and that partial mode transfers far fewer bytes for sparse random access.
-#include "../src/mc_archive_api.h"
+#include "../src/matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

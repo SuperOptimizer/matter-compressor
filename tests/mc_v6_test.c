@@ -1,5 +1,5 @@
 // format v6 test: per-axis dims (padding semantics), per-chunk q, xxh64.
-#include "../src/mc_archive_api.h"
+#include "../src/matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

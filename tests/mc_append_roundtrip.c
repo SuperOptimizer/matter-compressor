@@ -3,8 +3,7 @@
 // close again, then decode every appended chunk with a flat reader AND a streaming
 // reader and verify the values reconstruct within tolerance. Also checks coverage +
 // that the file is a valid archive after each phase. No external deps.
-#include "mc_archive_api.h"
-#include "mc_archive.h"
+#include "matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

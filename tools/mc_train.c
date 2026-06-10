@@ -15,7 +15,7 @@
 
 long mc_tr_n[8][32], mc_tr_z[8][32];   // [class][slot]: total bins, zero bins
 
-#include "../src/mc_codec.c"           // instrumented copy (MC_TRAIN defined)
+#include "../src/matter_compressor.c"           // instrumented copy (MC_TRAIN defined)
 
 static const char *CLS_NAME[8]={"SIG","MAG","EOB","MASK","MASKU","MASKA","FLAG","DC"};
 static const int  CLS_SLOTS[8]={32,16,16,16,4,2,4,8};
