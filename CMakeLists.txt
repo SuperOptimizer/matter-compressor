@@ -57,13 +57,24 @@ if(MC_THINLTO)
   add_link_options(-flto=thin)
 endif()
 
-# core library: codec + archive (deps: libm + pthread for the appendable writer)
-add_library(matter_compressor STATIC
-  src/matter_compressor.c)
-target_include_directories(matter_compressor PUBLIC src)
-set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# core library: codec + archive + cache + sample/render + zarr/s3/volume —
+# everything in one .c/.h pair. Required deps: libcurl + libzstd (and the
+# in-tree c3d.c + vendored libs3.c, compiled into the target).
 find_package(Threads REQUIRED)
-target_link_libraries(matter_compressor m Threads::Threads)
+find_package(CURL REQUIRED)
+find_library(ZSTD_LIB zstd REQUIRED HINTS /opt/homebrew/lib /usr/local/lib)
+find_path(ZSTD_INC zstd.h REQUIRED HINTS /opt/homebrew/include /usr/local/include)
+add_library(matter_compressor STATIC
+  src/matter_compressor.c
+  src/c3d.c
+  tools/vendor/libs3/libs3.c)
+target_include_directories(matter_compressor
+  PUBLIC src PRIVATE tools/vendor/libs3 ${ZSTD_INC})
+set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# c3d decode output feeds the .mca re-encode, so honor the archive
+# determinism policy: no -ffast-math, explicit -ffp-contract=off.
+set_source_files_properties(src/c3d.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off;-fno-openmp")
+target_link_libraries(matter_compressor CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
 
 # The codec is the hot path; build it -O3 -march=native regardless of
 # how a parent project (vendoring via add_subdirectory) sets global flags. The
@@ -109,8 +120,9 @@ if(MC_STANDALONE)
 
   # archive repacker: Morton order + clustered index for streaming + offline
   add_executable(mc_export tools/mc_export.c)
-  target_include_directories(mc_export PRIVATE src)
-  target_link_libraries(mc_export m Threads::Threads)
+  target_include_directories(mc_export PRIVATE src tools/vendor/libs3 ${ZSTD_INC})
+  target_sources(mc_export PRIVATE src/c3d.c tools/vendor/libs3/libs3.c)
+  target_link_libraries(mc_export CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
 
   # tools: benchmark harness (no extra deps) + zarr fetcher (libcurl + libzstd).
   add_executable(mc_bench tools/mc_bench.c)
@@ -122,53 +134,16 @@ if(MC_STANDALONE)
   add_executable(mc_verify tools/mc_verify.c)
   target_link_libraries(mc_verify matter_compressor)
 
-  find_package(CURL QUIET)
-  find_library(ZSTD_LIB_S3 zstd HINTS /opt/homebrew/lib /usr/local/lib)
-  if(CURL_FOUND)
-    # optional S3/HTTP open glue (separate lib: core stays dependency-free)
-    add_library(matter_compressor_s3 STATIC src/mc_s3.c tools/vendor/libs3/libs3.c)
-    target_include_directories(matter_compressor_s3 PUBLIC src PRIVATE tools/vendor/libs3)
-    set_property(TARGET matter_compressor_s3 PROPERTY C_STANDARD 23)
-    target_link_libraries(matter_compressor_s3 matter_compressor CURL::libcurl)
-  endif()
+  add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
+  target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})
+  set_property(TARGET mc_fetch PROPERTY C_STANDARD 23)
+  target_link_libraries(mc_fetch CURL::libcurl ${ZSTD_LIB})
 
-  find_library(ZSTD_LIB zstd HINTS /opt/homebrew/lib /usr/local/lib)
-  find_path(ZSTD_INC zstd.h HINTS /opt/homebrew/include /usr/local/include)
-  if(CURL_FOUND AND ZSTD_LIB AND ZSTD_INC)
-    add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
-    target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})
-    set_property(TARGET mc_fetch PROPERTY C_STANDARD 23)
-    target_link_libraries(mc_fetch CURL::libcurl ${ZSTD_LIB})
-  else()
-    message(STATUS "mc_fetch skipped (need libcurl + libzstd)")
-  endif()
+  add_executable(mc_zarr_test tests/mc_zarr_test.c)
+  set_property(TARGET mc_zarr_test PROPERTY C_STANDARD 23)
+  target_link_libraries(mc_zarr_test matter_compressor)
 
-  # mc_volume: remote-zarr streaming + transcode + cache + prefetch. Bundles the
-  # vendored c3d decoder, mc_zarr reader, and libs3. Deps: libcurl + libzstd.
-  # Separate lib so the core stays dependency-free; the c3d TU needs OpenMP.
-  if(CURL_FOUND AND ZSTD_LIB AND ZSTD_INC)
-    find_package(OpenMP QUIET)
-    add_library(matter_compressor_volume STATIC
-      src/mc_volume.c src/mc_zarr.c src/c3d.c tools/vendor/libs3/libs3.c)
-    target_include_directories(matter_compressor_volume
-      PUBLIC src PRIVATE tools/vendor/libs3 ${ZSTD_INC})
-    set_property(TARGET matter_compressor_volume PROPERTY C_STANDARD 23)
-    # c3d decode output feeds the .mca re-encode, so honor the archive
-    # determinism policy: no -ffast-math, explicit -ffp-contract=off.
-    set_source_files_properties(src/c3d.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off;-fno-openmp")
-    target_link_libraries(matter_compressor_volume
-      matter_compressor CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
-    if(OpenMP_C_FOUND)
-      target_link_libraries(matter_compressor_volume OpenMP::OpenMP_C)
-    endif()
-
-    add_executable(mc_zarr_test tests/mc_zarr_test.c src/mc_zarr.c)
-    target_include_directories(mc_zarr_test PRIVATE src ${ZSTD_INC})
-    set_property(TARGET mc_zarr_test PROPERTY C_STANDARD 23)
-    target_link_libraries(mc_zarr_test ${ZSTD_LIB})
-
-    add_executable(mc_volume_test tests/mc_volume_test.c)
-    set_property(TARGET mc_volume_test PROPERTY C_STANDARD 23)
-    target_link_libraries(mc_volume_test matter_compressor_volume)
-  endif()
+  add_executable(mc_volume_test tests/mc_volume_test.c)
+  set_property(TARGET mc_volume_test PROPERTY C_STANDARD 23)
+  target_link_libraries(mc_volume_test matter_compressor)
 endif()

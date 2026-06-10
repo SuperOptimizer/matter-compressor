@@ -14,13 +14,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: deps (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libzstd-dev
+      - name: deps (macos)
+        if: runner.os == 'macOS'
+        run: brew list zstd >/dev/null 2>&1 || brew install zstd
       - name: build
         run: CC=clang cmake -B build -S . -DMC_NO_NATIVE=ON -DCMAKE_C_FLAGS="${{ matrix.cflags }}" && cmake --build build -j
       - name: test
         run: ctest --test-dir build --output-on-failure
       - name: deterministic archive metrics
         run: |
-          clang -O3 ${{ matrix.cflags }} -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
+          clang -O3 ${{ matrix.cflags }} -w -Isrc -Itools/vendor/libs3 -I/opt/homebrew/include \
+            tests/mc_det_archive.c src/matter_compressor.c src/c3d.c tools/vendor/libs3/libs3.c \
+            -L/opt/homebrew/lib -lm -lpthread -lzstd -lcurl -o detarc
           mkdir -p digest && ./detarc | tee digest/${{ matrix.os }}.txt
       - uses: actions/upload-artifact@v4
         with: { name: "digest-${{ matrix.os }}", path: digest/ }
@@ -28,14 +36,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libzstd-dev
       - name: build+fuzz under ASan/UBSan
         run: |
-          clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -w -Isrc \
-            tests/mc_v6_test.c src/matter_compressor.c -lm -lpthread -o v6_asan
+          SRCS="src/matter_compressor.c src/c3d.c tools/vendor/libs3/libs3.c"
+          FLAGS="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -w -Isrc -Itools/vendor/libs3"
+          LIBS="-lm -lpthread -lzstd -lcurl"
+          clang $FLAGS tests/mc_v6_test.c $SRCS $LIBS -o v6_asan
           ./v6_asan
-          clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -w -Isrc \
-            tests/mc_cache_test.c src/matter_compressor.c -lm -lpthread -o cache_asan
+          clang $FLAGS tests/mc_cache_test.c $SRCS $LIBS -o cache_asan
           ./cache_asan
+          clang $FLAGS tests/mc_render_test.c $SRCS $LIBS -o render_asan
+          ./render_asan
   metric-equivalence:
     needs: test
     runs-on: ubuntu-24.04

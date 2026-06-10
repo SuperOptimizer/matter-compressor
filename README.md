@@ -4,8 +4,9 @@ A fast lossy codec + on-disk archive + in-RAM cache for dense 3D `u8` scalar
 volumes — purpose-built for masked micro-CT at Vesuvius-Challenge scale
 (100 TB+), consumed by interactive viewers (VC3D) and ML dataloaders.
 
-Three layers, one header (`src/matter_compressor.h`), plain C, no
-dependencies beyond libm/pthreads:
+One `.c`/`.h` pair (`src/matter_compressor.{c,h}`), plain C. Required
+deps: libcurl + libzstd (plus the in-tree `c3d.c` decoder and vendored
+`libs3`, compiled into the library target):
 
 - **codec** — 16³ blocks: integer separable DCT-16, tuned dead-zone quant
   with band-weighted steps, adaptive binary range coder with trained

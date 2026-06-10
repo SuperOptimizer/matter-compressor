@@ -1,6 +1,6 @@
 // mc_volume_test — open a remote zarr volume, fetch a block, report. Drives the
 // full stream->transcode->cache path. usage: mc_volume_test <zarr-root-url> <cache-dir>
-#include "mc_volume.h"
+#include "matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

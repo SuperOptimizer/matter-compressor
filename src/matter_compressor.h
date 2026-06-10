@@ -644,4 +644,165 @@ int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
 }
 #endif
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ===========================================================================
+// mc_zarr — standalone zarr reader (v3-sharded-c3d + v2-flat)
+// ===========================================================================
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct mc_zarr mc_zarr;
+
+// Byte source. `key` is an object key relative to the level root (e.g. "c/3/0/1"
+// for a shard, or "zarr.json"). [off,off+len) is the requested byte range; len 0
+// means the whole object. On success store a malloc'd buffer in *out (caller-owned,
+// freed with free()) and its length in *out_len, return 0. Return <0 on transport
+// error, and set *out_len to 0 with *out NULL for a 404 / absent object.
+typedef int (*mc_zarr_read_fn)(void *ud, const char *key,
+                               uint64_t off, uint64_t len,
+                               uint8_t **out, size_t *out_len);
+
+// Open a level. `read`/`ud` is the byte source; the level's "zarr.json" is fetched
+// through it. Returns NULL on parse/transport failure.
+mc_zarr *mc_zarr_open(mc_zarr_read_fn read, void *ud);
+void     mc_zarr_free(mc_zarr *z);
+
+// Geometry (voxels / edges).
+void mc_zarr_shape(const mc_zarr *z, int *nz, int *ny, int *nx);
+int  mc_zarr_inner_edge(const mc_zarr *z);          // e.g. 256
+int  mc_zarr_shard_edge(const mc_zarr *z);          // e.g. 4096
+// inner codec the caller must apply to bytes from mc_zarr_read_*: "c3d" means
+// RAW c3d (caller decodes); "blosc"/"raw" mean already-dense u8 (mc_zarr decoded).
+const char *mc_zarr_inner_codec(const mc_zarr *z);
+// inner chunks per axis across the whole level (ceil(shape/inner_edge)).
+void mc_zarr_inner_grid(const mc_zarr *z, int *nz, int *ny, int *nx);
+
+// Is the shard containing global inner chunk (cz,cy,cx) entirely air? Reads only
+// the shard's index footer (one small ranged read). 1 yes, 0 no, -1 unknown/error.
+int mc_zarr_shard_all_air(mc_zarr *z, int cz, int cy, int cx);
+
+// Fetch one shard (one GET of the whole object) and hand each PRESENT inner chunk
+// to `sink` as its RAW (still-compressed) bytes. (cz,cy,cx) is any global inner
+// chunk in the target shard. Absent inner chunks are skipped. 0 ok, <0 error.
+typedef void (*mc_zarr_chunk_fn)(void *ud, int cz, int cy, int cx,
+                                 const uint8_t *raw, size_t raw_len);
+int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
+                       mc_zarr_chunk_fn sink, void *sink_ud);
+
+// Fetch a single inner chunk's RAW bytes (interactive cold path). Two ranged
+// reads: the shard index footer, then the chunk payload. On success store a
+// malloc'd buffer in *raw (caller frees) and length in *len, return 0. Returns
+// 1 if the chunk is absent (air) with *raw NULL. <0 on error.
+int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx,
+                       uint8_t **raw, size_t *len);
+
+// One present inner chunk of a shard: global coords + its byte range in the
+// shard object. (v2: off/len describe the standalone chunk object, range from 0.)
+typedef struct {
+    int cz, cy, cx;       // global inner-chunk coords
+    uint64_t off, len;    // payload byte range within the shard object's key
+} mc_zarr_range;
+
+// Read a shard's index footer (ONE ranged read) and return the byte ranges of
+// every PRESENT inner chunk, plus the shard object key (for batched GETs). The
+// caller fetches the payloads however it likes (e.g. a parallel s3 batch), then
+// decodes. `key` is filled with the shard object key (relative to the level).
+// On success *out is a malloc'd array of *n entries (caller frees), return 0.
+// All-air / absent shard -> *n = 0, *out NULL, return 0. <0 on error.
+// (v2: returns the single chunk's key + {off=0,len=0-means-whole-object}.)
+int mc_zarr_shard_index(mc_zarr *z, int cz, int cy, int cx,
+                        char key_out[64], mc_zarr_range **out, int *n);
+
+#ifdef __cplusplus
+}
+#endif
+
+// ===========================================================================
+// mc_s3 — s3://-backed mc_reader glue (libs3)
+// ===========================================================================
+typedef struct mc_s3 mc_s3;
+
+// Open an archive at `url` (s3://bucket/key or https://...). Returns NULL on
+// any failure (unreachable, not an mc archive). The handle owns the HTTP
+// client and the mc_reader.
+mc_s3 *mc_s3_open(const char *url);
+// The reader for all decode calls (mc_chunk_offset / mc_decode_block / ...).
+mc_reader *mc_s3_reader(mc_s3 *s);
+void mc_s3_close(mc_s3 *s);
+
+// ===========================================================================
+// mc_volume — remote volume as a local .mca: stream/transcode/cache/prefetch
+// ===========================================================================
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct mc_volume mc_volume;
+
+// Open a remote volume rooted at `url` (an NGFF multiscales zarr group; levels
+// are its "0","1",... arrays). `cache_dir` holds the local <name>.mca; pass the
+// resident mc_cache budget in `cache_bytes`. `quality` is the local re-encode
+// quality (mc q scale). Returns NULL on failure (unreachable / unparseable).
+mc_volume *mc_volume_open(const char *url, const char *cache_dir,
+                          size_t cache_bytes, float quality);
+void       mc_volume_free(mc_volume *v);
+
+int  mc_volume_nlods(const mc_volume *v);
+void mc_volume_shape(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
+// block (16^3) grid extent of a level.
+void mc_volume_block_grid(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
+
+// Serve one 16^3 block (block coords) of `lod` into `dst` (4096 bytes).
+//   present -> decode from mc_cache (sync), return 1.
+//   absent  -> kick one deduped background region transcode, zero `dst`,
+//              return 0 (caller falls back to a coarser LOD).
+int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst4096);
+
+// Blocking variant (batch/CLI): transcode the enclosing region if absent, then
+// decode. Returns 1 on data, 0 on air, <0 on error.
+int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst4096);
+
+// Prefetch: download a whole source shard (one GET) and transcode every present
+// inner chunk into the .mca. Air shards skipped via the index probe.
+void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx);
+// Walk a level shard-by-shard with `nthreads` workers; *cancel (if non-NULL) is
+// polled to abort early.
+void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel);
+
+// Register a callback fired (from a worker thread) each time a background
+// transcode completes a region — lets an interactive client schedule a repaint.
+// `cb` must be cheap and thread-safe (e.g. set a flag / post to the UI loop).
+typedef void (*mc_volume_ready_fn)(void *ud);
+void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud);
+
+// Sampling source over one level (see mc_sample.h / mc_render.h).
+// blocking=0: try_block semantics — absent regions sample as 0 and kick one
+//             deduped background transcode (interactive render path).
+// blocking=1: absent regions are transcoded synchronously first (batch path).
+mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking);
+// All levels at once, for LOD-matched rendering (mc_render_plane_lod /
+// mc_render_quad_lod pick the level from the render scale).
+mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking);
+
+typedef struct {
+    uint64_t cache_hits, cache_misses;   // mc_cache residency
+    uint64_t disk_bytes;                 // .mca append cursor
+    uint64_t net_bytes;                  // bytes pulled from the source
+    uint64_t regions_inflight;           // single-flight depth right now
+} mc_volume_stats;
+void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif // MATTER_COMPRESSOR_H

@@ -1,7 +1,7 @@
 // mc_zarr_test — drive mc_zarr against a local zarr tree via a filesystem
 // byte-source. Point MC_ZARR_ROOT at a level dir (containing zarr.json or
 // .zarray); the test reports geometry and reads one inner chunk.
-#include "mc_zarr.h"
+#include "matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
