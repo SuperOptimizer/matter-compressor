@@ -90,6 +90,7 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
                 break;
             case MC_COMP_MAX:
                 for (int k = 0; k < 4; k++) if (v4[k] > mx) mx = v4[k];
+                if (mx >= 255.0f) done = 1;     // saturated
                 break;
             case MC_COMP_MEAN:
                 sum += v4[0] + v4[1] + v4[2] + v4[3];
