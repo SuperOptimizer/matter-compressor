@@ -136,3 +136,30 @@ c3d's 256³ chunk (whole-chunk decode ≈ 24 ms before one voxel is usable).
 c3d wins raw throughput ~3× (8-way interleaved static rANS + wavelet) — that
 is the ceiling plain-C entropy-stage parallelism buys, and the motivation for
 a future interleaved-rANS magnitude stage here.
+
+## Research round 2 — actionable queue (see git history for full report)
+
+Ranked by impact/complexity for this codec (AV2 paper arXiv:2601.02712 was the
+key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
+1. 3D LFNST/IST-style trained secondary transform on the low-band corner
+   (dense trained matvec, 64→32, always-on first). Est 1–3% ratio.
+2. PARA per-context adaptation-rate tuning (per-class shift offsets). ~free.
+3. ATC-style split entropy: adaptive bins on the LF corner + static rANS on
+   the HF bulk — recovers most of rANS's +1.6% loss, keeps ~2× decode.
+4. TCQ trellis quantization (parity-driven 4–9 state lattice; distinct
+   mechanism from the rejected RDOQ). Decoder ~free, encoder Viterbi.
+5. HPEZ-style per-chunk parameter auto-tuning by sampling (encode-only).
+6. Cache: S3-FIFO eviction beats LRU/CLOCK on scan-shaped render workloads
+   (SOSP'23: 6× LRU throughput @16T, mean 14% miss cut); SIEVE explicitly NOT
+   scan-resistant — avoid. Page-table residency + fallback-to-coarser-LOD
+   for renderers (GigaVoxels/UE5 SVT).
+7. Streaming: ≤2-GET cold reads via fixed-address/suffix-range index tiers
+   (Neuroglancer sharded, Zarr v3 end-placed shard index); one-GET head
+   region with root index + coarsest LODs; offset-adjacency coalescing;
+   keep Morton (hash-sharding destroys locality). Optional crc32c.
+Skip: MTS/MIP/ISP/FSC (need intra prediction / screen content), SZ4 (does
+not exist), HPEZ interpolation core (sequential, kills random access),
+INR/learned codecs (no random access, GPU-bound), SIEVE, hash-sharding.
+External anchor: synchrotron studies find 3–4× lossy safe for reconstruction
+quality, 6–8× for phase-retrieved data — our q=1 (~9×) and q=3 (~21×) tiers
+bracket that on already-reconstructed volumes.
