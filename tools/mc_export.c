@@ -33,9 +33,13 @@ static uint32_t morton3(uint32_t z, uint32_t y, uint32_t x){
     return m;
 }
 typedef struct { uint32_t key; uint16_t cz,cy,cx; uint8_t lod; } ent_t;
+// COARSEST LODs first: together with the clustered index this forms a small
+// "head region" right after the metadata — a viewer's single opening ranged
+// GET covers the index plus the whole preview pyramid (COG-style). Within a
+// LOD, Morton order for spatial locality / request coalescing.
 static int ent_cmp(const void*a,const void*b){
     const ent_t*p=a,*q=b;
-    if(p->lod!=q->lod) return (int)p->lod-(int)q->lod;
+    if(p->lod!=q->lod) return (int)q->lod-(int)p->lod;
     return p->key<q->key?-1:p->key>q->key?1:0;
 }
 
