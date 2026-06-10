@@ -578,3 +578,133 @@ int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
     quad_rg g = { q, x0, y0, step };
     return render_lod(ls, L, quad_rowgen, &g, w, h, p, out, nthreads);
 }
+
+// ---------------------------------------------------------------------------
+// 3D resampling (surface-aligned volumes)
+// ---------------------------------------------------------------------------
+typedef struct {
+    const mc_sample_src *src;
+    const mc_quad *q;
+    float x0, y0, step;
+    float t0, dt;
+    int w, h, nlayers;
+    mc_filter f;
+    uint8_t *out;
+    int row0, row1;
+} qvol_band_t;
+
+static void *qvol_band_main(void *ud) {
+    qvol_band_t *b = ud;
+    mc_sampler *s = mc_sampler_new(b->src);
+    float *row = malloc((size_t)b->w * 6 * sizeof(float));
+    const size_t layer = (size_t)b->w * b->h;
+    if (!s || !row) {
+        for (int k = 0; k < b->nlayers; k++)
+            memset(b->out + layer * k + (size_t)b->row0 * b->w, 0,
+                   (size_t)(b->row1 - b->row0) * b->w);
+        free(row); mc_sampler_free(s);
+        return NULL;
+    }
+    float *nrm = row + (size_t)b->w * 3;
+    quad_rg g = { b->q, b->x0, b->y0, b->step };
+    for (int i = b->row0; i < b->row1; i++) {
+        quad_rowgen(&g, i, b->w, row, nrm);
+        for (int j = 0; j < b->w; j++) {
+            const float *P = row + (size_t)j * 3;
+            const float *N = nrm + (size_t)j * 3;
+            uint8_t *o = b->out + (size_t)i * b->w + j;
+            if (!pt_valid(P)) {
+                for (int k = 0; k < b->nlayers; k++) o[layer * k] = 0;
+                continue;
+            }
+            float nz = N[0], ny = N[1], nx = N[2];
+            float n2 = nz * nz + ny * ny + nx * nx;
+            if (n2 >= 1e-12f && (n2 < 0.9998f || n2 > 1.0002f)) {
+                float nl = 1.0f / sqrtf(n2);
+                nz *= nl; ny *= nl; nx *= nl;
+            }
+            float pz = P[0] + b->t0 * nz, py = P[1] + b->t0 * ny,
+                  px = P[2] + b->t0 * nx;
+            const float sz_ = b->dt * nz, sy_ = b->dt * ny, sx_ = b->dt * nx;
+            int k = 0;
+            if (b->f == MC_FILTER_TRILINEAR) {
+                for (; k + 4 <= b->nlayers; k += 4) {
+                    float bz[4], by[4], bx[4], v4[4];
+                    for (int t = 0; t < 4; t++) {
+                        bz[t] = pz; by[t] = py; bx[t] = px;
+                        pz += sz_; py += sy_; px += sx_;
+                    }
+                    mc_s_tri4(s, bz, by, bx, v4);
+                    for (int t = 0; t < 4; t++)
+                        o[layer * (k + t)] = to_u8(v4[t]);
+                }
+            }
+            for (; k < b->nlayers; k++) {
+                o[layer * k] = to_u8(mc_s_sample(s, pz, py, px, b->f));
+                pz += sz_; py += sy_; px += sx_;
+            }
+        }
+    }
+    free(row);
+    mc_sampler_free(s);
+    return NULL;
+}
+
+int mc_sample_quad_volume(const mc_sample_src *src, const mc_quad *q,
+                          float x0, float y0, float step, int w, int h,
+                          float t0, float dt, int nlayers,
+                          mc_filter f, uint8_t *out, int nthreads) {
+    if (!src || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !out || w <= 0 || h <= 0 || nlayers <= 0) return -1;
+    if (nthreads <= 0) {
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        nthreads = nc > 0 ? (int)nc : 1;
+    }
+    if (nthreads > 16) nthreads = 16;
+    if (nthreads > h)  nthreads = h;
+    pthread_t th[16];
+    qvol_band_t bands[16];
+    int per = (h + nthreads - 1) / nthreads;
+    int nb = 0;
+    for (int t = 0; t < nthreads; t++) {
+        int r0 = t * per, r1 = r0 + per > h ? h : r0 + per;
+        if (r0 >= r1) break;
+        bands[nb] = (qvol_band_t){ src, q, x0, y0, step, t0, dt,
+                                   w, h, nlayers, f, out, r0, r1 };
+        if (nthreads == 1 ||
+            pthread_create(&th[nb], NULL, qvol_band_main, &bands[nb]) != 0) {
+            qvol_band_main(&bands[nb]);
+            continue;
+        }
+        nb++;
+    }
+    for (int t = 0; t < nb; t++) pthread_join(th[t], NULL);
+    return 0;
+}
+
+int mc_sample_box(const mc_sample_src *src,
+                  const float origin[3], const float du[3],
+                  const float dv[3], const float dw[3],
+                  int w, int h, int d,
+                  mc_filter f, uint8_t *out, int nthreads) {
+    if (!src || !origin || !du || !dv || !dw || !out ||
+        w <= 0 || h <= 0 || d <= 0) return -1;
+    // each depth slice is a plane render with the layer offset folded into
+    // the origin; comp NONE so no normals are needed
+    mc_render_params p = { .filter = f, .comp = MC_COMP_NONE };
+    for (int k = 0; k < d; k++) {
+        mc_plane pl;
+        for (int c = 0; c < 3; c++) {
+            // mc_plane_gen centers the image; sample with corner semantics
+            pl.origin[c] = origin[c] + (float)k * dw[c] +
+                           ((float)w * 0.5f) * du[c] + ((float)h * 0.5f) * dv[c];
+            pl.normal[c] = 0.0f;
+            pl.u[c] = du[c];
+            pl.v[c] = dv[c];
+        }
+        if (mc_render_plane(src, &pl, w, h, 1.0f, &p,
+                            out + (size_t)k * w * h, nthreads) != 0)
+            return -1;
+    }
+    return 0;
+}

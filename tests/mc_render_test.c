@@ -255,6 +255,69 @@ int main(void) {
     }
     printf("lod rendering OK\n");
 
+    // ---- 3D resampling ------------------------------------------------------
+    {
+        // restore the control point poisoned earlier
+        grid[((size_t)10 * GW + 10) * 3 + 0] = 77;
+        grid[((size_t)10 * GW + 10) * 3 + 1] = 10;
+        grid[((size_t)10 * GW + 10) * 3 + 2] = 10;
+        // flat quad at z=77, normals (-1,0,0): layer k samples z = 77 - k
+        enum { QW = 8, QH = 8, QL = 8 };
+        uint8_t qv[QW * QH * QL];
+        CHECK(mc_sample_quad_volume(&dsrc, &q, 4, 4, 1.0f, QW, QH,
+                                    0.0f, 1.0f, QL, MC_FILTER_NEAREST,
+                                    qv, 1) == 0);
+        for (int k = 0; k < QL; k++)
+            for (int i = 0; i < QH; i++)
+                for (int j = 0; j < QW; j++)
+                    CHECK(qv[k * QW * QH + i * QW + j] ==
+                          V(77 - k, 4 + i, 4 + j));
+        // trilinear layers (exercises the 4-wide chunk path) == per-point
+        // scalar sampling at the same positions
+        CHECK(mc_sample_quad_volume(&dsrc, &q, 4, 4, 1.0f, QW, QH,
+                                    0.5f, 1.0f, QL, MC_FILTER_TRILINEAR,
+                                    qv, 1) == 0);
+        for (int k = 0; k < QL; k++)
+            for (int i = 0; i < QH; i += 3)
+                for (int j = 0; j < QW; j += 3) {
+                    float z = 77.0f - (0.5f + (float)k);
+                    float ref = mc_sample_point(s, z, (float)(4 + i),
+                                                (float)(4 + j),
+                                                MC_FILTER_TRILINEAR);
+                    uint8_t e = (uint8_t)(ref + 0.5f);
+                    CHECK(qv[k * QW * QH + i * QW + j] == e);
+                }
+        // parallel == serial
+        uint8_t qv2[QW * QH * QL];
+        CHECK(mc_sample_quad_volume(&dsrc, &q, 4, 4, 1.0f, QW, QH,
+                                    0.5f, 1.0f, QL, MC_FILTER_TRILINEAR,
+                                    qv2, 0) == 0);
+        CHECK(memcmp(qv, qv2, sizeof qv) == 0);
+
+        // oriented box with unit axes == direct copy
+        enum { BW = 8, BH = 6, BD = 4 };
+        uint8_t bv[BW * BH * BD];
+        float org[3] = {30, 20, 10};
+        float bu[3] = {0, 0, 1}, bvx[3] = {0, 1, 0}, bw[3] = {1, 0, 0};
+        CHECK(mc_sample_box(&dsrc, org, bu, bvx, bw, BW, BH, BD,
+                            MC_FILTER_NEAREST, bv, 1) == 0);
+        for (int k = 0; k < BD; k++)
+            for (int i = 0; i < BH; i++)
+                for (int j = 0; j < BW; j++)
+                    CHECK(bv[k * BW * BH + i * BW + j] ==
+                          V(30 + k, 20 + i, 10 + j));
+        // swapped axes = transposed copy
+        float su[3] = {0, 1, 0}, sv[3] = {0, 0, 1};
+        CHECK(mc_sample_box(&dsrc, org, su, sv, bw, BW, BH, BD,
+                            MC_FILTER_NEAREST, bv, 1) == 0);
+        for (int k = 0; k < BD; k++)
+            for (int i = 0; i < BH; i++)
+                for (int j = 0; j < BW; j++)
+                    CHECK(bv[k * BW * BH + i * BW + j] ==
+                          V(30 + k, 20 + j, 10 + i));
+    }
+    printf("3d resampling OK\n");
+
     mc_sampler_free(s);
     free(grid); free(pa); free(pb); free(ca); free(cb); free(dec); free(vol);
     printf(fails ? "mc_render_test: %d FAILED\n" : "mc_render_test: OK\n", fails);

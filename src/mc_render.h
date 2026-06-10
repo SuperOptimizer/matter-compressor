@@ -123,6 +123,31 @@ typedef struct {
     int nlods;
 } mc_sample_lods;
 
+// ---------------------------------------------------------------------------
+// 3D resampling (surface-aligned volumes)
+// ---------------------------------------------------------------------------
+// Composite rendering's ray walk without the reduction: keep every sample.
+//
+// mc_sample_quad_volume samples a w*h*nlayers u8 volume over the quad's
+// parameterization — pixel (i,j) of layer k samples P(i,j) + (t0 + k*dt) *
+// N(i,j), i.e. the "flattened surface volume" ink-detection models consume.
+// out is layer-major: out[k*w*h + i*w + j]. Invalid surface points write 0
+// through all layers.
+int mc_sample_quad_volume(const mc_sample_src *src, const mc_quad *q,
+                          float x0, float y0, float step, int w, int h,
+                          float t0, float dt, int nlayers,
+                          mc_filter f, uint8_t *out, int nthreads);
+
+// Oriented-box resample: out voxel (k,i,j) samples origin + j*du + i*dv +
+// k*dw (axes in voxels; need not be unit or orthogonal). out[k*w*h + i*w + j].
+// The surface-normal-aligned ML crop primitive; with unit axes and integer
+// origin it degenerates to a plain copy.
+int mc_sample_box(const mc_sample_src *src,
+                  const float origin[3], const float du[3],
+                  const float dv[3], const float dw[3],
+                  int w, int h, int d,
+                  mc_filter f, uint8_t *out, int nthreads);
+
 // floor(log2(vox_per_pixel)) clamped to [0, nlods-1]; <2 vox/px -> 0.
 int mc_render_pick_lod(const mc_sample_lods *ls, float vox_per_pixel);
 

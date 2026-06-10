@@ -101,6 +101,13 @@ mc_cache_resolve(c, ids, n, ptrs, 0);                // pin + pointer table
 mc_cache_freeze(c);                                  // reads now LOCK-FREE
 // render: ptrs[i] directly; stragglers via get() -> NULL -> best_lod()
 
+// ---- 3D resampling (surface volumes, oriented ML crops) ----
+mc_sample_quad_volume(&src, &q, x0,y0, 1.0f, w,h,      // w*h*nlayers u8:
+                      -10.0f, 1.0f, 21, MC_FILTER_TRILINEAR, // the flattened
+                      svol, 0);                        // ink-detection input
+mc_sample_box(&src, origin, du,dv,dw, w,h,d,           // oriented crop
+              MC_FILTER_TRILINEAR, crop, 0);
+
 // ---- surface rendering (VC3D-style) ----
 mc_sample_src src = mc_sample_src_cache(c, /*lod*/0, nz, ny, nx);
 mc_plane pl = {.origin={z,y,x}, .normal={nz_,ny_,nx_}};
