@@ -151,30 +151,82 @@ static void infl_del(mc_volume *v, uint64_t key) {
 // transcode one 256^3 region (cz,cy,cx) of lod into the .mca. caller ensures
 // single-flight. returns 1 transcoded data, 0 air, <0 error.
 // ---------------------------------------------------------------------------
-static int transcode_region(mc_volume *v, int lod, int cz, int cy, int cx) {
-    level_t *lv = &v->lv[lod];
-    uint8_t *raw = NULL;
-    size_t rlen = 0;
-    int st = mc_zarr_read_inner(lv->z, cz, cy, cx, &raw, &rlen);
-    if (st < 0) return -1;
-    if (st == 1) {                       // air -> append a zero chunk (records ZERO)
-        mc_archive_append_chunk_raw(v->arc, lod, cz, cy, cx, zero256());
-        return 0;
-    }
-    // present: decode raw -> dense 256^3 (32-aligned), then re-encode into .mca.
-    uint8_t *dense = NULL;
-    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) { free(raw); return -1; }
-    const char *codec = mc_zarr_inner_codec(lv->z);
+// decode one source inner-chunk's raw bytes into `dst` (edge^3, edge = source
+// inner_edge: 256 for c3d, 128 for v2). dst need not be 32-aligned for v2; c3d
+// needs a 32-aligned 256^3 (the v3 case always passes the region buffer).
+static void decode_inner(const char *codec, const uint8_t *raw, size_t rlen,
+                         uint8_t *dst, int edge) {
+    size_t vox = (size_t)edge * edge * edge;
     if (strcmp(codec, "c3d") == 0) {
         c3d_decoder *d = c3d_decoder_new();
         c3d_decoder_set_denoise(d, false);
-        c3d_decoder_chunk_decode(d, raw, rlen, dense);
+        c3d_decoder_chunk_decode(d, raw, rlen, dst);   // c3d edge is always 256
         c3d_decoder_free(d);
-    } else {                              // blosc/raw: mc_zarr already gave dense u8
-        if (rlen >= (size_t)CHUNK * CHUNK * CHUNK) memcpy(dense, raw, (size_t)CHUNK * CHUNK * CHUNK);
-        else { memset(dense, 0, (size_t)CHUNK * CHUNK * CHUNK); memcpy(dense, raw, rlen); }
+    } else {                                            // blosc/raw: already dense u8
+        if (rlen >= vox) memcpy(dst, raw, vox);
+        else { memset(dst, 0, vox); memcpy(dst, raw, rlen); }
     }
-    free(raw);
+}
+
+// blit a src (edge^3) into the 256^3 region buffer at sub-offset (oz,oy,ox) voxels.
+static void blit_sub(uint8_t *region, const uint8_t *src, int edge,
+                     int oz, int oy, int ox) {
+    for (int z = 0; z < edge; ++z)
+        for (int y = 0; y < edge; ++y)
+            memcpy(region + (((size_t)(oz + z) * CHUNK + (oy + y)) * CHUNK + ox),
+                   src + ((size_t)z * edge + y) * edge, (size_t)edge);
+}
+
+// transcode the 256^3 mca region (cz,cy,cx) of lod. The source inner-chunk edge
+// is 256 (c3d: 1:1) or 128 (v2: assemble the 2x2x2 cube of 8 source chunks into
+// one 256^3 region before encoding it as a single mca chunk).
+static int transcode_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    level_t *lv = &v->lv[lod];
+    const char *codec = mc_zarr_inner_codec(lv->z);
+    const int edge = mc_zarr_inner_edge(lv->z);        // 256 or 128
+    const int sub = CHUNK / edge;                      // 1 (c3d) or 2 (v2)
+
+    uint8_t *dense = NULL;
+    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) return -1;
+
+    if (sub == 1) {                                    // c3d: one source chunk == region
+        uint8_t *raw = NULL;
+        size_t rlen = 0;
+        int st = mc_zarr_read_inner(lv->z, cz, cy, cx, &raw, &rlen);
+        if (st < 0) { free(dense); return -1; }
+        if (st == 1) {                                 // air -> ZERO
+            free(dense);
+            mc_archive_append_chunk_raw(v->arc, lod, cz, cy, cx, zero256());
+            return 0;
+        }
+        decode_inner(codec, raw, rlen, dense, CHUNK);
+        free(raw);
+    } else {                                           // v2: assemble the sub^3 cube
+        memset(dense, 0, (size_t)CHUNK * CHUNK * CHUNK);
+        uint8_t *tile = malloc((size_t)edge * edge * edge);
+        if (!tile) { free(dense); return -1; }
+        int present = 0;
+        for (int dz = 0; dz < sub; ++dz)
+            for (int dy = 0; dy < sub; ++dy)
+                for (int dx = 0; dx < sub; ++dx) {
+                    uint8_t *raw = NULL;
+                    size_t rlen = 0;
+                    int st = mc_zarr_read_inner(lv->z, cz * sub + dz, cy * sub + dy,
+                                                cx * sub + dx, &raw, &rlen);
+                    if (st < 0) { free(raw); free(tile); free(dense); return -1; }
+                    if (st == 1) continue;             // this sub-chunk is air -> leave zeros
+                    decode_inner(codec, raw, rlen, tile, edge);
+                    free(raw);
+                    blit_sub(dense, tile, edge, dz * edge, dy * edge, dx * edge);
+                    ++present;
+                }
+        free(tile);
+        if (!present) {                                // whole region air -> ZERO
+            free(dense);
+            mc_archive_append_chunk_raw(v->arc, lod, cz, cy, cx, zero256());
+            return 0;
+        }
+    }
     int rc = mc_archive_append_chunk_raw(v->arc, lod, cz, cy, cx, dense);
     free(dense);
     return rc == 0 ? 1 : -1;
@@ -409,34 +461,29 @@ mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking) {
 }
 
 // ---------------------------------------------------------------------------
-// prefetch
+// prefetch — region-at-a-time (NO whole-shard download). Each 256^3 region is
+// transcoded by reading only its source inner-chunk(s) via ranged GETs (one for
+// c3d, the 2x2x2 cube for v2). Same path as the interactive fill (ensure_region),
+// so coverage + single-flight dedup apply. (cz,cy,cx) is a source inner-chunk in
+// the target shard; we walk the shard's 256^3 regions.
 // ---------------------------------------------------------------------------
-typedef struct { mc_volume *v; int lod; } shard_ctx;
-static void shard_sink(void *ud, int cz, int cy, int cx, const uint8_t *raw, size_t raw_len) {
-    shard_ctx *c = ud;
-    mc_volume *v = c->v;
-    if (mc_archive_chunk_coverage(v->arc, c->lod, cz, cy, cx) != MC_ABSENT) return;
-    uint8_t *dense = NULL;
-    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) return;
-    const char *codec = mc_zarr_inner_codec(v->lv[c->lod].z);
-    if (strcmp(codec, "c3d") == 0) {
-        c3d_decoder *d = c3d_decoder_new();
-        c3d_decoder_set_denoise(d, false);
-        c3d_decoder_chunk_decode(d, raw, raw_len, dense);
-        c3d_decoder_free(d);
-    } else {
-        memset(dense, 0, (size_t)CHUNK * CHUNK * CHUNK);
-        memcpy(dense, raw, raw_len < (size_t)CHUNK*CHUNK*CHUNK ? raw_len : (size_t)CHUNK*CHUNK*CHUNK);
-    }
-    mc_archive_append_chunk_raw(v->arc, c->lod, cz, cy, cx, dense);
-    free(dense);
-}
-
 void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
     if (lod < 0 || lod >= v->nlods) return;
-    if (mc_zarr_shard_all_air(v->lv[lod].z, cz, cy, cx) == 1) return;
-    shard_ctx ctx = {v, lod};
-    mc_zarr_read_shard(v->lv[lod].z, cz, cy, cx, shard_sink, &ctx);
+    mc_zarr *z = v->lv[lod].z;
+    if (mc_zarr_shard_all_air(z, cz, cy, cx) == 1) return;
+    const int edge = mc_zarr_inner_edge(z);            // 256 or 128
+    const int sub = CHUNK / edge;                      // source chunks per region axis
+    const int per = mc_zarr_shard_edge(z) / edge;      // source chunks per shard axis
+    const int rper = per / sub;                        // 256^3 regions per shard axis
+    int gz, gy, gx;
+    mc_zarr_inner_grid(z, &gz, &gy, &gx);
+    const int rgz = (gz + sub - 1) / sub, rgy = (gy + sub - 1) / sub, rgx = (gx + sub - 1) / sub;
+    // shard origin in REGION coords.
+    const int rz0 = (cz / per) * rper, ry0 = (cy / per) * rper, rx0 = (cx / per) * rper;
+    for (int rz = rz0; rz < rz0 + rper && rz < rgz; ++rz)
+        for (int ry = ry0; ry < ry0 + rper && ry < rgy; ++ry)
+            for (int rx = rx0; rx < rx0 + rper && rx < rgx; ++rx)
+                ensure_region(v, lod, rz, ry, rx);     // ranged per-chunk reads, append per region
 }
 
 void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel) {

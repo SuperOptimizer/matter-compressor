@@ -317,28 +317,34 @@ int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
         return 0;
     }
 
-    // v3: one GET of the whole shard, then walk every present inner chunk.
+    // v3: read the index footer ONCE, then range-GET each present inner chunk
+    // individually (no whole-shard buffering). Each chunk is sunk + freed before
+    // the next, so RAM stays at one chunk and disk grows per-chunk.
     char key[64];
     chunk_key(z, cz, cy, cx, key);
-    size_t shard_len = 0;
-    uint8_t *shard = fetch_all(z, key, &shard_len);
-    if (!shard || !shard_len) { free(shard); return 0; }    // absent shard = all air
     size_t n_inner = (size_t)z->per * z->per * z->per;
     size_t idx_bytes = n_inner * 16;
-    if (shard_len < idx_bytes) { free(shard); return -1; }
+    uint8_t *idx = NULL;
+    size_t got = 0;
+    if (z->read(z->ud, key, 0, idx_bytes, &idx, &got) < 0) return -1;
+    if (!idx || got < idx_bytes) { free(idx); return 0; }   // absent shard = all air
     int sz0 = (cz / z->per) * z->per, sy0 = (cy / z->per) * z->per, sx0 = (cx / z->per) * z->per;
     for (int iz = 0; iz < z->per; ++iz)
         for (int iy = 0; iy < z->per; ++iy)
             for (int ix = 0; ix < z->per; ++ix) {
                 size_t lin = ((size_t)iz * z->per + iy) * z->per + ix;
                 uint64_t off, nb;
-                if (index_entry(shard, n_inner, lin, &off, &nb) != 0) continue;
-                if (off + nb > shard_len) { free(shard); return -1; }
+                if (index_entry(idx, n_inner, lin, &off, &nb) != 0) continue;
                 int gz = sz0 + iz, gy = sy0 + iy, gx = sx0 + ix;
                 if (gz >= z->inner_grid[0] || gy >= z->inner_grid[1] || gx >= z->inner_grid[2])
                     continue;
-                sink(sink_ud, gz, gy, gx, shard + off, (size_t)nb);   // c3d raw bytes
+                uint8_t *payload = NULL;
+                size_t plen = 0;
+                if (z->read(z->ud, key, off, nb, &payload, &plen) < 0) { free(idx); return -1; }
+                if (payload && plen >= nb)
+                    sink(sink_ud, gz, gy, gx, payload, (size_t)nb);   // c3d raw bytes
+                free(payload);
             }
-    free(shard);
+    free(idx);
     return 0;
 }
