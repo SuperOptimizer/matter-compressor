@@ -29,20 +29,29 @@ static inline uint64_t khash(uint64_t k){
     return k;
 }
 
-// one shard: its own slice of the arena, its own map, lock, clock hand.
+// one shard: its own slice of the arena, its own map, lock, eviction state.
 typedef struct {
     pthread_mutex_t mu;
     uint64_t *map_key;        // open addressing, linear probe, backward-shift delete
     uint32_t *map_slot;
     uint32_t  map_cap;        // power of two
     uint64_t *slot_key;       // per-slot reverse key (EMPTY_KEY = free)
-    uint8_t  *slot_ref;       // NRU reference bit
+    uint8_t  *slot_ref;       // CLOCK ref bit / S3-FIFO 2-bit freq
     uint32_t  nslot, used, hand;
     mc_u8    *arena;          // nslot * 4KB
     uint64_t  hits, misses, evictions;
+    // S3-FIFO state: two slot-id rings + a ghost fingerprint ring w/ set.
+    uint32_t *fs, fs_head, fs_tail, fs_cap;     // small queue (ring)
+    uint32_t *fm, fm_head, fm_tail, fm_cap;     // main queue (ring)
+    uint32_t *gfp, g_head, g_cap;               // ghost fingerprints (ring)
+    int32_t  *gset; uint32_t gset_cap;          // fp -> ring idx, open addressing
+    uint8_t  *slot_inmain;                      // which queue a slot lives in
 } shard_t;
 
+#define FREQ_MAX 3
+
 struct mc_cache {
+    int policy;               // mc_cache_policy
     shard_t sh[NSHARD];
     mc_cache_src_fn src; void *src_ud;
     size_t arena_bytes;
@@ -80,9 +89,16 @@ mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
         sh->map_slot=calloc(sh->map_cap,4);
         sh->slot_key=calloc(per,8);
         sh->slot_ref=calloc(per,1);
+        sh->fs_cap=per+1; sh->fm_cap=per+1;
+        sh->fs=malloc(4u*sh->fs_cap); sh->fm=malloc(4u*sh->fm_cap);
+        sh->g_cap=per; sh->gfp=calloc(sh->g_cap,4);
+        sh->gset_cap=pow2_at_least(per*2); sh->gset=malloc(4u*sh->gset_cap);
+        memset(sh->gset,0xFF,4u*sh->gset_cap);
+        sh->slot_inmain=calloc(per,1);
     }
     return c;
 }
+void mc_cache_set_policy(mc_cache *c, mc_cache_policy p){ if(c) c->policy=(int)p; }
 
 void mc_cache_free(mc_cache *c){
     if(!c) return;
@@ -90,6 +106,7 @@ void mc_cache_free(mc_cache *c){
         shard_t *sh=&c->sh[s];
         pthread_mutex_destroy(&sh->mu);
         free(sh->map_key); free(sh->map_slot); free(sh->slot_key); free(sh->slot_ref);
+        free(sh->fs); free(sh->fm); free(sh->gfp); free(sh->gset); free(sh->slot_inmain);
     }
 #if MC_CACHE_MMAP
     munmap(c->arena_base,c->arena_bytes);
@@ -146,6 +163,89 @@ static uint32_t reclaim_slot(shard_t *sh){
     }
 }
 
+// ---- S3-FIFO (SOSP'23) ----
+static inline uint32_t s3_fp(uint64_t key){ uint32_t f=(uint32_t)(khash(key)>>17); return f?f:1; }
+static inline uint32_t ring_len(uint32_t h,uint32_t t,uint32_t cap){ return (t+cap-h)%cap; }
+static void ghost_put(shard_t *sh, uint32_t fp){
+    uint32_t old=sh->gfp[sh->g_head];
+    if(old){  // remove the overwritten fingerprint from the set
+        uint32_t m=sh->gset_cap-1, i=(old*0x9E3779B1u)&m;
+        while(sh->gset[i]!=-1){ if(sh->gfp[sh->gset[i]]==old && (uint32_t)sh->gset[i]==sh->g_head){ sh->gset[i]=-1; break; } i=(i+1)&m; }
+    }
+    sh->gfp[sh->g_head]=fp;
+    uint32_t m=sh->gset_cap-1, i=(fp*0x9E3779B1u)&m;
+    while(sh->gset[i]!=-1) i=(i+1)&m;
+    sh->gset[i]=(int32_t)sh->g_head;
+    sh->g_head=(sh->g_head+1)%sh->g_cap;
+}
+static int ghost_has(shard_t *sh, uint32_t fp){
+    uint32_t m=sh->gset_cap-1, i=(fp*0x9E3779B1u)&m;
+    for(int probes=0;probes<64;++probes){
+        int32_t v=sh->gset[i];
+        if(v==-1) return 0;
+        if(sh->gfp[v]==fp) return 1;
+        i=(i+1)&m;
+    }
+    return 0;
+}
+// reclaim one slot under S3-FIFO rules; the freed slot's key is unmapped.
+static uint32_t s3_reclaim(shard_t *sh){
+    for(;;){
+        uint32_t small_len=ring_len(sh->fs_head,sh->fs_tail,sh->fs_cap);
+        if(small_len >= sh->nslot/10+1){
+            uint32_t s=sh->fs[sh->fs_head]; sh->fs_head=(sh->fs_head+1)%sh->fs_cap;
+            if(sh->slot_ref[s]>0){             // promote to main
+                sh->slot_ref[s]=0; sh->slot_inmain[s]=1;
+                sh->fm[sh->fm_tail]=s; sh->fm_tail=(sh->fm_tail+1)%sh->fm_cap;
+                continue;
+            }
+            ghost_put(sh,s3_fp(sh->slot_key[s]));
+            map_delete(sh,sh->slot_key[s]); sh->evictions++;
+            return s;
+        }
+        if(ring_len(sh->fm_head,sh->fm_tail,sh->fm_cap)==0){   // degenerate: force small
+            uint32_t s=sh->fs[sh->fs_head]; sh->fs_head=(sh->fs_head+1)%sh->fs_cap;
+            ghost_put(sh,s3_fp(sh->slot_key[s]));
+            map_delete(sh,sh->slot_key[s]); sh->evictions++;
+            return s;
+        }
+        uint32_t s=sh->fm[sh->fm_head]; sh->fm_head=(sh->fm_head+1)%sh->fm_cap;
+        if(sh->slot_ref[s]>0){                 // re-insert with decremented freq
+            sh->slot_ref[s]--;
+            sh->fm[sh->fm_tail]=s; sh->fm_tail=(sh->fm_tail+1)%sh->fm_cap;
+            continue;
+        }
+        map_delete(sh,sh->slot_key[s]); sh->evictions++;
+        return s;
+    }
+}
+// allocate a slot for `key` under the active policy and enqueue it.
+static uint32_t cache_alloc_slot(mc_cache *c, shard_t *sh, uint64_t key){
+    uint32_t slot;
+    if(c->policy==MC_CACHE_CLOCK){
+        slot=reclaim_slot(sh);
+        return slot;
+    }
+    if(sh->used<sh->nslot){
+        for(uint32_t k=0;k<sh->nslot;++k){
+            uint32_t i=(sh->hand+k)%sh->nslot;
+            if(sh->slot_key[i]==EMPTY_KEY){ sh->hand=(i+1)%sh->nslot; sh->used++; slot=i; goto have; }
+        }
+    }
+    slot=s3_reclaim(sh);
+have:;
+    int to_main = ghost_has(sh,s3_fp(key));
+    sh->slot_inmain[slot]=(uint8_t)to_main;
+    sh->slot_ref[slot]=0;
+    if(to_main){ sh->fm[sh->fm_tail]=slot; sh->fm_tail=(sh->fm_tail+1)%sh->fm_cap; }
+    else       { sh->fs[sh->fs_tail]=slot; sh->fs_tail=(sh->fs_tail+1)%sh->fs_cap; }
+    return slot;
+}
+static inline void cache_touch(mc_cache *c, shard_t *sh, uint32_t slot){
+    if(c->policy==MC_CACHE_CLOCK) sh->slot_ref[slot]=1;
+    else if(sh->slot_ref[slot]<FREQ_MAX) sh->slot_ref[slot]++;
+}
+
 static inline shard_t *shard_of(mc_cache *c, uint64_t key){
     return &c->sh[(khash(key)>>56)&(NSHARD-1)];
 }
@@ -157,7 +257,7 @@ const mc_u8 *mc_cache_get(mc_cache *c, int lod, int bz, int by, int bx){
     uint32_t mi=map_find(sh,key);
     if(mi!=UINT32_MAX){
         uint32_t slot=sh->map_slot[mi];
-        sh->slot_ref[slot]=1; sh->hits++;
+        cache_touch(c,sh,slot); sh->hits++;
         const mc_u8 *p=sh->arena+(size_t)slot*BLK_BYTES;
         pthread_mutex_unlock(&sh->mu);
         return p;
@@ -173,12 +273,12 @@ const mc_u8 *mc_cache_get(mc_cache *c, int lod, int bz, int by, int bx){
     uint32_t slot;
     if(mi!=UINT32_MAX) slot=sh->map_slot[mi];
     else {
-        slot=reclaim_slot(sh);
+        slot=cache_alloc_slot(c,sh,key);
         sh->slot_key[slot]=key;
         map_insert(sh,key,slot);
         memcpy(sh->arena+(size_t)slot*BLK_BYTES,tmp,BLK_BYTES);
     }
-    sh->slot_ref[slot]=1;
+    cache_touch(c,sh,slot);
     const mc_u8 *p=sh->arena+(size_t)slot*BLK_BYTES;
     pthread_mutex_unlock(&sh->mu);
     return p;
@@ -191,7 +291,7 @@ void mc_cache_get_copy(mc_cache *c, int lod, int bz, int by, int bx, mc_u8 *dst)
     uint32_t mi=map_find(sh,key);
     if(mi!=UINT32_MAX){
         uint32_t slot=sh->map_slot[mi];
-        sh->slot_ref[slot]=1; sh->hits++;
+        cache_touch(c,sh,slot); sh->hits++;
         memcpy(dst,sh->arena+(size_t)slot*BLK_BYTES,BLK_BYTES);
         pthread_mutex_unlock(&sh->mu);
         return;
@@ -201,11 +301,11 @@ void mc_cache_get_copy(mc_cache *c, int lod, int bz, int by, int bx, mc_u8 *dst)
     c->src(c->src_ud,lod,bz,by,bx,dst);
     pthread_mutex_lock(&sh->mu);
     if(map_find(sh,key)==UINT32_MAX){
-        uint32_t slot=reclaim_slot(sh);
+        uint32_t slot=cache_alloc_slot(c,sh,key);
         sh->slot_key[slot]=key;
         map_insert(sh,key,slot);
         memcpy(sh->arena+(size_t)slot*BLK_BYTES,dst,BLK_BYTES);
-        sh->slot_ref[slot]=1;
+        cache_touch(c,sh,slot);
     }
     pthread_mutex_unlock(&sh->mu);
 }
@@ -239,6 +339,10 @@ void mc_cache_clear(mc_cache *c){
         memset(sh->slot_key,0,(size_t)sh->nslot*8);
         memset(sh->slot_ref,0,sh->nslot);
         sh->used=0; sh->hand=0;
+        sh->fs_head=sh->fs_tail=sh->fm_head=sh->fm_tail=0;
+        sh->g_head=0; memset(sh->gfp,0,4u*sh->g_cap);
+        memset(sh->gset,0xFF,4u*sh->gset_cap);
+        memset(sh->slot_inmain,0,sh->nslot);
         pthread_mutex_unlock(&sh->mu);
     }
 }

@@ -93,6 +93,29 @@ int main(void){
     printf("hit path: %.1f Mget/s single thread (prefetched chunk, %zu blocks resident)\n",
         N/1e6/s, st3.used);
     mc_cache_free(c);
+
+    // 4) scan resistance: hot set comparable to cache size (700 blocks, 50% of
+    // accesses) + cyclic scan over 3072 blocks through a 1024-slot cache —
+    // scan pollution forces CLOCK to evict hot entries; S3-FIFO quarantines
+    // one-hit scan traffic in its small queue.
+    double hitrate[2];
+    for(int pol=0;pol<2;++pol){
+        c=mc_cache_new_archive(1024*4096ull,a);
+        mc_cache_set_policy(c,pol==0?MC_CACHE_S3FIFO:MC_CACHE_CLOCK);
+        unsigned r4=42; int scan_i=0;
+        for(long it=0;it<200000;++it){
+            r4^=r4<<13;r4^=r4>>17;r4^=r4<<5;
+            int bz,by,bx;
+            if(r4&1){ unsigned h=(r4>>8)%700; bz=h%8; by=(h/8)%16; bx=8+h/128; }
+            else { int s=scan_i++%3072; bz=s%16; by=(s/16)%16; bx=s/256; }
+            (void)mc_cache_get(c,0,bz,by,bx);
+        }
+        mc_cache_stats s4; mc_cache_get_stats(c,&s4);
+        hitrate[pol]=(double)s4.hits/(s4.hits+s4.misses);
+        printf("%s: %.1f%% hit (scan+hot mix)\n",pol==0?"s3fifo":"clock ",100*hitrate[pol]);
+        mc_cache_free(c);
+    }
+    if(hitrate[0] < hitrate[1]){ fprintf(stderr,"FAIL: S3-FIFO worse than CLOCK on scan mix\n"); return 1; }
     mc_archive_close(a);
     remove(path);
     printf("mc_cache: OK\n");

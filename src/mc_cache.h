@@ -30,8 +30,16 @@ typedef struct mc_cache mc_cache;
 // Called outside any cache lock; must be thread-safe (mc decode is).
 typedef void (*mc_cache_src_fn)(void *ud, int lod, int bz, int by, int bx, mc_u8 *dst);
 
+// Eviction policy. CLOCK = classic NRU sweep. S3FIFO (default) = small/main
+// FIFO queues + ghost table (SOSP'23): one-hit wonders die in the small queue,
+// re-referenced ghosts go straight to main — scan-resistant, which matters for
+// render loops (slice sweeps re-touch everything once per frame).
+typedef enum { MC_CACHE_S3FIFO = 0, MC_CACHE_CLOCK = 1 } mc_cache_policy;
+
 // Create a cache with ~`bytes` of block storage (rounded to slots of 4 KB).
 mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud);
+// Switch eviction policy (call before first use; clears nothing).
+void mc_cache_set_policy(mc_cache *c, mc_cache_policy p);
 void      mc_cache_free(mc_cache *c);
 
 // Get the decoded block, from cache or by decoding (and caching) it.

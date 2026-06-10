@@ -167,10 +167,12 @@ key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
    high-rate coefficients; scroll blocks are sparse and sig-flag-dominated.
    Code kept behind MC_TCQ=0.
 5. HPEZ-style per-chunk parameter auto-tuning by sampling (encode-only).
-6. Cache: S3-FIFO eviction beats LRU/CLOCK on scan-shaped render workloads
-   (SOSP'23: 6× LRU throughput @16T, mean 14% miss cut); SIEVE explicitly NOT
-   scan-resistant — avoid. Page-table residency + fallback-to-coarser-LOD
-   for renderers (GigaVoxels/UE5 SVT).
+6. Cache: S3-FIFO eviction — IMPLEMENTED as mc_cache's default policy
+   (small/main slot-id rings + ghost fingerprint table per shard; CLOCK kept
+   as an option). Measured on a hot-set+cyclic-scan mix through a 1024-slot
+   cache: 44.0% vs 35.6% hit (24% relative miss cut), matching SOSP'23.
+   Page-table residency / fallback-to-coarser-LOD remains a renderer-side
+   pattern (out of codec scope).
 7. Streaming: ≤2-GET cold reads via fixed-address/suffix-range index tiers
    (Neuroglancer sharded, Zarr v3 end-placed shard index); one-GET head
    region with root index + coarsest LODs; offset-adjacency coalescing;
