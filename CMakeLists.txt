@@ -51,6 +51,10 @@ if(MC_STANDALONE)
   target_link_libraries(mc_stream_partial matter_compressor)
   add_test(NAME stream_partial COMMAND mc_stream_partial)
 
+  add_executable(mc_v6_test tests/mc_v6_test.c)
+  target_link_libraries(mc_v6_test matter_compressor)
+  add_test(NAME v6 COMMAND mc_v6_test)
+
   add_executable(mc_cache_test tests/mc_cache_test.c)
   target_link_libraries(mc_cache_test matter_compressor)
   add_test(NAME cache COMMAND mc_cache_test)
@@ -65,6 +69,9 @@ if(MC_STANDALONE)
 
   # fysics-style aggressive air masking preprocessor (no deps)
   add_executable(mc_mask tools/mc_mask.c)
+
+  add_executable(mc_verify tools/mc_verify.c)
+  target_link_libraries(mc_verify matter_compressor)
 
   find_package(CURL QUIET)
   find_library(ZSTD_LIB zstd HINTS /opt/homebrew/lib /usr/local/lib)

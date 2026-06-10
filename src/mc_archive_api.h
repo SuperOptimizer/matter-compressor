@@ -16,9 +16,12 @@
 // the source internally. `ud` is the caller's context.
 typedef mc_u8 (*mc_voxel_fn)(void *ud, int x, int y, int z);
 
-// Build options.
+// Build options. Either set cubic `dim`, or per-axis nx/ny/nz (voxels; each is
+// padded up to the next 256 boundary internally — zero padding is nearly free:
+// all-air blocks cost one bitmap bit and absent chunks cost nothing).
 typedef struct {
-    int   dim;            // volume edge (must be a multiple of MC_CHUNK_ALIGN=256)
+    int   dim;            // cubic volume edge (used when nx/ny/nz are 0)
+    int   nx, ny, nz;     // per-axis dims (0 -> use `dim`)
     float quality;        // codec quality dial (base quant step)
     const char *metadata; // optional free-form text stored in the metadata region (NULL = none)
     size_t meta_len;      // metadata byte length
@@ -52,6 +55,9 @@ typedef enum { MC_ABSENT = 0, MC_PRESENT = 1 } mc_cover;
 // MC_CHUNK_ALIGN=256) at the given `quality`. If the file exists and is a valid mc
 // archive, it is reopened (dim/quality must match the stored header). NULL on failure.
 mc_archive *mc_archive_open(const char *path, int dim, float quality);
+// Per-axis variant: nx/ny/nz in voxels, each padded up to the next 256
+// boundary. Chunk coordinates run over the padded grid per axis.
+mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float quality);
 
 // Append one 256^3 chunk of raw u8 voxels at chunk coords (cz,cy,cx) in `lod`. Encodes
 // via the mc codec, writes the compressed chunk blob contiguously at EOF, installs it
@@ -59,6 +65,20 @@ mc_archive *mc_archive_open(const char *path, int dim, float quality);
 // which decodes to zero).
 int mc_archive_append_chunk_raw(mc_archive *a, int lod, int cz,int cy,int cx,
                                 const mc_u8 vox[256*256*256]);
+// Per-chunk quality variant (rate control / ROI archives): this chunk encodes
+// at `q` instead of the archive default. The chunk's q is stored in its blob
+// (format v6), so decode needs nothing extra.
+int mc_archive_append_chunk_raw_q(mc_archive *a, int lod, int cz,int cy,int cx,
+                                  const mc_u8 vox[256*256*256], float q);
+// Rate-controlled variant: pick this chunk's q to hit ~target_ratio (raw bytes
+// / compressed bytes) for THIS chunk. One 1/16-block sample encode at the
+// archive's base q plus a single power-law correction (~6% encode overhead,
+// no iteration). Heterogeneous content lands within ~10-20% of target; use
+// per-volume averaging upstream if you need it exact. Chosen q is stored in
+// the chunk (v6) and returned via *q_out if non-NULL.
+int mc_archive_append_chunk_target(mc_archive *a, int lod, int cz,int cy,int cx,
+                                   const mc_u8 vox[256*256*256], float target_ratio,
+                                   float *q_out);
 
 // Append an ALREADY-COMPRESSED chunk blob verbatim (no re-encode). `blob`/`len` must be
 // a valid mc chunk blob. Direct .mca -> .mca fast path. Returns 0 on success.
@@ -114,5 +134,19 @@ void mc_reader_set_partial_fetch(mc_reader *r, int on);
 
 // metadata region (pointer into arc; not owned). *out_len = bytes stored.
 const char *mc_metadata(const uint8_t *arc, size_t *out_len);
+
+// Integrity: recompute a chunk blob's xxh64 (over bitmap+lens+payloads) and
+// the stored value (format v6 stores it in the blob header). mc_verify walks
+// every chunk of an archive buffer; returns number of corrupt chunks.
+uint64_t mc_chunk_compute_hash(const uint8_t *blob, uint64_t blob_len);
+long mc_verify_archive(const uint8_t *arc, size_t len, int verbose);
+
+// Per-volume trained priors (format v6). Store a prior blob (from mc_train's
+// binary output: q=1 and q=12 endpoint tables) in the archive; every open of
+// the archive then decodes with these instead of the baked corpus tables.
+// Set BEFORE appending (the encoder uses them too). Process-global: one prior
+// set active per process at a time (matches the one-quality-dial design).
+int mc_archive_set_priors(struct mc_archive *a,
+                          const uint16_t plo[8][32], const uint16_t phi[8][32]);
 
 #endif

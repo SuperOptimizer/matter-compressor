@@ -60,15 +60,33 @@ static const uint16_t RC_PHI[8][RC_NSLOT]={
   /*FLAG*/ {1023,4064,4064,4064,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048},
   /*DC*/ {3873,366,1820,2056,2040,2055,2041,2045,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048,2048}
 };
-static uint16_t g_pri[8][RC_NSLOT];
-static float g_pri_q = -1.0f;
+static _Thread_local uint16_t g_pri[8][RC_NSLOT];
+static _Thread_local float g_pri_q = -1.0f;
+// Per-volume prior override (format v6: a trained-prior blob stored in the
+// archive replaces the baked corpus tables). Process-global, set at open
+// before decode threads start; a generation counter forces per-thread rebuild.
+static uint16_t g_plo_ovr[8][RC_NSLOT], g_phi_ovr[8][RC_NSLOT];
+static int g_pri_ovr = 0;
+static int g_pri_gen = 1;
+static _Thread_local int g_pri_seen = 0;
+static void rc_set_priors(const uint16_t *plo, const uint16_t *phi){
+    if(plo&&phi){
+        memcpy(g_plo_ovr,plo,sizeof g_plo_ovr);
+        memcpy(g_phi_ovr,phi,sizeof g_phi_ovr);
+        g_pri_ovr=1;
+    } else g_pri_ovr=0;
+    g_pri_gen++;
+}
 static void rc_prior_build(float q){
-    if(g_pri_q==q) return;
+    if(g_pri_q==q && g_pri_seen==g_pri_gen) return;
+    g_pri_seen=g_pri_gen;
     float lo=0.0f, hi=3.585f;                       // log2(1) .. log2(12)
     float w=(q<=1.0f)?0.0f:((float)(log(q)/log(2.0))-lo)/(hi-lo);
     if(w<0)w=0; if(w>1)w=1;
+    const uint16_t (*tlo)[RC_NSLOT] = g_pri_ovr ? (const uint16_t(*)[RC_NSLOT])g_plo_ovr : RC_PLO;
+    const uint16_t (*thi)[RC_NSLOT] = g_pri_ovr ? (const uint16_t(*)[RC_NSLOT])g_phi_ovr : RC_PHI;
     for(int c=0;c<8;++c)for(int s=0;s<RC_NSLOT;++s)
-        g_pri[c][s]=(uint16_t)(RC_PLO[c][s]+(RC_PHI[c][s]-RC_PLO[c][s])*w+0.5f);
+        g_pri[c][s]=(uint16_t)(tlo[c][s]+(thi[c][s]-tlo[c][s])*w+0.5f);
     g_pri_q=q;
 }
 #define RC_PRIOR_SIG   g_pri[0]

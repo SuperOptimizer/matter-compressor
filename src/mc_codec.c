@@ -11,18 +11,22 @@
 
 #define N3 (MC_BLK*MC_BLK*MC_BLK)
 
-static float g_quality = 8.0f;
+// Quality state is THREAD-LOCAL: format v6 stores q per chunk, so concurrent
+// decodes of different-q chunks each keep their own step/prior tables (rebuilt
+// only when the thread's q actually changes — once per chunk at most).
+static _Thread_local float g_quality = 8.0f;
 static int   g_max_err = 0;            // 0 = corrections off
 // per-coefficient quant step table (quality * hf_weight), rebuilt when quality
 // changes. powf per coefficient was 20%+ of encode AND decode time.
-static float g_step_tab[N3];
-static float g_step_q = -1.0f;
+static _Thread_local float g_step_tab[N3];
+static _Thread_local float g_step_q = -1.0f;
 static void step_tab_build(void);
 void  mc_set_quality(float q){ g_quality = q; step_tab_build(); }
 float mc_get_quality(void){ return g_quality; }
 void  mc_set_max_error(int tau){ g_max_err = tau<0?0:tau; }
 int   mc_get_max_error(void){ return g_max_err; }
 void  mc_codec_init(void){ mc_dct_init(); }
+void  mc_codec_set_priors(const uint16_t *plo, const uint16_t *phi){ rc_set_priors(plo,phi); }
 
 void mc_buf_put(mc_buf *b, const void *s, size_t n){
     if(b->len+n > b->cap){ size_t nc=b->cap?b->cap*2:1<<16; while(nc<b->len+n)nc*=2; b->p=realloc(b->p,nc); b->cap=nc; }

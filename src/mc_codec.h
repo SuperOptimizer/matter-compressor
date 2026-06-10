@@ -38,6 +38,10 @@ float mc_get_quality(void);
 void  mc_set_max_error(int tau);
 int   mc_get_max_error(void);
 void  mc_codec_init(void);             // one-time: build the DCT tables
+// Override the trained context priors (q=1 / q=12 endpoint tables, u16[8][32]
+// each) — used by per-volume prior blobs. NULL,NULL restores the baked tables.
+// Process-global; set before encode/decode threads run.
+void  mc_codec_set_priors(const uint16_t *plo, const uint16_t *phi);
 
 // growable output byte buffer the codec appends block payloads to.
 typedef struct { mc_u8 *p; size_t len, cap; } mc_buf;
