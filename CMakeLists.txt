@@ -138,4 +138,33 @@ if(MC_STANDALONE)
   else()
     message(STATUS "mc_fetch skipped (need libcurl + libzstd)")
   endif()
+
+  # mc_volume: remote-zarr streaming + transcode + cache + prefetch. Bundles the
+  # vendored c3d decoder, mc_zarr reader, and libs3. Deps: libcurl + libzstd.
+  # Separate lib so the core stays dependency-free; the c3d TU needs OpenMP.
+  if(CURL_FOUND AND ZSTD_LIB AND ZSTD_INC)
+    find_package(OpenMP QUIET)
+    add_library(matter_compressor_volume STATIC
+      src/mc_volume.c src/mc_zarr.c src/c3d.c tools/vendor/libs3/libs3.c)
+    target_include_directories(matter_compressor_volume
+      PUBLIC src PRIVATE tools/vendor/libs3 ${ZSTD_INC})
+    set_property(TARGET matter_compressor_volume PROPERTY C_STANDARD 23)
+    # c3d decode output feeds the .mca re-encode, so honor the archive
+    # determinism policy: no -ffast-math, explicit -ffp-contract=off.
+    set_source_files_properties(src/c3d.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off")
+    target_link_libraries(matter_compressor_volume
+      matter_compressor CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
+    if(OpenMP_C_FOUND)
+      target_link_libraries(matter_compressor_volume OpenMP::OpenMP_C)
+    endif()
+
+    add_executable(mc_zarr_test tests/mc_zarr_test.c src/mc_zarr.c)
+    target_include_directories(mc_zarr_test PRIVATE src ${ZSTD_INC})
+    set_property(TARGET mc_zarr_test PROPERTY C_STANDARD 23)
+    target_link_libraries(mc_zarr_test ${ZSTD_LIB})
+
+    add_executable(mc_volume_test tests/mc_volume_test.c)
+    set_property(TARGET mc_volume_test PROPERTY C_STANDARD 23)
+    target_link_libraries(mc_volume_test matter_compressor_volume)
+  endif()
 endif()

@@ -149,11 +149,23 @@ inner codec name is checked against "c3d"; blosc/raw handled separately if neede
 
 ## Migration order (incremental, each step builds+tests)
 
-1. mc_zarr (with a filesystem byte-source unit test against a tiny v3 shard).
-2. mc_volume over mc_zarr + the decode hook; bench against a known volume.
+1. [DONE] mc_zarr (fs + S3 tested against paris4_c3d_r50.zarr; footer parse
+   byte-matches python; extracted chunk byte-identical to aws range-extract).
+2. [DONE] mc_volume over mc_zarr + vendored c3d. Validated on S3: 6-LOD
+   discovery, get_block transcodes (mean 126, full chunk), re-get is cache-only
+   (0 net), async try_block (absent->0, worker fills, poll->data), profile creds
+   via s3_credentials_load(NULL). CMake: matter_compressor_volume lib + tests.
 3. VC ChunkCache mca-mode -> mc_volume shim; delete MatterCache.
 4. Re-point VolumePrefetcher + vc_cache_prefetch.
 5. Prune now-dead VC zarr/fetch code.
+
+### Notes for the VC port (steps 3-5)
+- c3d C3D_ALIGN=32 is on the 256^3 OUTPUT buffer; mc_volume posix_memaligns it.
+- mc_volume owns 4 background transcode workers; the VC shim must NOT add its own.
+- block coords are 16^3 units; region = block/16. try_block(lod,bz,by,bx) maps to
+  VC ChunkKey directly (level, iz, iy, ix in 16^3-block coords).
+- stats: cache_hits/misses/disk_bytes from mc_cache+archive, net_bytes counted in
+  the s3 read cb. VC status bar reads mc_volume_get_stats.
 
 Risk: steps 3-5 are a big VC diff; do them only once mc_volume is proven in
 isolation (step 2 bench). Keep the legacy non-uint8 ChunkCache path untouched.
