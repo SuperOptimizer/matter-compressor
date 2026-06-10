@@ -289,3 +289,13 @@ plain LTO harmful (-15%) becomes a win. Encode neutral. Recipe:
   rebuild with -fprofile-instr-use=merged.profdata -flto -fuse-ld=lld.
 Ratio/quality bit-identical. Recommended for fleet builds where the ~2-step
 build is acceptable; plain clang -O3 -march=native remains the simple default.
+
+## ThinLTO + toolchain policy (final)
+
+ThinLTO without profiles regresses identically to full LTO (~-15% decode:
+link-time inliner mispredicts the branch-dense rc loop; alignment flags do
+not recover it — only profiles do). Policy: ThinLTO ONLY with PGO. CMake now
+has MC_PGO_GEN / MC_PGO_USE / MC_THINLTO plus cmake/homebrew-llvm.cmake
+(brew clang + lld + llvm-ar end-to-end). Full pipeline verified: 5/5 tests,
+q6 367 dec / q12 478 dec MB/s single-thread (+6-7% over plain -O3), ratio
+bit-identical.
