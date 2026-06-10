@@ -270,3 +270,11 @@ frame's own inserts until the next thaw. DUAL MODE: clients that never call
 freeze() get the original always-thread-safe multi-reader/multi-writer
 behavior unchanged (pins are inert until the first freeze; eviction sweeps
 are bounded so pathological pin states can never livelock).
+
+## Toolchain study (M-series, q=6, same-moment A/B)
+
+apple clang 17: 134/342 enc/dec MB/s · brew clang 22: 133/338 ·
+clang+LTO(+lld): ~130/287 (LTO = -15% decode, both clang versions — the
+codec is a single TU so LTO adds only harmful code-layout churn; do NOT
+enable IPO/-flto) · gcc 15: 97/354 (-28% encode; ship clang everywhere).
+Bitstreams identical across all toolchains.
