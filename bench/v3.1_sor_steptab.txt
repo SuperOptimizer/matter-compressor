@@ -1,0 +1,4 @@
+T=512 q=1.00  ratio    8.7x | PSNR  43.60 MAE 1.710 p50 0 p90 3 p95 4 p99 5 max 32 SSIM 0.9972 | enc   81.0 MB/s dec   82.1 MB/s cold   0.043 ms
+T=512 q=3.00  ratio   20.5x | PSNR  38.41 MAE 3.158 p50 1 p90 5 p95 7 p99 10 max 51 SSIM 0.9904 | enc   96.2 MB/s dec  127.3 MB/s cold   0.026 ms
+T=512 q=6.00  ratio   33.6x | PSNR  35.78 MAE 4.289 p50 1 p90 7 p95 9 p99 13 max 58 SSIM 0.9820 | enc  102.2 MB/s dec  156.6 MB/s cold   0.022 ms
+T=512 q=12.00 ratio   51.0x | PSNR  33.45 MAE 5.622 p50 1 p90 10 p95 12 p99 17 max 70 SSIM 0.9685 | enc  104.8 MB/s dec  176.3 MB/s cold   0.020 ms

@@ -1,0 +1,16 @@
+## v2 per-block mask
+# /tmp/vesuvius_512.bin T=128 (pad 256) air 17.2%
+T=128 q=1.00  ratio    1.7x | PSNR  40.17 MAE 2.118 p50 1 p90 4 p95 5 p99 7 max 21 SSIM 0.9977 | enc  314.9 MB/s dec  477.1 MB/s cold   0.000 ms
+T=128 q=3.00  ratio    3.0x | PSNR  35.04 MAE 3.713 p50 2 p90 7 p95 9 p99 15 max 55 SSIM 0.9923 | enc  467.5 MB/s dec  699.4 MB/s cold   0.000 ms
+T=128 q=6.00  ratio    3.9x | PSNR  32.18 MAE 5.238 p50 3 p90 10 p95 13 p99 20 max 76 SSIM 0.9851 | enc  502.0 MB/s dec  845.4 MB/s cold   0.000 ms
+T=128 q=12.00 ratio    4.8x | PSNR  29.45 MAE 7.298 p50 5 p90 14 p95 18 p99 26 max 80 SSIM 0.9721 | enc  524.8 MB/s dec  968.3 MB/s cold   0.000 ms
+# /tmp/vesuvius_512.bin T=256 (pad 256) air 23.2%
+T=256 q=1.00  ratio    1.9x | PSNR  40.33 MAE 2.157 p50 1 p90 4 p95 5 p99 7 max 29 SSIM 0.9971 | enc   50.1 MB/s dec   61.0 MB/s cold   0.050 ms
+T=256 q=3.00  ratio    3.9x | PSNR  35.03 MAE 3.840 p50 2 p90 7 p95 9 p99 16 max 77 SSIM 0.9895 | enc   61.1 MB/s dec   90.5 MB/s cold   0.040 ms
+T=256 q=6.00  ratio    5.6x | PSNR  32.20 MAE 5.413 p50 3 p90 10 p95 13 p99 21 max 89 SSIM 0.9806 | enc   66.3 MB/s dec  107.6 MB/s cold   0.036 ms
+T=256 q=12.00 ratio    7.7x | PSNR  29.50 MAE 7.513 p50 4 p90 14 p95 18 p99 27 max 106 SSIM 0.9660 | enc   69.7 MB/s dec  125.7 MB/s cold   0.033 ms
+# /tmp/vesuvius_512.bin T=512 (pad 512) air 27.6%
+T=512 q=1.00  ratio    3.7x | PSNR  40.40 MAE 2.201 p50 1 p90 4 p95 5 p99 8 max 37 SSIM 0.9968 | enc   48.9 MB/s dec   58.3 MB/s cold   0.070 ms
+T=512 q=3.00  ratio    7.7x | PSNR  34.84 MAE 4.025 p50 2 p90 7 p95 10 p99 16 max 89 SSIM 0.9879 | enc   59.3 MB/s dec   80.1 MB/s cold   0.047 ms
+T=512 q=6.00  ratio   11.4x | PSNR  31.96 MAE 5.707 p50 3 p90 10 p95 14 p99 22 max 122 SSIM 0.9778 | enc   64.1 MB/s dec  104.7 MB/s cold   0.036 ms
+T=512 q=12.00 ratio   16.0x | PSNR  29.24 MAE 7.953 p50 4 p90 15 p95 19 p99 28 max 128 SSIM 0.9620 | enc   67.7 MB/s dec  118.7 MB/s cold   0.034 ms

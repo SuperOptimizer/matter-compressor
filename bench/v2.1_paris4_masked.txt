@@ -1,0 +1,16 @@
+## v2.1 (per-block mask + trim) on 2.4um masked PHercParis4
+# /tmp/paris4_masked_512.bin T=128 (pad 256) air 50.3%
+T=128 q=1.00  ratio    2.9x | PSNR  43.86 MAE 1.780 p50 0 p90 3 p95 4 p99 5 max 23 SSIM 0.9981 | enc  442.2 MB/s dec  720.9 MB/s cold   0.000 ms
+T=128 q=3.00  ratio    4.9x | PSNR  38.53 MAE 3.346 p50 0 p90 5 p95 7 p99 10 max 32 SSIM 0.9935 | enc  534.1 MB/s dec  975.6 MB/s cold   0.000 ms
+T=128 q=6.00  ratio    6.0x | PSNR  35.94 MAE 4.534 p50 0 p90 7 p95 9 p99 14 max 42 SSIM 0.9879 | enc  556.6 MB/s dec 1106.3 MB/s cold   0.000 ms
+T=128 q=12.00 ratio    6.9x | PSNR  33.65 MAE 5.914 p50 0 p90 9 p95 12 p99 18 max 51 SSIM 0.9790 | enc  572.3 MB/s dec 1261.6 MB/s cold   0.000 ms
+# /tmp/paris4_masked_512.bin T=256 (pad 256) air 41.8%
+T=256 q=1.00  ratio    3.7x | PSNR  43.36 MAE 1.750 p50 0 p90 3 p95 4 p99 6 max 24 SSIM 0.9974 | enc   64.3 MB/s dec   90.1 MB/s cold   0.045 ms
+T=256 q=3.00  ratio    7.8x | PSNR  38.09 MAE 3.263 p50 1 p90 6 p95 7 p99 10 max 40 SSIM 0.9910 | enc   75.5 MB/s dec  130.0 MB/s cold   0.035 ms
+T=256 q=6.00  ratio   11.7x | PSNR  35.48 MAE 4.430 p50 1 p90 8 p95 10 p99 14 max 52 SSIM 0.9832 | enc   79.9 MB/s dec  152.9 MB/s cold   0.031 ms
+T=256 q=12.00 ratio   16.1x | PSNR  33.16 MAE 5.799 p50 1 p90 10 p95 13 p99 18 max 77 SSIM 0.9706 | enc   82.5 MB/s dec  168.6 MB/s cold   0.029 ms
+# /tmp/paris4_masked_512.bin T=512 (pad 512) air 41.9%
+T=512 q=1.00  ratio    8.0x | PSNR  43.47 MAE 1.728 p50 0 p90 3 p95 4 p99 5 max 36 SSIM 0.9971 | enc   62.2 MB/s dec   95.8 MB/s cold   0.035 ms
+T=512 q=3.00  ratio   17.6x | PSNR  38.27 MAE 3.194 p50 1 p90 5 p95 7 p99 10 max 51 SSIM 0.9902 | enc   80.1 MB/s dec  138.1 MB/s cold   0.026 ms
+T=512 q=6.00  ratio   27.6x | PSNR  35.66 MAE 4.336 p50 1 p90 7 p95 9 p99 13 max 61 SSIM 0.9818 | enc   78.8 MB/s dec  161.8 MB/s cold   0.023 ms
+T=512 q=12.00 ratio   40.4x | PSNR  33.33 MAE 5.686 p50 1 p90 10 p95 12 p99 18 max 77 SSIM 0.9681 | enc   78.8 MB/s dec  176.2 MB/s cold   0.021 ms
