@@ -250,6 +250,15 @@ mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len);
 // (whole-blob fetch amortizes better).
 void mc_reader_set_partial_fetch(mc_reader *r, int on);
 
+// Total byte length of the chunk blob at `chunk_off` (flat or streaming reader);
+// 0 on error. Pair with mc_chunk_offset to range-copy compressed chunks verbatim
+// into another archive via mc_archive_append_chunk_compressed.
+uint64_t mc_reader_chunk_blob_len(mc_reader *r, uint64_t chunk_off);
+
+// Raw per-volume prior arrays (plo/phi as u16[8][32]); returns 0 if the archive
+// stores none. Feed into mc_archive_set_priors so a local mirror decodes identically.
+int mc_reader_priors(mc_reader *r, const uint16_t **plo, const uint16_t **phi);
+
 // Header metadata (valid for flat and streaming readers).
 void  mc_reader_dims(mc_reader *r, int *nx, int *ny, int *nz);  // LOD0 voxel dims
 float mc_reader_quality(mc_reader *r);                          // build quality
