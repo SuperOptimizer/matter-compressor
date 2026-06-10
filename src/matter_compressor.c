@@ -1100,10 +1100,14 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
     }
 #endif
     if(flags&2){                                      // sparse max-error corrections
+        // HARDENED: ncorr and positions are attacker-controlled on corrupted
+        // input — clamp both so a flipped bit can never write outside dst.
         rc_u32 ncorr=dec_eg(&d)+1, pos=0;
+        if(ncorr>(rc_u32)N3) ncorr=N3;
         for(rc_u32 c=0;c<ncorr;++c){
             pos+=dec_eg(&d);
             int neg=dec_bypass(&d); rc_u32 m=dec_eg(&d)+1;
+            if(pos>=(rc_u32)N3) break;                // corrupt stream: stop
             int v=(int)dst[pos]+(neg?-(int)m:(int)m);
             if(v<0)v=0; if(v>255)v=255; dst[pos]=(mc_u8)v;
         }
@@ -1811,6 +1815,12 @@ void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,in
     mc_set_quality(mc_chunk_q(a->base,chunk_off));   // thread-local; per-chunk q
     uint64_t boff; uint32_t bl;
     if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    // HARDENED: offsets derive from the on-disk length table; on a corrupt
+    // archive they could point past the mapped file (SIGBUS). Bound against
+    // the live append cursor. (For untrusted archives run mc_verify first —
+    // the per-chunk xxh64 covers bitmap+lens+payloads.)
+    uint64_t end=atomic_load_explicit(&a->cursor,memory_order_acquire);
+    if(boff+bl>end){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     mc_dec_block(a->base+boff,bl,dst);
 }
 
