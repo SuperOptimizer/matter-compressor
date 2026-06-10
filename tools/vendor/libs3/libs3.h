@@ -51,6 +51,7 @@ typedef enum s3_status {
     S3_ERR_PARSE        = -6,  /* malformed JSON/XML response */
     S3_ERR_IO           = -7,  /* local file open/read failure */
     S3_ERR_ABORTED      = -8,  /* global abort flag was set */
+    S3_ERR_BUSY         = -9,  /* async request not yet complete */
 } s3_status;
 
 /* Human-readable string for a status code (static storage, never NULL). */
@@ -342,12 +343,103 @@ typedef struct s3_range_req {
     const char *url;
     uint64_t    offset;
     uint64_t    length;   /* 0 -> whole object */
+    /*
+     * Optional caller-owned destination of `length` bytes (requires
+     * length > 0). When set, the body is written straight into `dst`
+     * (zero allocations, zero copies on the direct path); the response's
+     * body stays NULL and body_len reports bytes written. Bodies larger
+     * than `length` (e.g. a Range-ignoring server) are refused at the
+     * transport level rather than overrunning the buffer.
+     */
+    uint8_t    *dst;
 } s3_range_req;
 
 s3_status s3_get_batch(s3_client *c,
                        const s3_range_req *reqs, size_t n,
                        size_t max_concurrency,
                        s3_response *out);
+
+/*
+ * Zero-allocation single ranged GET: the body is written straight into
+ * `dst` (capacity = `length`). resp->body stays NULL; resp->body_len
+ * reports bytes written (0 unless the HTTP status was 200/206 -- error
+ * bodies are not delivered through `dst`). Same retry behaviour as
+ * s3_get_range.
+ */
+s3_status s3_get_range_into(s3_client *c, const char *url,
+                            uint64_t offset, uint64_t length,
+                            uint8_t *dst, s3_response *resp);
+
+/* ------------------------------------------------------------------ */
+/* Asynchronous batched GET (submit / poll / cancel)                    */
+/* ------------------------------------------------------------------ */
+/*
+ * Non-blocking variant of s3_get_batch for latency-sensitive callers
+ * (render loops, frame-budgeted I/O). Submit returns immediately; the
+ * transfers make progress only inside s3_batch_poll / s3_batch_wait,
+ * called from the SAME THREAD that submitted (the batch borrows the
+ * thread's persistent connection pool). Typical frame loop:
+ *
+ *   s3_batch *b;
+ *   s3_batch_submit(c, reqs, n, 16, &b);
+ *   ...per frame:
+ *   s3_batch_poll(b, 2);                       // <= 2 ms of I/O pumping
+ *   for (i ...) if (s3_batch_ready(b, i)) {
+ *       s3_response r; s3_batch_take(b, i, &r); ... s3_response_free(&r);
+ *   }
+ *   ...view changed:
+ *   s3_batch_cancel(b, i);                     // stale chunk: stop now
+ *   ...teardown:
+ *   s3_batch_free(b);                          // cancels whatever is left
+ *
+ * Requests are NOT range-coalesced (members of a merged transfer could
+ * not be cancelled independently). reqs[].url / reqs[].dst buffers are
+ * copied/borrowed at submit: urls are duplicated, dst buffers must stay
+ * alive until the request is taken, cancelled, or the batch is freed.
+ * A batch must be polled, taken from, cancelled, waited on and freed on
+ * its submitting thread.
+ */
+typedef struct s3_batch s3_batch;
+
+/* Start a batch: validates inputs, begins up to max_concurrency
+ * transfers (0 -> a sane default), returns without blocking. */
+s3_status s3_batch_submit(s3_client *c,
+                          const s3_range_req *reqs, size_t n,
+                          size_t max_concurrency,
+                          s3_batch **out);
+
+/*
+ * Pump the batch's transfers for at most `budget_ms` milliseconds
+ * (0 -> one non-blocking pump; negative -> until every request is
+ * terminal). Returns the total number of terminal (done or cancelled)
+ * requests, or -1 if `b` is NULL.
+ */
+int s3_batch_poll(s3_batch *b, long budget_ms);
+
+/* True once request i has completed (its response is takeable). */
+bool s3_batch_ready(const s3_batch *b, size_t i);
+
+/*
+ * Move request i's response out to the caller (caller frees with
+ * s3_response_free). Returns S3_ERR_BUSY while in flight, S3_ERR_ABORTED
+ * if it was cancelled, S3_ERR_INVALID_ARG if already taken / i out of
+ * range. Inspect out->status for the HTTP result as with s3_get_batch.
+ */
+s3_status s3_batch_take(s3_batch *b, size_t i, s3_response *out);
+
+/* Cancel request i: a pending request never starts; an in-flight one is
+ * torn down immediately (its connection is dropped). No-op once the
+ * request is terminal. */
+void s3_batch_cancel(s3_batch *b, size_t i);
+
+/* Block until every request is terminal. Returns S3_OK if every
+ * completed transfer succeeded at the transport level (per-request HTTP
+ * status still in each response), or the first error otherwise. */
+s3_status s3_batch_wait(s3_batch *b);
+
+/* Cancel anything still running, free untaken responses, release the
+ * batch. NULL-safe. */
+void s3_batch_free(s3_batch *b);
 
 /*
  * Open `nconn` connections to `url`'s host from the calling thread's batch

@@ -188,6 +188,8 @@ static CURL *thread_handle(void) {
 #define BATCH_POOL_MAX 64
 typedef struct {
     CURLM *multi;
+    CURLSH *share;               /* connection/DNS/TLS-session cache shared by
+                                    the thread multi and async-batch multis */
     CURL  *pool[BATCH_POOL_MAX];
     size_t npool;
 } batch_tls_t;
@@ -198,6 +200,7 @@ static void batch_tls_destructor(void *p) {
     if (!bt) return;
     for (size_t i = 0; i < bt->npool; i++) curl_easy_cleanup(bt->pool[i]);
     if (bt->multi) curl_multi_cleanup(bt->multi);
+    if (bt->share) curl_share_cleanup(bt->share);   /* after all its users */
     free(bt);
 }
 static void make_batch_key(void) {
@@ -213,13 +216,24 @@ static batch_tls_t *thread_batch(void) {
         if (!bt->multi) { free(bt); return NULL; }
         /* keep completed connections cached instead of closing them */
         curl_multi_setopt(bt->multi, CURLMOPT_MAXCONNECTS, (long)BATCH_POOL_MAX);
+        /* thread-local share: single-thread use, no lock callbacks needed */
+        bt->share = curl_share_init();
+        if (bt->share) {
+            curl_share_setopt(bt->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+            curl_share_setopt(bt->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+            curl_share_setopt(bt->share, CURLSHOPT_SHARE,
+                              CURL_LOCK_DATA_SSL_SESSION);
+        }
         pthread_setspecific(g_batch_key, bt);
     }
     return bt;
 }
 static CURL *batch_easy_acquire(batch_tls_t *bt) {
-    if (bt->npool) { CURL *h = bt->pool[--bt->npool]; curl_easy_reset(h); return h; }
-    return curl_easy_init();
+    CURL *h;
+    if (bt->npool) { h = bt->pool[--bt->npool]; curl_easy_reset(h); }
+    else            h = curl_easy_init();
+    if (h && bt->share) curl_easy_setopt(h, CURLOPT_SHARE, bt->share);
+    return h;
 }
 static void batch_easy_release(batch_tls_t *bt, CURL *h) {
     if (!h) return;
@@ -242,6 +256,7 @@ const char *s3_status_str(s3_status st) {
     case S3_ERR_PARSE:        return "malformed response";
     case S3_ERR_IO:           return "local I/O failure";
     case S3_ERR_ABORTED:      return "aborted";
+    case S3_ERR_BUSY:         return "async request not yet complete";
     }
     return "unknown error";
 }
@@ -1187,6 +1202,7 @@ static s3_status do_request(s3_client *c, const char *url, method_t method,
                             const char *range,
                             const struct curl_slist *extra_hdrs,
                             FILE *sink,        /* if set, stream body here (no RAM buffer) */
+                            fixed_sink *fsink, /* if set, write body into caller memory */
                             s3_response *resp) {
     if (!c || !url || !resp) return S3_ERR_INVALID_ARG;
     memset(resp, 0, sizeof *resp);
@@ -1240,8 +1256,13 @@ static s3_status do_request(s3_client *c, const char *url, method_t method,
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, file_write_cb);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, sink);
         }
+        if (fsink) {
+            fsink->len = 0;                      /* fresh write each retry */
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fixed_write_cb);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, fsink);
+        }
         body_ctx bctx = { &bbuf, resp };
-        if (!sink) {
+        if (!sink && !fsink) {
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, body_write_cb);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &bctx);
         }
@@ -1320,6 +1341,9 @@ static s3_status do_request(s3_client *c, const char *url, method_t method,
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp->status);
             resp->body = bbuf.data;       /* NULL when streamed to sink */
             resp->body_len = bbuf.len;
+            if (fsink)                    /* error bodies don't count */
+                resp->body_len = (resp->status == 200 || resp->status == 206)
+                                     ? fsink->len : 0;
             bool retryable = resp->status >= 500 ||
                              resp->status == 401 || resp->status == 403;
             if (retryable && attempt < c->max_retries) {
@@ -1360,14 +1384,14 @@ void s3_response_free(s3_response *r) {
 /* ================================================================== */
 
 s3_status s3_get(s3_client *c, const char *url, s3_response *resp) {
-    return do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, resp);
+    return do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, resp);
 }
 
 s3_status s3_get_to_file(s3_client *c, const char *url, FILE *sink, s3_response *resp) {
     if (!sink) return S3_ERR_INVALID_ARG;
     /* Streams the body straight to `sink` (constant memory); resp->body stays
      * NULL. resp->status/headers are still filled. */
-    return do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, sink, resp);
+    return do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, sink, NULL, resp);
 }
 
 s3_status s3_get_range(s3_client *c, const char *url,
@@ -1380,31 +1404,45 @@ s3_status s3_get_range(s3_client *c, const char *url,
     snprintf(range, sizeof range, "%llu-%llu",
              (unsigned long long)offset,
              (unsigned long long)(offset + length - 1));
-    return do_request(c, url, M_GET_RANGE, NULL, 0, NULL, 0, NULL, range, NULL, NULL, resp);
+    return do_request(c, url, M_GET_RANGE, NULL, 0, NULL, 0, NULL, range, NULL, NULL, NULL, resp);
+}
+
+s3_status s3_get_range_into(s3_client *c, const char *url,
+                            uint64_t offset, uint64_t length,
+                            uint8_t *dst, s3_response *resp) {
+    if (!dst || !resp) return S3_ERR_INVALID_ARG;
+    if (length == 0) { memset(resp, 0, sizeof *resp); return S3_OK; }
+    char range[64];
+    snprintf(range, sizeof range, "%llu-%llu",
+             (unsigned long long)offset,
+             (unsigned long long)(offset + length - 1));
+    fixed_sink fs = { dst, (size_t)length, 0 };
+    return do_request(c, url, M_GET_RANGE, NULL, 0, NULL, 0, NULL, range,
+                      NULL, NULL, &fs, resp);
 }
 
 s3_status s3_get_conditional(s3_client *c, const char *url,
                              const char *if_none_match, s3_response *resp) {
     if (!if_none_match || !if_none_match[0])
-        return do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, resp);
+        return do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, resp);
     char *hv = str_appendf(NULL, "If-None-Match: %s", if_none_match);
     if (!hv) return S3_ERR_OOM;
     struct curl_slist *h = curl_slist_append(NULL, hv);
     free(hv);
-    s3_status rc = do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, h, NULL, resp);
+    s3_status rc = do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, h, NULL, NULL, resp);
     curl_slist_free_all(h);
     return rc;
 }
 
 s3_status s3_head(s3_client *c, const char *url, s3_response *resp) {
-    return do_request(c, url, M_HEAD, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, resp);
+    return do_request(c, url, M_HEAD, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, resp);
 }
 
 s3_status s3_put(s3_client *c, const char *url,
                  const void *data, size_t len,
                  const char *content_type, s3_response *resp) {
     return do_request(c, url, M_PUT, data, len, NULL, 0, content_type, NULL, NULL,
-                      NULL, resp);
+                      NULL, NULL, resp);
 }
 
 s3_status s3_put_if_match(s3_client *c, const char *url,
@@ -1413,13 +1451,13 @@ s3_status s3_put_if_match(s3_client *c, const char *url,
                           const char *if_match, s3_response *resp) {
     if (!if_match || !if_match[0])
         return do_request(c, url, M_PUT, data, len, NULL, 0,
-                          content_type, NULL, NULL, NULL, resp);
+                          content_type, NULL, NULL, NULL, NULL, resp);
     char *hv = str_appendf(NULL, "If-Match: %s", if_match);
     if (!hv) return S3_ERR_OOM;
     struct curl_slist *h = curl_slist_append(NULL, hv);
     free(hv);
     s3_status rc = do_request(c, url, M_PUT, data, len, NULL, 0,
-                              content_type, NULL, h, NULL, resp);
+                              content_type, NULL, h, NULL, NULL, resp);
     curl_slist_free_all(h);
     return rc;
 }
@@ -1437,7 +1475,7 @@ s3_status s3_put_file(s3_client *c, const char *url, const char *path,
     /* Stream from the FILE* in constant memory (do_request rewinds on
        each retry attempt). */
     s3_status rc = do_request(c, url, M_PUT, NULL, 0, f, sz,
-                              content_type, NULL, NULL, NULL, resp);
+                              content_type, NULL, NULL, NULL, NULL, resp);
     fclose(f);
     return rc;
 }
@@ -1459,6 +1497,110 @@ typedef struct {
     bool               in_flight;
 } batch_slot;
 
+/* Start one batch transfer: acquire a pooled handle, configure it for
+ * rq, attach to `multi`. `dest` (optional) is a caller buffer of
+ * rq->length bytes; headers are parsed into `hdr`. On failure the slot is
+ * left inert (nothing to clean up beyond batch_slot_abort). */
+static s3_status batch_slot_start(s3_client *c, batch_tls_t *bt, CURLM *multi,
+                                  batch_slot *s, const s3_range_req *rq,
+                                  uint8_t *dest, s3_response *hdr) {
+    s->eh = batch_easy_acquire(bt);
+    if (!s->eh) return S3_ERR_CURL;
+    s->url = resolve_url_for(c->endpoint, c->endpoint_insecure, rq->url);
+    if (!s->url) {
+        batch_easy_release(bt, s->eh); s->eh = NULL;
+        return S3_ERR_INVALID_ARG;
+    }
+
+    curl_easy_setopt(s->eh, CURLOPT_URL, s->url);
+    curl_easy_setopt(s->eh, CURLOPT_CONNECTTIMEOUT, c->connect_timeout_s);
+    curl_easy_setopt(s->eh, CURLOPT_TIMEOUT, c->transfer_timeout_s);
+    curl_easy_setopt(s->eh, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(s->eh, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(s->eh, CURLOPT_TCP_KEEPINTVL, 30L);
+    if (c->follow_redirects) {
+        curl_easy_setopt(s->eh, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(s->eh, CURLOPT_MAXREDIRS, 10L);
+    }
+    curl_easy_setopt(s->eh, CURLOPT_USERAGENT, c->user_agent);
+    curl_easy_setopt(s->eh, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(s->eh, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+    curl_easy_setopt(s->eh, CURLOPT_HTTPGET, 1L);
+    if (dest) {
+        s->fs = (fixed_sink){ dest, (size_t)rq->length, 0 };
+        curl_easy_setopt(s->eh, CURLOPT_WRITEFUNCTION, fixed_write_cb);
+        curl_easy_setopt(s->eh, CURLOPT_WRITEDATA, &s->fs);
+    } else {
+        curl_easy_setopt(s->eh, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(s->eh, CURLOPT_WRITEDATA, &s->body);
+    }
+    curl_easy_setopt(s->eh, CURLOPT_HEADERFUNCTION, header_cb);
+    curl_easy_setopt(s->eh, CURLOPT_HEADERDATA, hdr);
+
+    if (rq->length > 0) {
+        snprintf(s->range, sizeof s->range, "%llu-%llu",
+            (unsigned long long)rq->offset,
+            (unsigned long long)(rq->offset + rq->length - 1));
+        curl_easy_setopt(s->eh, CURLOPT_RANGE, s->range);
+        /* exact-size body preallocation: no realloc chain */
+        if (!dest) buf_reserve(&s->body, rq->length);
+    }
+
+    s3_status crc = resolve_request_creds(c, &s->cr);
+    if (crc != S3_OK) {
+        batch_easy_release(bt, s->eh); s->eh = NULL;
+        free(s->url); s->url = NULL;
+        return crc;
+    }
+    apply_auth(c, s->eh, &s->cr, &s->hdrs,
+               s->sigv4, sizeof s->sigv4, s->userpwd, sizeof s->userpwd);
+    if (s->hdrs)
+        curl_easy_setopt(s->eh, CURLOPT_HTTPHEADER, s->hdrs);
+
+    curl_easy_setopt(s->eh, CURLOPT_PRIVATE, s);
+    curl_multi_add_handle(multi, s->eh);
+    s->in_flight = true;
+    return S3_OK;
+}
+
+/* Harvest one completed transfer into `out`; downgrades *final on error. */
+static void batch_slot_finish(batch_tls_t *bt, CURLM *multi, batch_slot *s,
+                              CURLcode result, ptrdiff_t idx,
+                              s3_response *out, s3_status *final) {
+    if (result == CURLE_OK) {
+        curl_easy_getinfo(s->eh, CURLINFO_RESPONSE_CODE, &out->status);
+        if (s->fs.dst) {
+            out->body_len = s->fs.len;           /* body stays NULL */
+        } else {
+            out->body = s->body.data;
+            out->body_len = s->body.len;
+            s->body.data = NULL;
+        }
+        if (!s3_response_ok(out) && out->status != 206 && out->status != 304)
+            *final = S3_ERR_HTTP;
+    } else {
+        set_error("batch[%td]: %s", idx, curl_easy_strerror(result));
+        *final = S3_ERR_CURL;
+    }
+    curl_multi_remove_handle(multi, s->eh);
+    batch_easy_release(bt, s->eh);
+    s->eh = NULL;
+    s->in_flight = false;
+}
+
+/* Tear down a slot in any state (pending start failure, in-flight cancel,
+ * or completed): detach, return the handle to the pool, free leftovers. */
+static void batch_slot_abort(batch_tls_t *bt, CURLM *multi, batch_slot *s) {
+    if (s->in_flight && s->eh) curl_multi_remove_handle(multi, s->eh);
+    batch_easy_release(bt, s->eh);
+    s->eh = NULL;
+    s->in_flight = false;
+    if (s->hdrs) { curl_slist_free_all(s->hdrs); s->hdrs = NULL; }
+    s3_credentials_free(&s->cr);
+    free(s->url); s->url = NULL;
+    free(s->body.data); s->body.data = NULL;
+}
+
 /* core batch engine; dsts!=NULL -> scatter mode: request i writes straight
  * into dsts[i] (capacity reqs[i].length), out[i].body stays NULL and
  * out[i].body_len reports bytes written — no per-part allocation and no
@@ -1470,6 +1612,8 @@ static s3_status get_batch_core(s3_client *c,
                        uint8_t *const *dsts) {
     if (!c || (!reqs && n) || (!out && n)) return S3_ERR_INVALID_ARG;
     if (n == 0) return S3_OK;
+    for (size_t i = 0; i < n; i++)        /* dst needs a known capacity */
+        if (reqs[i].dst && reqs[i].length == 0) return S3_ERR_INVALID_ARG;
     if (max_concurrency == 0) max_concurrency = 16;
     if (max_concurrency > n)  max_concurrency = n;
     if (s3_global_is_aborted()) return S3_ERR_ABORTED;
@@ -1494,59 +1638,10 @@ static s3_status get_batch_core(s3_client *c,
         while (added < n &&
                (added - completed) < max_concurrency) {
             batch_slot *s = &slots[added];
-            s->eh = batch_easy_acquire(bt);
-            if (!s->eh) { final = S3_ERR_CURL; goto drain; }
-            s->url = resolve_url_for(c->endpoint, c->endpoint_insecure,
-                                     reqs[added].url);
-            if (!s->url) { final = S3_ERR_INVALID_ARG; goto drain; }
-
-            curl_easy_setopt(s->eh, CURLOPT_URL, s->url);
-            curl_easy_setopt(s->eh, CURLOPT_CONNECTTIMEOUT,
-                             c->connect_timeout_s);
-            curl_easy_setopt(s->eh, CURLOPT_TIMEOUT, c->transfer_timeout_s);
-            curl_easy_setopt(s->eh, CURLOPT_TCP_KEEPALIVE, 1L);
-            curl_easy_setopt(s->eh, CURLOPT_TCP_KEEPIDLE, 30L);
-            curl_easy_setopt(s->eh, CURLOPT_TCP_KEEPINTVL, 30L);
-            if (c->follow_redirects) {
-                curl_easy_setopt(s->eh, CURLOPT_FOLLOWLOCATION, 1L);
-                curl_easy_setopt(s->eh, CURLOPT_MAXREDIRS, 10L);
-            }
-            curl_easy_setopt(s->eh, CURLOPT_USERAGENT, c->user_agent);
-            curl_easy_setopt(s->eh, CURLOPT_NOPROGRESS, 0L);
-            curl_easy_setopt(s->eh, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
-            curl_easy_setopt(s->eh, CURLOPT_HTTPGET, 1L);
-            if (dsts && dsts[added]) {
-                s->fs = (fixed_sink){ dsts[added], (size_t)reqs[added].length, 0 };
-                curl_easy_setopt(s->eh, CURLOPT_WRITEFUNCTION, fixed_write_cb);
-                curl_easy_setopt(s->eh, CURLOPT_WRITEDATA, &s->fs);
-            } else {
-                curl_easy_setopt(s->eh, CURLOPT_WRITEFUNCTION, write_cb);
-                curl_easy_setopt(s->eh, CURLOPT_WRITEDATA, &s->body);
-            }
-            curl_easy_setopt(s->eh, CURLOPT_HEADERFUNCTION, header_cb);
-            curl_easy_setopt(s->eh, CURLOPT_HEADERDATA, &out[added]);
-
-            if (reqs[added].length > 0) {
-                snprintf(s->range, sizeof s->range, "%llu-%llu",
-                    (unsigned long long)reqs[added].offset,
-                    (unsigned long long)(reqs[added].offset +
-                                         reqs[added].length - 1));
-                curl_easy_setopt(s->eh, CURLOPT_RANGE, s->range);
-                /* exact-size body preallocation: no realloc chain */
-                if (!(dsts && dsts[added]))
-                    buf_reserve(&s->body, reqs[added].length);
-            }
-
-            s3_status crc = resolve_request_creds(c, &s->cr);
-            if (crc != S3_OK) { final = crc; goto drain; }
-            apply_auth(c, s->eh, &s->cr, &s->hdrs,
-                       s->sigv4, sizeof s->sigv4, s->userpwd, sizeof s->userpwd);
-            if (s->hdrs)
-                curl_easy_setopt(s->eh, CURLOPT_HTTPHEADER, s->hdrs);
-
-            curl_easy_setopt(s->eh, CURLOPT_PRIVATE, s);
-            curl_multi_add_handle(multi, s->eh);
-            s->in_flight = true;
+            uint8_t *dest = dsts ? dsts[added] : reqs[added].dst;
+            s3_status src = batch_slot_start(c, bt, multi, s, &reqs[added],
+                                             dest, &out[added]);
+            if (src != S3_OK) { final = src; goto drain; }
             added++;
         }
 
@@ -1563,44 +1658,16 @@ static s3_status get_batch_core(s3_client *c,
             if (m->msg != CURLMSG_DONE) continue;
             batch_slot *s = NULL;
             curl_easy_getinfo(m->easy_handle, CURLINFO_PRIVATE, &s);
-            ptrdiff_t idx = s - slots;
-            if (m->data.result == CURLE_OK) {
-                curl_easy_getinfo(s->eh, CURLINFO_RESPONSE_CODE,
-                                  &out[idx].status);
-                if (dsts && dsts[idx]) {
-                    out[idx].body_len = s->fs.len;       /* body stays NULL */
-                } else {
-                    out[idx].body = s->body.data;
-                    out[idx].body_len = s->body.len;
-                    s->body.data = NULL;
-                }
-                if (!s3_response_ok(&out[idx]) &&
-                    out[idx].status != 206 && out[idx].status != 304)
-                    final = S3_ERR_HTTP;
-            } else {
-                set_error("batch[%td]: %s", idx,
-                          curl_easy_strerror(m->data.result));
-                final = S3_ERR_CURL;
-            }
-            curl_multi_remove_handle(multi, s->eh);
-            batch_easy_release(bt, s->eh);
-            s->eh = NULL;
-            s->in_flight = false;
+            batch_slot_finish(bt, multi, s, m->data.result, s - slots,
+                              &out[s - slots], &final);
             completed++;
         }
     }
     if (s3_global_is_aborted()) final = S3_ERR_ABORTED;
 
 drain:
-    for (size_t i = 0; i < n; i++) {
-        batch_slot *s = &slots[i];
-        if (s->in_flight && s->eh) curl_multi_remove_handle(multi, s->eh);
-        batch_easy_release(bt, s->eh);
-        if (s->hdrs) curl_slist_free_all(s->hdrs);
-        s3_credentials_free(&s->cr);
-        free(s->url);
-        free(s->body.data);   /* NULL unless transfer never completed */
-    }
+    for (size_t i = 0; i < n; i++)
+        batch_slot_abort(bt, multi, &slots[i]);
     /* multi + easy pool persist in thread-local state (connection cache) */
     free(slots);
     return final;
@@ -1684,11 +1751,14 @@ s3_status s3_get_batch(s3_client *c,
     for (size_t i = 0; i < n; i++) {
         if (gfirst[i] == i) {
             uint64_t end = cr[i].off + cr[i].len;
-            for (size_t j = i + 1; j < n && gfirst[j] == i; j++)
+            size_t members = 1;
+            for (size_t j = i + 1; j < n && gfirst[j] == i; j++, members++)
                 if (cr[j].off + cr[j].len > end) end = cr[j].off + cr[j].len;
             mreq[g].url    = cr[i].url;
             mreq[g].offset = cr[i].off;
             mreq[g].length = cr[i].len ? end - cr[i].off : 0;
+            if (members == 1)             /* pass-through keeps caller's dst */
+                mreq[g].dst = reqs[cr[i].orig].dst;
             g++;
         }
         gid[i] = g - 1;
@@ -1724,9 +1794,14 @@ s3_status s3_get_batch(s3_client *c,
             final = final == S3_OK ? S3_ERR_HTTP : final;
             continue;
         }
-        o->body = malloc(cr[i].len ? cr[i].len : 1);
-        if (!o->body) { final = S3_ERR_OOM; continue; }
-        memcpy(o->body, m->body + rel, cr[i].len);
+        uint8_t *dst = reqs[cr[i].orig].dst;
+        if (dst) {
+            memcpy(dst, m->body + rel, cr[i].len);   /* body stays NULL */
+        } else {
+            o->body = malloc(cr[i].len ? cr[i].len : 1);
+            if (!o->body) { final = S3_ERR_OOM; continue; }
+            memcpy(o->body, m->body + rel, cr[i].len);
+        }
         o->body_len       = cr[i].len;
         o->content_length = cr[i].len;
         o->content_type   = co_strdup(m->content_type);
@@ -1738,6 +1813,203 @@ done:
     for (size_t k = 0; k < ngroups; k++) s3_response_free(&mout[k]);
     free(cr); free(gfirst); free(gid); free(mreq); free(mout);
     return s3_global_is_aborted() ? S3_ERR_ABORTED : final;
+}
+
+/* ================================================================== */
+/* Asynchronous batched GET (submit / poll / cancel)                   */
+/* ================================================================== */
+
+enum { AB_PENDING = 0, AB_INFLIGHT, AB_DONE, AB_TAKEN, AB_CANCELLED };
+
+struct s3_batch {
+    s3_client   *c;
+    batch_tls_t *bt;        /* submitting thread's pool (thread affinity) */
+    CURLM       *multi;     /* owned: isolates this batch's completions */
+    s3_range_req *reqs;     /* copies; url points into urls[] */
+    char        **urls;
+    batch_slot  *slots;
+    s3_response *res;
+    unsigned char *st;
+    size_t n, next, inflight, term;
+    size_t maxc;
+    s3_status final;
+};
+
+/* Start pending requests up to the concurrency cap. */
+static void async_top_up(s3_batch *b) {
+    while (b->next < b->n && b->inflight < b->maxc) {
+        size_t i = b->next++;
+        if (b->st[i] != AB_PENDING) continue;       /* cancelled before start */
+        s3_status rc = batch_slot_start(b->c, b->bt, b->multi, &b->slots[i],
+                                        &b->reqs[i], b->reqs[i].dst,
+                                        &b->res[i]);
+        if (rc != S3_OK) {                /* request fails terminally */
+            b->st[i] = AB_DONE;
+            b->res[i].status = 0;
+            b->term++;
+            if (b->final == S3_OK) b->final = rc;
+            continue;
+        }
+        b->st[i] = AB_INFLIGHT;
+        b->inflight++;
+    }
+}
+
+/* One perform + harvest pass; returns whether any transfer is running. */
+static int async_pump(s3_batch *b) {
+    async_top_up(b);
+    int running = 0;
+    if (curl_multi_perform(b->multi, &running) != CURLM_OK &&
+        b->final == S3_OK)
+        b->final = S3_ERR_CURL;
+    CURLMsg *m;
+    int inq = 0;
+    while ((m = curl_multi_info_read(b->multi, &inq))) {
+        if (m->msg != CURLMSG_DONE) continue;
+        batch_slot *s = NULL;
+        curl_easy_getinfo(m->easy_handle, CURLINFO_PRIVATE, &s);
+        size_t i = (size_t)(s - b->slots);
+        batch_slot_finish(b->bt, b->multi, s, m->data.result, (ptrdiff_t)i,
+                          &b->res[i], &b->final);
+        b->st[i] = AB_DONE;
+        b->inflight--;
+        b->term++;
+        async_top_up(b);                  /* keep the pipe full */
+    }
+    return running;
+}
+
+s3_status s3_batch_submit(s3_client *c,
+                          const s3_range_req *reqs, size_t n,
+                          size_t max_concurrency,
+                          s3_batch **out) {
+    if (out) *out = NULL;
+    if (!c || !reqs || n == 0 || !out) return S3_ERR_INVALID_ARG;
+    for (size_t i = 0; i < n; i++) {
+        if (!reqs[i].url) return S3_ERR_INVALID_ARG;
+        if (reqs[i].dst && reqs[i].length == 0) return S3_ERR_INVALID_ARG;
+    }
+    if (s3_global_is_aborted()) return S3_ERR_ABORTED;
+    if (max_concurrency == 0) max_concurrency = 16;
+    if (max_concurrency > n)  max_concurrency = n;
+
+    batch_tls_t *bt = thread_batch();
+    if (!bt) return S3_ERR_CURL;
+
+    s3_batch *b = calloc(1, sizeof *b);
+    if (!b) return S3_ERR_OOM;
+    b->c = c; b->bt = bt; b->n = n; b->maxc = max_concurrency;
+    b->reqs  = calloc(n, sizeof *b->reqs);
+    b->urls  = calloc(n, sizeof *b->urls);
+    b->slots = calloc(n, sizeof *b->slots);
+    b->res   = calloc(n, sizeof *b->res);
+    b->st    = calloc(n, 1);
+    b->multi = curl_multi_init();
+    if (!b->reqs || !b->urls || !b->slots || !b->res || !b->st || !b->multi) {
+        s3_batch_free(b);
+        return S3_ERR_OOM;
+    }
+    curl_multi_setopt(b->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                      (long)max_concurrency);
+    /* connections come from / return to the thread share, so they are
+     * reused across batches and with the blocking calls */
+    for (size_t i = 0; i < n; i++) {
+        b->urls[i] = strdup(reqs[i].url);
+        if (!b->urls[i]) { s3_batch_free(b); return S3_ERR_OOM; }
+        b->reqs[i] = reqs[i];
+        b->reqs[i].url = b->urls[i];
+    }
+    async_top_up(b);
+    async_pump(b);                        /* kick the transfers off */
+    *out = b;
+    return S3_OK;
+}
+
+int s3_batch_poll(s3_batch *b, long budget_ms) {
+    if (!b) return -1;
+    if (s3_global_is_aborted()) {
+        for (size_t i = 0; i < b->n; i++) s3_batch_cancel(b, i);
+        if (b->final == S3_OK) b->final = S3_ERR_ABORTED;
+        return (int)b->term;
+    }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        async_pump(b);
+        if (b->term == b->n) break;
+        long elapsed_ms = 0;
+        if (budget_ms >= 0) {
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+                         (t1.tv_nsec - t0.tv_nsec) / 1000000;
+            if (elapsed_ms >= budget_ms) break;
+        }
+        long wait = budget_ms < 0 ? 200 : budget_ms - elapsed_ms;
+        if (wait > 200) wait = 200;
+        curl_multi_poll(b->multi, NULL, 0, (int)wait, NULL);
+        if (s3_global_is_aborted()) break;
+    }
+    return (int)b->term;
+}
+
+bool s3_batch_ready(const s3_batch *b, size_t i) {
+    return b && i < b->n && b->st[i] == AB_DONE;
+}
+
+s3_status s3_batch_take(s3_batch *b, size_t i, s3_response *out) {
+    if (!b || i >= b->n || !out) return S3_ERR_INVALID_ARG;
+    switch (b->st[i]) {
+    case AB_PENDING:
+    case AB_INFLIGHT:  return S3_ERR_BUSY;
+    case AB_CANCELLED: return S3_ERR_ABORTED;
+    case AB_TAKEN:     return S3_ERR_INVALID_ARG;
+    }
+    *out = b->res[i];
+    memset(&b->res[i], 0, sizeof b->res[i]);
+    b->st[i] = AB_TAKEN;
+    return S3_OK;
+}
+
+void s3_batch_cancel(s3_batch *b, size_t i) {
+    if (!b || i >= b->n) return;
+    if (b->st[i] == AB_PENDING) {
+        b->st[i] = AB_CANCELLED;
+        b->term++;
+        return;
+    }
+    if (b->st[i] != AB_INFLIGHT) return;     /* already terminal */
+    batch_slot_abort(b->bt, b->multi, &b->slots[i]);
+    s3_response_free(&b->res[i]);            /* partial headers */
+    b->st[i] = AB_CANCELLED;
+    b->inflight--;
+    b->term++;
+}
+
+s3_status s3_batch_wait(s3_batch *b) {
+    if (!b) return S3_ERR_INVALID_ARG;
+    while (b->term < b->n) {
+        s3_batch_poll(b, 1000);
+        if (s3_global_is_aborted()) {
+            for (size_t i = 0; i < b->n; i++) s3_batch_cancel(b, i);
+            if (b->final == S3_OK) b->final = S3_ERR_ABORTED;
+            break;
+        }
+    }
+    return b->final;
+}
+
+void s3_batch_free(s3_batch *b) {
+    if (!b) return;
+    for (size_t i = 0; i < b->n; i++) {
+        if (b->st && b->st[i] == AB_INFLIGHT)
+            batch_slot_abort(b->bt, b->multi, &b->slots[i]);
+        if (b->res) s3_response_free(&b->res[i]);
+        if (b->urls) free(b->urls[i]);
+    }
+    if (b->multi) curl_multi_cleanup(b->multi);
+    free(b->reqs); free(b->urls); free(b->slots); free(b->res); free(b->st);
+    free(b);
 }
 
 s3_status s3_prewarm(s3_client *c, const char *url, size_t nconn) {
@@ -1827,7 +2099,7 @@ s3_status s3_get_parallel(s3_client *c, const char *url,
 }
 
 s3_status s3_delete(s3_client *c, const char *url, s3_response *resp) {
-    return do_request(c, url, M_DELETE, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, resp);
+    return do_request(c, url, M_DELETE, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, resp);
 }
 
 s3_status s3_copy(s3_client *c, const char *src_url, const char *dst_url,
@@ -1841,7 +2113,7 @@ s3_status s3_copy(s3_client *c, const char *src_url, const char *dst_url,
     s3_url_free(&s);
     struct curl_slist *h = curl_slist_append(NULL, hv);
     free(hv);
-    s3_status rc = do_request(c, dst_url, M_PUT, "", 0, NULL, 0, NULL, NULL, h, NULL, resp);
+    s3_status rc = do_request(c, dst_url, M_PUT, "", 0, NULL, 0, NULL, NULL, h, NULL, NULL, resp);
     curl_slist_free_all(h);
     return rc;
 }
@@ -1870,7 +2142,7 @@ s3_status s3_multipart_create(s3_client *c, const char *url,
     char *u = str_appendf(NULL, "%s?uploads", url);
     s3_response r = {0};
     s3_status rc = do_request(c, u, M_POST, "", 0, NULL, 0, content_type, NULL, NULL,
-                              NULL, &r);
+                              NULL, NULL, &r);
     free(u);
     if (rc != S3_OK) { s3_response_free(&r); return rc; }
 
@@ -1912,7 +2184,7 @@ static s3_status mp_put_part(s3_multipart *m, int pn,
                           m->url, pn, m->upload_id);
     s3_response r = {0};
     s3_status rc = do_request(m->client, u, M_PUT, data, len, fp, fp_size,
-                              NULL, NULL, NULL, NULL, &r);
+                              NULL, NULL, NULL, NULL, NULL, &r);
     free(u);
     if (rc != S3_OK) { s3_response_free(&r); return rc; }
 
@@ -2172,7 +2444,7 @@ s3_status s3_multipart_complete(s3_multipart *m, s3_response *resp) {
 
     char *u = str_appendf(NULL, "%s?uploadId=%s", m->url, m->upload_id);
     s3_status rc = do_request(m->client, u, M_POST, xml, strlen(xml),
-                              NULL, 0, "application/xml", NULL, NULL, NULL, resp);
+                              NULL, 0, "application/xml", NULL, NULL, NULL, NULL, resp);
     free(u);
     free(xml);
     mp_free(m);
@@ -2184,7 +2456,7 @@ s3_status s3_multipart_abort(s3_multipart *m) {
     char *u = str_appendf(NULL, "%s?uploadId=%s", m->url, m->upload_id);
     s3_response r = {0};
     s3_status rc = do_request(m->client, u, M_DELETE, NULL, 0, NULL, 0, NULL, NULL,
-                              NULL, NULL, &r);
+                              NULL, NULL, NULL, &r);
     s3_response_free(&r);
     free(u);
     mp_free(m);
@@ -2258,7 +2530,7 @@ s3_status s3_list_ex(s3_client *c, const char *s3_url_prefix,
     s3_url_free(&u);
 
     s3_response r = {0};
-    s3_status rc = do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, &r);
+    s3_status rc = do_request(c, url, M_GET, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, &r);
     free(url);
     if (rc != S3_OK) { s3_response_free(&r); return rc; }
     if (!r.body) { s3_response_free(&r); return S3_ERR_PARSE; }
