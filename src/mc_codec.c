@@ -8,6 +8,7 @@
 #include <math.h>
 #include "mc_dct.h"          // mc_dct3_fwd / mc_dct3_inv / mc_dct_init
 #include "mc_rangecoder.h"   // enc/dec block coefs + bit coders
+#include "mc_klt_tab.h"      // trained 3D-LFNST secondary transform (Q14)
 
 #define N3 (MC_BLK*MC_BLK*MC_BLK)
 
@@ -31,11 +32,65 @@ void mc_buf_put(mc_buf *b, const void *s, size_t n){
 
 // frozen quant: dead-zone, step = quality*(1+L1freq)^MC_HF_EXP
 static inline float hf_weight(int cz,int cy,int cx){ return powf(1.0f+(float)(cz+cy+cx), MC_HF_EXP); }
+// ---- 3D-LFNST secondary transform (AV2 IST / VVC LFNST analog) -------------
+// A trained KLT over the 4x4x4 low-band DCT corner, applied between the DCT
+// and quantization; the decoder applies the transpose after dequantization.
+// Corner outputs are eigenvalue-ordered; their quant steps reuse the corner's
+// own band-weight profile sorted ascending (finest step on the strongest
+// component), so total bit allocation matches the primary path.
+// MEASURED NEUTRAL on scroll data (identical ratio/PSNR, max error -1..-5):
+// the 3D DCT already decorrelates this texture; LFNST pays in video because
+// directional intra-prediction residuals leave structure the DCT misses,
+// which we don't have. Kept (off) with the trained table + mc_klt for
+// future data regimes.
+#define MC_LFNST 0
+static int   g_klt_pos[64];          // corner raster positions, (L1, raster) order
+static float g_klt_w[64];            // sorted corner hf weights (ascending)
+static int   g_klt_ready=0;
+static void klt_build(void){
+    if(g_klt_ready) return;
+    int n=0;
+    for(int b=0;b<=9;++b)
+        for(int cz=0;cz<4;++cz)for(int cy=0;cy<4;++cy)for(int cx=0;cx<4;++cx)
+            if(cz+cy+cx==b) g_klt_pos[n++]=(cz*MC_BLK+cy)*MC_BLK+cx;
+    for(int i=0;i<64;++i){
+        int p=g_klt_pos[i];
+        g_klt_w[i]=hf_weight(p>>8,(p>>4)&15,p&15);
+    }
+    for(int i=0;i<64;++i)for(int j=i+1;j<64;++j)
+        if(g_klt_w[j]<g_klt_w[i]){ float t=g_klt_w[i]; g_klt_w[i]=g_klt_w[j]; g_klt_w[j]=t; }
+    g_klt_ready=1;
+}
+static void klt_fwd(float *coef){
+    float v[64], o[64];
+    for(int i=0;i<64;++i) v[i]=coef[g_klt_pos[i]];
+    for(int i=0;i<64;++i){
+        float a=0;
+        for(int j=0;j<64;++j) a+=(float)MC_KLT[i][j]*v[j];
+        o[i]=a*(1.0f/16384.0f);
+    }
+    for(int i=0;i<64;++i) coef[g_klt_pos[i]]=o[i];
+}
+static void klt_inv(float *coef){
+    float v[64], o[64];
+    for(int i=0;i<64;++i) v[i]=coef[g_klt_pos[i]];
+    for(int j=0;j<64;++j){
+        float a=0;
+        for(int i=0;i<64;++i) a+=(float)MC_KLT[i][j]*v[i];   // transpose
+        o[j]=a*(1.0f/16384.0f);
+    }
+    for(int i=0;i<64;++i) coef[g_klt_pos[i]]=o[i];
+}
+
 static void step_tab_build(void){
     rc_prior_build(g_quality);
     if(g_step_q==g_quality) return;
+    klt_build();
     for(int cz=0;cz<MC_BLK;++cz)for(int cy=0;cy<MC_BLK;++cy)for(int cx=0;cx<MC_BLK;++cx)
         g_step_tab[(cz*MC_BLK+cy)*MC_BLK+cx]=g_quality*hf_weight(cz,cy,cx);
+#if MC_LFNST
+    for(int i=0;i<64;++i) g_step_tab[g_klt_pos[i]]=g_quality*g_klt_w[i];
+#endif
     g_step_q=g_quality;
 }
 static inline mc_i32 quant_one(float c, float step){
@@ -295,6 +350,9 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
         }
     }
     mc_dct3_fwd(blk,coef);
+#if MC_LFNST
+    step_tab_build(); klt_fwd(coef);
+#endif
 #if MC_RDOQ
     rdoq_init();
 #endif
@@ -335,6 +393,9 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     if(g_max_err>0){
         static _Thread_local float rcoef[N3], rblk[N3];
         for(int idx=0;idx<N3;++idx) rcoef[idx]=deq_one(ql[idx],g_step_tab[idx]*qs);
+#if MC_LFNST
+        klt_inv(rcoef);
+#endif
         mc_dct3_inv(rcoef,rblk);
         for(int i=0;i<n;++i){
             if(!vox[i]) continue;                          // air decodes to exactly 0
@@ -402,6 +463,9 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
     }
     (void)ey;(void)ex;
     for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],g_step_tab[idx]*qs);
+#if MC_LFNST
+    klt_inv(coef);
+#endif
     mc_dct3_inv(coef,blk);
     for(int i=0;i<n;++i){
         int v = air[i] ? 0 : (int)lrintf(blk[i])+dc;  // mask-restore: air -> exactly 0

@@ -141,8 +141,10 @@ a future interleaved-rANS magnitude stage here.
 
 Ranked by impact/complexity for this codec (AV2 paper arXiv:2601.02712 was the
 key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
-1. 3D LFNST/IST-style trained secondary transform on the low-band corner
-   (dense trained matvec, 64→32, always-on first). Est 1–3% ratio.
+1. 3D LFNST/IST secondary transform — IMPLEMENTED + MEASURED NEUTRAL (ratio
+   and PSNR identical, max error marginally better; eigen-spread 1000:1 but
+   the band-weighted quantizer already exploits that profile). Disabled;
+   trained table + tools/mc_klt kept for future regimes.
 2. PARA per-context adaptation-rate tuning — IMPLEMENTED (per-context shift in
    ctx_t, per-class table). Coordinate descent on the corpus found shift 4
    already optimal for every class (the earlier global 5→4 change captured the

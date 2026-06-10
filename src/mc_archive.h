@@ -57,7 +57,7 @@
 #define MC_HDR      256u            // header size; metadata region begins here
 #define MC_META_END (128u*1024u)    // archive data begins at this offset (128KB)
 #define MC_META_CAP (MC_META_END - MC_HDR)
-#define MC_VERSION  3u              // format version (v3: group-pass coefficient coding)
+#define MC_VERSION  4u              // format version (v4: header bins in-stream, subcube mask)
 
 #define MC_CHUNK_ALIGN 256          // volume dim must be a multiple of this
 
