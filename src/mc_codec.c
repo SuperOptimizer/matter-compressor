@@ -161,6 +161,72 @@ static inline mc_i32 rdoq_level(float a, float step, int b, mc_i32 m){
     return best;
 }
 
+// ---- TCQ: VVC-style dependent (trellis-coded) quantization -----------------
+// Two quantizers on the half-step lattice — Q0 recon = k*step, Q1 recon =
+// (k-0.5)*step (k>=1) — switched by a 4-state machine driven by level parity.
+// The admissible reconstruction set packs denser than a scalar quantizer
+// (vector-quantization-like gain) at zero decoder cost beyond state tracking.
+// Encoder runs a small Viterbi per block over the scan.
+#define MC_TCQ 0   // MEASURED: lands 3-8% below the dead-zone RD curve at every
+                   // lambda (0.08-0.2) — same failure mode as RDOQ: the lattice
+                   // gain assumes dense high-rate coefficients; ours are sparse
+                   // and sig-flag-dominated. Kept for reference.
+#define MC_TCQ_LAMBDA 0.12f
+static const uint8_t TCQ_NEXT[4][2]={{0,2},{2,0},{1,3},{3,1}};   // [state][lvl&1]
+static inline int   tcq_useq1(int s){ return s>=2; }
+static inline float tcq_recon(int lvl,int useq1,float step){
+    if(!lvl) return 0.0f;
+    float a=(float)(lvl<0?-lvl:lvl);
+    float r=useq1? (a-0.5f)*step : a*step;
+    return lvl<0?-r:r;
+}
+static void tcq_quantize(const float *coef, const uint16_t *scan, int n, mc_i32 *lv, float qs){
+    rdoq_init();
+    static _Thread_local int16_t cand_lv[16*16*16][4];
+    static _Thread_local uint8_t bp[16*16*16][4];
+    float J[4]={0,1e30f,1e30f,1e30f}, Jn[4];
+    for(int p=0;p<n;++p){
+        int idx=scan[p];
+        int cz=idx>>8, cy=(idx>>4)&15, cx=idx&15;
+        int b=(cz+cy+cx)*NB_BANDS/(3*MC_BLK); if(b>=NB_BANDS)b=NB_BANDS-1;
+        float step=g_step_tab[idx]*qs;
+        float lam=MC_TCQ_LAMBDA*step*step;
+        float a=fabsf(coef[idx]);
+        for(int s=0;s<4;++s) Jn[s]=1e30f;
+        for(int s=0;s<4;++s){
+            if(J[s]>=1e29f) continue;
+            int q1=tcq_useq1(s);
+            int k = q1 ? (int)(a/step+1.0f) : (int)(a/step+0.5f);
+            if(k<0)k=0;
+            int cands[3]={0,k,k+1};
+            for(int ci=0;ci<3;++ci){
+                int lvl=cands[ci]; if(ci&&lvl==0) continue;
+                float rec=tcq_recon(lvl,q1,step), d=a-rec;
+                float R = lvl? g_rd_sig1[b]+g_rd_mag[lvl<=65?lvl:65] : g_rd_sig0[b];
+                float Jc=J[s]+d*d+lam*R;
+                int ns=TCQ_NEXT[s][lvl&1];
+                if(Jc<Jn[ns]){ Jn[ns]=Jc; bp[p][ns]=(uint8_t)s; cand_lv[p][ns]=(int16_t)lvl; }
+            }
+        }
+        for(int s=0;s<4;++s) J[s]=Jn[s];
+    }
+    int s=0; for(int k2=1;k2<4;++k2) if(J[k2]<J[s]) s=k2;
+    for(int p=n-1;p>=0;--p){
+        int lvl=cand_lv[p][s];
+        int idx=scan[p];
+        lv[idx]= coef[idx]<0 ? -lvl : lvl;
+        s=bp[p][s];
+    }
+}
+static void tcq_dequant(const rc_i16 *ql, const uint16_t *scan, int n, float *coef, float qs){
+    int s=0;
+    for(int p=0;p<n;++p){
+        int idx=scan[p]; int lvl=ql[idx];
+        coef[idx]=tcq_recon(lvl,tcq_useq1(s),g_step_tab[idx]*qs);
+        s=TCQ_NEXT[s][lvl&1];
+    }
+}
+
 // block-mask surface coder: 3-neighbor (z-1,y-1,x-1) context bit coder over the
 // block's 16^3 air mask (air = vox==0). Out-of-block neighbors read as 0. Codes
 // into the block's single range-coder stream (shared with the coefficients).
@@ -370,6 +436,9 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
 #endif
     const float qp_scale[4]={1.0f,1.4f,1.0f,0.71f};
     float qs=qp_scale[qpd];
+#if MC_TCQ
+    { scanS_build(MC_BLK); tcq_quantize(coef,g_scanS[4],N3,lv,qs); }
+#else
     for(int cz=0;cz<MC_BLK;++cz)for(int cy=0;cy<MC_BLK;++cy)for(int cx=0;cx<MC_BLK;++cx){
         int idx=(cz*MC_BLK+cy)*MC_BLK+cx; float step=g_step_tab[idx]*qs;
         mc_i32 m=quant_one(coef[idx],step);
@@ -383,6 +452,7 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
 #endif
         lv[idx]=m;
     }
+#endif
     static _Thread_local rc_i16 ql[N3];
     static _Thread_local rc_u8 scratch[N3*4+1024];
     for(int i=0;i<n;++i){ mc_i32 v=lv[i]; ql[i]=(rc_i16)(v>32767?32767:v<-32768?-32768:v); }
@@ -392,7 +462,11 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     int ncorr=0;
     if(g_max_err>0){
         static _Thread_local float rcoef[N3], rblk[N3];
+#if MC_TCQ
+        { scanS_build(MC_BLK); tcq_dequant(ql,g_scanS[4],N3,rcoef,qs); }
+#else
         for(int idx=0;idx<N3;++idx) rcoef[idx]=deq_one(ql[idx],g_step_tab[idx]*qs);
+#endif
 #if MC_LFNST
         klt_inv(rcoef);
 #endif
@@ -462,7 +536,11 @@ void mc_dec_block(const mc_u8 *p, uint32_t plen, mc_u8 *dst){
         memset(dst,(mc_u8)dc,n); return;
     }
     (void)ey;(void)ex;
+#if MC_TCQ
+    { scanS_build(MC_BLK); tcq_dequant(ql,g_scanS[4],N3,coef,qs); }
+#else
     for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],g_step_tab[idx]*qs);
+#endif
 #if MC_LFNST
     klt_inv(coef);
 #endif

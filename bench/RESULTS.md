@@ -160,8 +160,12 @@ key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
    symbols in the alphabet (cuts symbol count 5-10x -> real decode win) or
    per-chunk shared rANS streams (amortized states, breaks block independence).
    Trainer (tools/mc_rans_tab.c) + tables (src/mc_rans_tab.h) kept.
-4. TCQ trellis quantization (parity-driven 4–9 state lattice; distinct
-   mechanism from the rejected RDOQ). Decoder ~free, encoder Viterbi.
+4. TCQ trellis quantization — IMPLEMENTED + MEASURED, REJECTED: 4-state
+   VVC-style dependent quant (Viterbi encoder, parity-tracked half-step
+   lattice decode) lands 3–8% below the dead-zone RD curve at every lambda
+   (0.08–0.2). Same failure mode as RDOQ: lattice-packing gains assume dense
+   high-rate coefficients; scroll blocks are sparse and sig-flag-dominated.
+   Code kept behind MC_TCQ=0.
 5. HPEZ-style per-chunk parameter auto-tuning by sampling (encode-only).
 6. Cache: S3-FIFO eviction beats LRU/CLOCK on scan-shaped render workloads
    (SOSP'23: 6× LRU throughput @16T, mean 14% miss cut); SIEVE explicitly NOT
