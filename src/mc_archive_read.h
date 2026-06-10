@@ -35,26 +35,22 @@ static uint64_t mc_resolve_chunk(const uint8_t*arc, uint64_t root_off,int cz,int
     return node;   // chunk-blob offset (0 if absent)
 }
 
-// chunk blob: [u32 masklen][mask][512B block-bitmap][present u32 lens][payloads].
-static const uint8_t* mc_chunk_mask(const uint8_t*arc, uint64_t chunk_off, uint32_t *mlen){
-    uint32_t ml; memcpy(&ml, arc+chunk_off, 4); *mlen=ml;
-    return ml ? arc+chunk_off+4 : 0;
-}
+// chunk blob (v2): [512B block-bitmap][present u16 lens][payloads]. Blocks are
+// self-contained (each mixed block carries its own air mask in its payload).
 // block (bz,by,bx) present? -> 1 + its payload (abs_off, len). 0 = ZERO block. Offsets
 // are implicit (cumulative len of present blocks before it); ZERO blocks cost 1 bitmap bit.
 static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,int bx,
                           uint64_t *abs_off, uint32_t *len){
-    uint32_t ml; memcpy(&ml, arc+chunk_off, 4);
-    uint64_t bm_off = chunk_off + 4 + ml;
+    uint64_t bm_off = chunk_off;
     const uint8_t*bm = arc + bm_off;
     int bi=(bz*16+by)*16+bx;
     if(!mc_bit_get(bm,bi)) return 0;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
     const uint8_t*lens = arc + bm_off + MC_BITMAP_BYTES;
-    uint64_t pay_base = bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*4;
+    uint64_t pay_base = bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*2;
     int slot = mc_rank(bm,bi);
-    uint64_t cum=0; for(int s=0;s<slot;++s){ uint32_t l; memcpy(&l,lens+(size_t)s*4,4); cum+=l; }
-    uint32_t mylen; memcpy(&mylen, lens+(size_t)slot*4, 4);
+    uint64_t cum=0; for(int s=0;s<slot;++s){ uint16_t l; memcpy(&l,lens+(size_t)s*2,2); cum+=l; }
+    uint16_t mylen; memcpy(&mylen, lens+(size_t)slot*2, 2);
     *abs_off = pay_base + cum; *len = mylen;
     return 1;
 }
@@ -62,12 +58,11 @@ static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,i
 // total byte length of a chunk blob — used to copy a whole compressed chunk verbatim
 // (mc_append_chunk_compressed) and for chunk-blob range queries. chunk_off must be valid.
 static uint64_t mc_chunk_blob_len(const uint8_t*arc, uint64_t chunk_off){
-    uint32_t ml; memcpy(&ml, arc+chunk_off, 4);
-    uint64_t bm_off = chunk_off + 4 + ml;
+    uint64_t bm_off = chunk_off;
     const uint8_t*bm = arc + bm_off;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
     const uint8_t*lens = arc + bm_off + MC_BITMAP_BYTES;
-    uint64_t paybytes=0; for(int s=0;s<npresent;++s){ uint32_t l; memcpy(&l,lens+(size_t)s*4,4); paybytes+=l; }
-    return bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*4 + paybytes - chunk_off;
+    uint64_t paybytes=0; for(int s=0;s<npresent;++s){ uint16_t l; memcpy(&l,lens+(size_t)s*2,2); paybytes+=l; }
+    return bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*2 + paybytes - chunk_off;
 }
 #endif

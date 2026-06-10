@@ -65,37 +65,25 @@ static int gather_blk256(const u8 *chunk,int bz,int by,int bx,u8 *dst){
 // Encode one dense 256^3 chunk buffer into a compressed blob in `out` (a growable
 // byte sink: out_put(out, ptr, n)). Returns the blob length, or 0 if the chunk is all
 // air (no blob — caller leaves the slot absent). Shared by build + writer.
-// blob = [u32 masklen][mask][512B block-bitmap][present-block u32 lens][block payloads].
+// blob (v2) = [512B block-bitmap][present-block u16 lens][block payloads]; blocks are
+// self-contained (mask in payload).
 typedef void (*out_put_fn)(void *out, const void *s, size_t n);
 
 static size_t encode_chunk_blob(const u8 *chunk256, out_put_fn put, void *out){
-    // air mask: air=1 where voxel==0.
-    static _Thread_local u8 *cmask=0;
-    if(!cmask) cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-    int anyvox=0;
-    for(size_t i=0;i<(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK;++i){ u8 v=chunk256[i]; cmask[i]=v?0:1; anyvox|=v; }
-    if(!anyvox) return 0;   // all air -> no blob
-
     static _Thread_local mc_buf tmp; tmp.len=0;
     uint8_t bm[MC_BITMAP_BYTES]; memset(bm,0,sizeof bm);
-    uint32_t blen[MC_GRID3]; int npresent=0;
-    static _Thread_local u8 vox[MC_BLK*MC_BLK*MC_BLK], rair[MC_BLK*MC_BLK*MC_BLK];
+    uint16_t blen[MC_GRID3]; int npresent=0;
+    static _Thread_local u8 vox[MC_BLK*MC_BLK*MC_BLK];
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         int bi=(bz*16+by)*16+bx;
         if(!gather_blk256(chunk256,bz,by,bx,vox)) continue;
-        for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)for(int x=0;x<MC_BLK;++x){
-            size_t ci=((size_t)(bz*MC_BLK+z)*MC_CHUNK+(by*MC_BLK+y))*MC_CHUNK+(bx*MC_BLK+x);
-            rair[(z*MC_BLK+y)*MC_BLK+x]=cmask[ci];
-        }
-        uint32_t len=0; if(mc_enc_block(vox,rair,&tmp,&len)){ mc_bit_set(bm,bi); blen[bi]=len; npresent++; }
+        uint32_t len=0; if(mc_enc_block(vox,&tmp,&len)){ mc_bit_set(bm,bi); blen[bi]=(uint16_t)len; npresent++; }
     }
-    static _Thread_local mc_u8 *mbuf=0; if(!mbuf) mbuf=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK/4+1024);
-    uint32_t mlen=mc_enc_chunkmask(cmask,mbuf,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK/4+1024);
-    size_t total=4+mlen+MC_BITMAP_BYTES+(size_t)npresent*4+tmp.len;
-    put(out,&mlen,4); put(out,mbuf,mlen);
+    if(!npresent) return 0;   // all air -> no blob
+    size_t total=MC_BITMAP_BYTES+(size_t)npresent*2+tmp.len;
     put(out,bm,MC_BITMAP_BYTES);
-    for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(bm,bi)) put(out,&blen[bi],4);
-    if(npresent) put(out,tmp.p,tmp.len);
+    for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(bm,bi)) put(out,&blen[bi],2);
+    put(out,tmp.p,tmp.len);
     return total;
 }
 
@@ -410,28 +398,16 @@ uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
 
 // Decode one 16^3 block from the live mmap. LOCK-FREE: the codec's per-call scratch is
 // all _Thread_local and g_quality is constant for the archive's lifetime (set once at
-// open), so concurrent decodes are safe without serialization. A THREAD-LOCAL 256^3 air
-// mask is cached + keyed on chunk_off so iterating a chunk's 4096 blocks decodes the mask
-// once per thread. The mmap is read-only here; appends publish via a release fence so a
-// resolved chunk_off always points at fully-written bytes.
+// open), so concurrent decodes are safe without serialization. Blocks are fully
+// self-contained (v2: per-block air mask in the payload), so a single block decode
+// touches only the bitmap + its own payload. The mmap is read-only here; appends
+// publish via a release fence so a resolved chunk_off always points at fully-written
+// bytes.
 void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
     if(!a||!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    static _Thread_local mc_u8 *tl_cmask=0;
-    static _Thread_local uint64_t tl_cmask_key=~0ull;
-    if(!tl_cmask) tl_cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-    if(tl_cmask_key!=chunk_off){
-        uint32_t cml; const u8 *cmb=mc_chunk_mask(a->base,chunk_off,&cml);
-        if(cmb) mc_dec_chunkmask(cmb,cml,tl_cmask); else memset(tl_cmask,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-        tl_cmask_key=chunk_off;
-    }
-    static _Thread_local mc_u8 rair[MC_BLK*MC_BLK*MC_BLK];
-    for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)for(int x=0;x<MC_BLK;++x){
-        size_t ci=((size_t)(bz*MC_BLK+z)*MC_CHUNK+(by*MC_BLK+y))*MC_CHUNK+(bx*MC_BLK+x);
-        rair[(z*MC_BLK+y)*MC_BLK+x]=tl_cmask[ci];
-    }
     uint64_t boff; uint32_t bl;
     if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    mc_dec_block(a->base+boff,rair,dst);
+    mc_dec_block(a->base+boff,bl,dst);
 }
 
 void mc_archive_close(mc_archive *a){
@@ -472,14 +448,17 @@ struct mc_reader {
     size_t len;
     uint64_t roots[8];
     mc_read_fn read; void *read_ud;   // streaming mode
-    u8 *cmask; uint64_t cmask_key;
     // streaming scratch: a fetched window of the current chunk blob.
     u8 *cbuf; uint64_t cbuf_off; uint64_t cbuf_len;
+    // partial-fetch mode: per-chunk header cache (bitmap + lens) + one payload.
+    int partial;
+    u8 hdr[MC_BITMAP_BYTES + MC_GRID3*2]; uint64_t hdr_off; int hdr_np;
+    u8 *pbuf; size_t pbuf_cap;
 };
 
 mc_reader *mc_open(const uint8_t *arc, size_t len){
     mc_codec_init();
-    mc_reader *r=calloc(1,sizeof *r); r->arc=arc; r->len=len; r->cmask_key=~0ull;
+    mc_reader *r=calloc(1,sizeof *r); r->arc=arc; r->len=len;
     for(int l=0;l<8;++l) memcpy(&r->roots[l], arc+MCH_ROOTOFF+l*8, 8);
     return r;
 }
@@ -491,7 +470,7 @@ static int sread(mc_reader *r, uint64_t off, uint32_t len, u8 *dst){
 
 mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len){
     mc_codec_init();
-    mc_reader *r=calloc(1,sizeof *r); r->read=read; r->read_ud=ud; r->len=(size_t)total_len; r->cmask_key=~0ull;
+    mc_reader *r=calloc(1,sizeof *r); r->read=read; r->read_ud=ud; r->len=(size_t)total_len;
     u8 hdr[MC_HDR];
     if(read(ud,0,MC_HDR,hdr)!=0){ free(r); return NULL; }
     uint32_t magic; memcpy(&magic,hdr+MCH_MAGIC,4);
@@ -500,7 +479,12 @@ mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len){
     return r;
 }
 
-void mc_close(mc_reader *r){ if(!r)return; free(r->cmask); free(r->cbuf); free(r); }
+void mc_close(mc_reader *r){ if(!r)return; free(r->cbuf); free(r->pbuf); free(r); }
+// Partial-fetch mode (streaming readers only): decode a block by fetching just
+// the chunk's bitmap+length table (cached per chunk, <=8.7KB) plus that block's
+// own payload, instead of the whole chunk blob. Wins cold random-access latency
+// over high-latency byte sources (S3); leave OFF when scanning whole chunks.
+void mc_reader_set_partial_fetch(mc_reader *r, int on){ if(r){ r->partial=on; r->hdr_off=~0ull; } }
 void mc_reader_set_quality(mc_reader *r, float q){ (void)r; mc_set_quality(q); }
 
 // streaming chunk-offset resolve: pull node tables on demand (each is MC_NODE_BYTES).
@@ -526,27 +510,48 @@ uint64_t mc_chunk_offset(mc_reader *r,int lod,int cz,int cy,int cx){
 // streaming: ensure the whole chunk blob at chunk_off is cached in r->cbuf, return ptr.
 static const u8 *sfetch_chunk(mc_reader *r, uint64_t chunk_off){
     if(r->cbuf && r->cbuf_off==chunk_off) return r->cbuf;
-    // read the header words to size the blob, then fetch the whole blob in one GET.
-    u8 head[4]; if(sread(r,chunk_off,4,head)!=0) return NULL;
-    uint32_t ml; memcpy(&ml,head,4);
-    // fetch mask + bitmap to compute total length, then the full blob.
-    uint64_t bm_off = chunk_off + 4 + ml;
+    // fetch the bitmap + lens to compute total length, then the full blob in one GET.
+    uint64_t bm_off = chunk_off;
     u8 bm[MC_BITMAP_BYTES];
     if(sread(r,bm_off,MC_BITMAP_BYTES,bm)!=0) return NULL;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
-    u8 *lens=malloc((size_t)npresent*4);
-    if(npresent && sread(r,bm_off+MC_BITMAP_BYTES,(uint32_t)(npresent*4),lens)!=0){ free(lens); return NULL; }
-    uint64_t paybytes=0; for(int s=0;s<npresent;++s){ uint32_t l; memcpy(&l,lens+(size_t)s*4,4); paybytes+=l; }
+    u8 *lens=malloc((size_t)npresent*2);
+    if(npresent && sread(r,bm_off+MC_BITMAP_BYTES,(uint32_t)(npresent*2),lens)!=0){ free(lens); return NULL; }
+    uint64_t paybytes=0; for(int s=0;s<npresent;++s){ uint16_t l; memcpy(&l,lens+(size_t)s*2,2); paybytes+=l; }
     free(lens);
-    uint64_t total = (bm_off+MC_BITMAP_BYTES+(uint64_t)npresent*4+paybytes) - chunk_off;
+    uint64_t total = (bm_off+MC_BITMAP_BYTES+(uint64_t)npresent*2+paybytes) - chunk_off;
     r->cbuf = realloc(r->cbuf, total);
     if(sread(r,chunk_off,(uint32_t)total,r->cbuf)!=0) return NULL;
     r->cbuf_off=chunk_off; r->cbuf_len=total;
     return r->cbuf;
 }
 
+// partial-fetch path: header cache + single-payload range read.
+static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst){
+    if(r->hdr_off!=chunk_off){
+        if(sread(r,chunk_off,MC_BITMAP_BYTES,r->hdr)!=0) return -1;
+        int np=0; for(int i=0;i<MC_BITMAP_BYTES;++i) np+=__builtin_popcount(r->hdr[i]);
+        if(np && sread(r,chunk_off+MC_BITMAP_BYTES,(uint32_t)(np*2),r->hdr+MC_BITMAP_BYTES)!=0) return -1;
+        r->hdr_np=np; r->hdr_off=chunk_off;
+    }
+    if(!mc_bit_get(r->hdr,bi)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return 0; }
+    int slot=mc_rank(r->hdr,bi);
+    const u8 *lens=r->hdr+MC_BITMAP_BYTES;
+    uint64_t cum=0; for(int s2=0;s2<slot;++s2){ uint16_t l; memcpy(&l,lens+(size_t)s2*2,2); cum+=l; }
+    uint16_t mylen; memcpy(&mylen,lens+(size_t)slot*2,2);
+    uint64_t pay=chunk_off+MC_BITMAP_BYTES+(uint64_t)r->hdr_np*2+cum;
+    if(r->pbuf_cap<mylen){ r->pbuf=realloc(r->pbuf,mylen); r->pbuf_cap=mylen; }
+    if(sread(r,pay,mylen,r->pbuf)!=0) return -1;
+    mc_dec_block(r->pbuf,mylen,dst);
+    return 0;
+}
+
 void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
     if(!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    if(!r->arc && r->partial){
+        if(spartial_decode(r,chunk_off,(bz*16+by)*16+bx,dst)==0) return;
+        memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return;
+    }
     // resolve the chunk-blob base pointer (flat mmap or streamed window).
     const u8 *blob_base;       // points at the chunk blob start
     uint64_t blob_origin;      // absolute archive offset of that blob start
@@ -558,18 +563,7 @@ void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_
         blob_origin = 0;
     }
     (void)blob_origin;
-    if(r->cmask_key!=chunk_off){
-        if(!r->cmask) r->cmask=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-        uint32_t cml; const u8 *cmb=mc_chunk_mask(blob_base,chunk_off,&cml);
-        if(cmb) mc_dec_chunkmask(cmb,cml,r->cmask); else memset(r->cmask,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
-        r->cmask_key=chunk_off;
-    }
-    static _Thread_local mc_u8 rair[MC_BLK*MC_BLK*MC_BLK];
-    for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)for(int x=0;x<MC_BLK;++x){
-        size_t ci=((size_t)(bz*MC_BLK+z)*MC_CHUNK+(by*MC_BLK+y))*MC_CHUNK+(bx*MC_BLK+x);
-        rair[(z*MC_BLK+y)*MC_BLK+x]=r->cmask[ci];
-    }
     uint64_t boff; uint32_t blen;
     if(!mc_block_range(blob_base,chunk_off,bz,by,bx,&boff,&blen)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    mc_dec_block(blob_base+boff,rair,dst);
+    mc_dec_block(blob_base+boff,blen,dst);
 }

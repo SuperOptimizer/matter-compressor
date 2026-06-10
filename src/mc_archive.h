@@ -20,8 +20,10 @@
 // published LAST as the commit word. The file is a fully valid, decodable archive
 // after every appended chunk and PERSISTS across process runs (reopen + append).
 //
-// CHUNK blob = [u32 masklen][mask][512B block-bitmap][present-block u32 lens]
-// [block payloads]; one range-GET fetches a whole chunk.
+// CHUNK blob (v2) = [512B block-bitmap][present-block u32 lens][block payloads];
+// one range-GET fetches a whole chunk. Blocks are self-contained (per-block air
+// mask lives in each block payload), so one block decode needs only the bitmap,
+// the lens, and its own payload.
 //
 // LAYOUT: [256B header][metadata region up to 128KB][archive data from 128KB:
 //          node/shard tables + chunk blobs, both appended at EOF].
@@ -55,7 +57,7 @@
 #define MC_HDR      256u            // header size; metadata region begins here
 #define MC_META_END (128u*1024u)    // archive data begins at this offset (128KB)
 #define MC_META_CAP (MC_META_END - MC_HDR)
-#define MC_VERSION  1u              // matter-compressor format version (appendable dense-node)
+#define MC_VERSION  3u              // format version (v3: group-pass coefficient coding)
 
 #define MC_CHUNK_ALIGN 256          // volume dim must be a multiple of this
 

@@ -98,6 +98,13 @@ typedef int (*mc_read_fn)(void *ud, uint64_t off, uint32_t len, uint8_t *dst);
 // identical to mc_open on the same bytes. The callback must outlive the handle.
 mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len);
 
+// Partial-fetch mode (streaming readers only): mc_decode_block fetches just the
+// chunk's bitmap+length table (cached per chunk, <=8.7KB) and the block's own
+// payload (typically <100B) instead of the whole chunk blob — far lower cold
+// random-access cost over S3-like sources. Leave OFF for full-chunk scans
+// (whole-blob fetch amortizes better).
+void mc_reader_set_partial_fetch(mc_reader *r, int on);
+
 // metadata region (pointer into arc; not owned). *out_len = bytes stored.
 const char *mc_metadata(const uint8_t *arc, size_t *out_len);
 
