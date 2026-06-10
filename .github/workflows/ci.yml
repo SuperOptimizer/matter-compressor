@@ -20,7 +20,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: deterministic archive digest
         run: |
-          cc -O3 -ffast-math ${{ matrix.cflags }} -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
+          cc -O3 ${{ matrix.cflags }} -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
           mkdir -p digest && ./detarc | tee digest/${{ matrix.os }}.txt
       - uses: actions/upload-artifact@v4
         with: { name: "digest-${{ matrix.os }}", path: digest/ }

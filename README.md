@@ -124,8 +124,9 @@ cmake -B build -S . && cmake --build build && ctest --test-dir build
 ```
 
 Clang strongly recommended (GCC measured −28 % encode). For fleet builds,
-ThinLTO+PGO adds ~5–7 % decode — **never enable LTO without profiles** (it
-measures ~15 % slower):
+ThinLTO+PGO adds ~5–7 % decode — **never enable LTO without profiles** (~15 % slower) and **never add
+-ffast-math** (breaks cross-ISA bitstream identity, zero speedup — hot paths
+are integer):
 
 ```sh
 cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=cmake/homebrew-llvm.cmake -DMC_PGO_GEN=ON

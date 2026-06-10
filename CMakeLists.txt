@@ -17,18 +17,18 @@ endif()
 # Only set fast/native flags + tests when built standalone. When vendored, the parent
 # owns the build type/flags and may build shared libs (so we force PIC below).
 if(MC_STANDALONE)
-  set(CMAKE_C_FLAGS_RELEASE "-O3 -ffast-math")
+  set(CMAKE_C_FLAGS_RELEASE "-O3")
   add_compile_options(-Wall -Wno-stringop-overflow)
   if(NOT DEFINED MC_NO_NATIVE)
     add_compile_options(-march=native)
   endif()
 endif()
 
-# DETERMINISM FLOOR: archives are byte-identical across targets WITH FMA
-# (aarch64 NEON, x86-64-v3+ AVX2) — the project's actual fleet. Pre-FMA x86
-# (baseline SSE2) rounds fp-contracted float expressions in the encoder's
-# air-fill differently and produces equally-valid but non-identical
-# bitstreams. Build x86 at -march=x86-64-v3 or newer.
+# DETERMINISM: archives are byte-identical across ISAs (CI-enforced) because
+# the build is strict-IEEE — do NOT add -ffast-math: it licenses per-target
+# reassociation/reciprocal tricks in the encoder's float air-fill and breaks
+# bitstream identity, while buying zero measured performance (hot paths are
+# integer by design; the fill vectorizes fine under strict semantics).
 
 # Optional ThinLTO + PGO. MEASURED POLICY (bench/RESULTS.md): LTO of either
 # flavor WITHOUT profiles costs ~15% decode (link-time inliner mispredicts the
@@ -64,11 +64,11 @@ set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
 target_link_libraries(matter_compressor m Threads::Threads)
 
-# The codec is the hot path; build it -O3 -ffast-math -march=native regardless of
+# The codec is the hot path; build it -O3 -march=native regardless of
 # how a parent project (vendoring via add_subdirectory) sets global flags. The
 # MC_STANDALONE block above already does this for standalone builds; this target-
 # scoped copy guarantees it when vendored too. -DMC_NO_NATIVE=ON for portable builds.
-target_compile_options(matter_compressor PRIVATE -O3 -ffast-math -Wno-stringop-overflow)
+target_compile_options(matter_compressor PRIVATE -O3 -Wno-stringop-overflow)
 if(NOT MC_NO_NATIVE)
   include(CheckCCompilerFlag)
   check_c_compiler_flag(-march=native MC_HAS_MARCH_NATIVE)

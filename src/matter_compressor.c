@@ -950,6 +950,14 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     // 1126163 -> 1126019 bytes (-0.013%), material max-abs-diff unchanged
     // (41), air voxels still decode to exactly 0.
     if(nair>0){
+        // CROSS-ISA DETERMINISM: the floats computed here feed the DCT, so
+        // they must round identically on every target. The build is strict
+        // IEEE (no -ffast-math — see CMakeLists); under fast-math the
+        // per-target reassociation/reciprocal choices in these loops broke
+        // bitstream identity (caught by CI), for zero measured speedup.
+#if defined(__clang__)
+#pragma clang fp reassociate(off) contract(off)
+#endif
         const int S=MC_BLK;
         // (b) skip the fine SOR sweeps on nearly-pure blocks (<5% or >95% air):
         // the coarse 4^3 seed already lands within quantization noise there
