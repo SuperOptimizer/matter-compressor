@@ -149,8 +149,17 @@ key source; AV2 transform+entropy tools total −7.1% BD-rate all-intra):
    ctx_t, per-class table). Coordinate descent on the corpus found shift 4
    already optimal for every class (the earlier global 5→4 change captured the
    gain); the infrastructure stays for future corpora.
-3. ATC-style split entropy: adaptive bins on the LF corner + static rANS on
-   the HF bulk — recovers most of rANS's +1.6% loss, keeps ~2× decode.
+3. ATC-style split entropy — IMPLEMENTED + MEASURED, REJECTED in this form:
+   adaptive LF corner + static per-band 2-lane rANS HF tail (backward-decoded
+   from payload end, escapes in the rc stream reverse-ordered, 3-byte lane
+   states, only for blocks with >=256 HF symbols). Round-trips clean but costs
+   ~6% ratio at q=6 (31.7x vs 33.8x) with no decode win: per-block adaptation
+   is strongest exactly on the HF zeros (p adapts to ~0.97+ within a block;
+   a corpus-average static table can't follow), and the probe's +1.6% bound
+   was for full replacement, not this split. A future attempt needs zero-RUN
+   symbols in the alphabet (cuts symbol count 5-10x -> real decode win) or
+   per-chunk shared rANS streams (amortized states, breaks block independence).
+   Trainer (tools/mc_rans_tab.c) + tables (src/mc_rans_tab.h) kept.
 4. TCQ trellis quantization (parity-driven 4–9 state lattice; distinct
    mechanism from the rejected RDOQ). Decoder ~free, encoder Viterbi.
 5. HPEZ-style per-chunk parameter auto-tuning by sampling (encode-only).
