@@ -6,6 +6,7 @@
 #include "../src/matter_compressor.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 static mc_u8 srcv(void *ud, int x,int y,int z){
     (void)ud;
