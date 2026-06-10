@@ -1,6 +1,0 @@
-/home/forrest/matter-compressor/build_native/CMakeFiles/matter_compressor.dir
-/home/forrest/matter-compressor/build_native/CMakeFiles/mc_roundtrip.dir
-/home/forrest/matter-compressor/build_native/CMakeFiles/mc_append_roundtrip.dir
-/home/forrest/matter-compressor/build_native/CMakeFiles/test.dir
-/home/forrest/matter-compressor/build_native/CMakeFiles/edit_cache.dir
-/home/forrest/matter-compressor/build_native/CMakeFiles/rebuild_cache.dir

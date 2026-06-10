@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -ffast-math -Wl,--dependency-file=CMakeFiles/mc_roundtrip.dir/link.d CMakeFiles/mc_roundtrip.dir/tests/mc_roundtrip.c.o -o mc_roundtrip  libmatter_compressor.a -lm

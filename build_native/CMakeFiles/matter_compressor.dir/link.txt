@@ -1,2 +1,0 @@
-/usr/bin/ar qc libmatter_compressor.a CMakeFiles/matter_compressor.dir/src/mc_codec.c.o CMakeFiles/matter_compressor.dir/src/mc_archive.c.o
-/usr/bin/ranlib libmatter_compressor.a
