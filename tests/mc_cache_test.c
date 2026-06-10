@@ -149,6 +149,35 @@ int main(void){
     printf("invalidate: OK (stale-until-invalidate, fresh after)\n");
     mc_cache_free(c);
 
+    // 6) batch update (vc3d pattern): submit a working set incl. duplicates +
+    // already-resident blocks; after the call every block must be resident and
+    // queries must be pure hits.
+    c=mc_cache_new_archive(64ull<<20,a);
+    mc_cache_get_copy(c,0,5,5,5,want);                    // pre-resident block
+    enum { NW=900 };
+    static mc_block_id ws[NW]; int nw=0;
+    for(int i=0;i<NW-4;++i){ ws[nw++]=(mc_block_id){0,(i*7)%16,(i*13)%16,(i*3)%16}; }
+    ws[nw++]=(mc_block_id){0,5,5,5};                      // resident
+    ws[nw++]=(mc_block_id){0,1,2,3}; ws[nw++]=(mc_block_id){0,1,2,3};  // dup
+    ws[nw++]=(mc_block_id){1,0,0,0};                      // another LOD
+    size_t dec=mc_cache_update(c,ws,(size_t)nw,0);
+    mc_cache_stats su; mc_cache_get_stats(c,&su);
+    int missing=0;
+    for(int i=0;i<nw;++i) if(!mc_cache_contains(c,ws[i].lod,ws[i].bz,ws[i].by,ws[i].bx)) missing++;
+    uint64_t h0=su.hits,m0=su.misses;
+    for(int i=0;i<nw;++i){ mc_u8 g6[4096]; mc_cache_get_copy(c,ws[i].lod,ws[i].bz,ws[i].by,ws[i].bx,g6); }
+    mc_cache_get_stats(c,&su);
+    printf("update: decoded %zu of %d submitted, %d missing, post-update queries: %llu hits %llu misses\n",
+        dec,nw,missing,(unsigned long long)(su.hits-h0),(unsigned long long)(su.misses-m0));
+    if(missing || su.misses!=m0){ fprintf(stderr,"FAIL: batch update left misses\n"); return 1; }
+    // correctness of one updated block vs direct decode
+    mc_u8 g7[4096];
+    mc_cache_get_copy(c,1,0,0,0,g7);
+    uint64_t co7=mc_archive_chunk_offset(a,1,0,0,0);
+    mc_archive_decode_block(a,co7,0,0,0,want);
+    if(memcmp(g7,want,4096)!=0){ fprintf(stderr,"FAIL: updated block wrong\n"); return 1; }
+    mc_cache_free(c);
+
     mc_archive_close(a);
     remove(path);
     printf("mc_cache: OK\n");

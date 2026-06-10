@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
 #if defined(__unix__) || defined(__APPLE__)
   #include <sys/mman.h>
@@ -321,6 +323,94 @@ int mc_cache_contains(mc_cache *c, int lod, int bz, int by, int bx){
     int r = map_find(sh,key)!=UINT32_MAX;
     pthread_mutex_unlock(&sh->mu);
     return r;
+}
+
+// lookup-or-decode-insert; returns 1 if a decode happened.
+static int cache_fill_one(mc_cache *c, int lod, int bz, int by, int bx){
+    uint64_t key=bkey(lod,bz,by,bx);
+    shard_t *sh=shard_of(c,key);
+    pthread_mutex_lock(&sh->mu);
+    uint32_t mi=map_find(sh,key);
+    if(mi!=UINT32_MAX){
+        cache_touch(c,sh,sh->map_slot[mi]); sh->hits++;
+        pthread_mutex_unlock(&sh->mu);
+        return 0;
+    }
+    sh->misses++;
+    pthread_mutex_unlock(&sh->mu);
+    static _Thread_local mc_u8 tmp[BLK_BYTES];
+    c->src(c->src_ud,lod,bz,by,bx,tmp);
+    pthread_mutex_lock(&sh->mu);
+    if(map_find(sh,key)==UINT32_MAX){
+        uint32_t slot=cache_alloc_slot(c,sh,key);
+        sh->slot_key[slot]=key;
+        map_insert(sh,key,slot);
+        memcpy(sh->arena+(size_t)slot*BLK_BYTES,tmp,BLK_BYTES);
+        cache_touch(c,sh,slot);
+    }
+    pthread_mutex_unlock(&sh->mu);
+    return 1;
+}
+
+typedef struct {
+    mc_cache *c;
+    const mc_block_id *ids;     // sorted copy, grouped by chunk
+    const uint32_t *group_off;  // group g = ids[group_off[g] .. group_off[g+1])
+    uint32_t ngroups;
+    _Atomic uint32_t next;      // work-stealing group cursor
+    _Atomic size_t decoded;
+} upd_ctx;
+static void *upd_worker(void *p){
+    upd_ctx *u=p;
+    for(;;){
+        uint32_t g=atomic_fetch_add_explicit(&u->next,1,memory_order_relaxed);
+        if(g>=u->ngroups) break;
+        size_t dec=0;
+        for(uint32_t i=u->group_off[g];i<u->group_off[g+1];++i){
+            const mc_block_id *b=&u->ids[i];
+            dec+=(size_t)cache_fill_one(u->c,b->lod,b->bz,b->by,b->bx);
+        }
+        atomic_fetch_add_explicit(&u->decoded,dec,memory_order_relaxed);
+    }
+    return NULL;
+}
+static uint64_t upd_sortkey(const mc_block_id *b){    // chunk-major; low 12 bits = in-chunk
+    return ((uint64_t)(b->lod&7)<<60)
+         | ((uint64_t)(b->bz>>4)<<44) | ((uint64_t)(b->by>>4)<<28) | ((uint64_t)(b->bx>>4)<<12)
+         | ((uint64_t)(b->bz&15)<<8)  | ((uint64_t)(b->by&15)<<4)  | (uint64_t)(b->bx&15);
+}
+static int upd_cmp(const void *a,const void *b){
+    uint64_t ka=upd_sortkey(a), kb=upd_sortkey(b);
+    return ka<kb?-1:ka>kb?1:0;
+}
+size_t mc_cache_update(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads){
+    if(!c||!ids||!n) return 0;
+    mc_block_id *s=malloc(n*sizeof *s);
+    memcpy(s,ids,n*sizeof *s);
+    qsort(s,n,sizeof *s,upd_cmp);
+    uint32_t *off=malloc((n+1)*sizeof *off);
+    uint32_t ng=0; off[0]=0;
+    for(size_t i=1;i<n;++i){
+        if((upd_sortkey(&s[i])>>12)!=(upd_sortkey(&s[i-1])>>12)) off[++ng]=(uint32_t)i;
+    }
+    off[++ng]=(uint32_t)n;
+    upd_ctx u={.c=c,.ids=s,.group_off=off,.ngroups=ng};
+    atomic_store(&u.next,0); atomic_store(&u.decoded,0);
+    int nt=nthreads;
+    if(nt<=0){
+        long nc=sysconf(_SC_NPROCESSORS_ONLN);
+        nt=(int)(nc>0?nc:4);
+    }
+    if(nt>16)nt=16; if((uint32_t)nt>ng)nt=(int)ng;
+    if(nt<=1){ upd_worker(&u); }
+    else {
+        pthread_t th[16];
+        for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,upd_worker,&u);
+        for(int t=0;t<nt;++t) pthread_join(th[t],NULL);
+    }
+    size_t dec=atomic_load(&u.decoded);
+    free(s); free(off);
+    return dec;
 }
 
 void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx){

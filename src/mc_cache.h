@@ -66,6 +66,20 @@ int  mc_cache_contains(mc_cache *c, int lod, int bz, int by, int bx);
 // threads ahead of the viewport so the render threads only ever hit.
 void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx);
 
+// Batch update: bring an explicit working set into the cache and return when
+// every listed block is resident. The vc3d pattern: compute all needed blocks
+// up front from geometry, submit the list, wait, then query (all hits).
+//   - already-resident blocks are touched (marked recently used) so the new
+//     working set is protected; everything else decays toward eviction,
+//   - misses are decoded by an internal worker pool, grouped by chunk for
+//     payload locality (nthreads = 0 -> one per core, capped at 16),
+//   - duplicates in the list are fine; list order does not matter,
+//   - the working set should fit in the cache: if n exceeds capacity, later
+//     inserts evict earlier ones from the same batch.
+// Returns the number of blocks that were newly decoded.
+typedef struct { int lod, bz, by, bx; } mc_block_id;
+size_t mc_cache_update(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads);
+
 // Invalidate every cached block of chunk (lod, cz,cy,cx). Writers call this
 // after re-appending/replacing a chunk so readers stop seeing stale blocks.
 // Thread-safe against concurrent gets/inserts.
