@@ -18,6 +18,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---------------------------------------------------------------------------
 // source: anything that can produce 16^3 blocks
 // ---------------------------------------------------------------------------
@@ -74,5 +78,9 @@ void mc_sample_points(mc_sampler *s, const float *zyx, size_t n,
                       mc_filter f, float *out);
 void mc_sample_points_u8(mc_sampler *s, const float *zyx, size_t n,
                          mc_filter f, uint8_t *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

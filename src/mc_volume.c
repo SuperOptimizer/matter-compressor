@@ -170,6 +170,7 @@ static void decode_one(mc_volume *v, decode_item *it) {
     }
     uint8_t *dense = NULL;
     if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) goto done;
+    double t_dec0 = mcv_now();
     if (it->sub == 1) {                                // c3d: chunk == region
         decode_inner(codec, it->raw[0], it->rlen[0], dense, CHUNK);
     } else {                                           // v2: blit the cube
@@ -183,10 +184,12 @@ static void decode_one(mc_volume *v, decode_item *it) {
             free(tile);
         }
     }
-    double td = mcv_now();
+    double t_enc0 = mcv_now();
     mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, dense);
-    MCVLOG("decoded   lod%d region(%d,%d,%d) appended (decode+enc %.0fms)",
-           it->lod, it->rz, it->ry, it->rx, mcv_now() - td);
+    double t_end = mcv_now();
+    MCVLOG("decoded   lod%d region(%d,%d,%d) codec=%s decode=%.0fms encode=%.0fms",
+           it->lod, it->rz, it->ry, it->rx, codec,
+           t_enc0 - t_dec0, t_end - t_enc0);
     free(dense);
 done:
     for (int k = 0; k < it->nsub; ++k) free(it->raw[k]);

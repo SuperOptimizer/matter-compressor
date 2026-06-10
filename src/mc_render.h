@@ -22,6 +22,10 @@
 #define MC_RENDER_H
 #include "mc_sample.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     MC_COMP_NONE  = 0,
     MC_COMP_MIN   = 1,
@@ -163,5 +167,9 @@ int mc_render_plane_lod(const mc_sample_lods *ls, const mc_plane *pl,
 int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
                        float x0, float y0, float step, int w, int h,
                        const mc_render_params *p, uint8_t *out, int nthreads);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
