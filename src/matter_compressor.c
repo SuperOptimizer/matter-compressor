@@ -2092,6 +2092,8 @@ struct mc_reader {
     const uint8_t *arc;        // flat mode: archive buffer; streaming: NULL
     size_t len;
     uint64_t roots[8];
+    int nx, ny, nz;            // LOD0 dims from the header
+    float quality;             // quality the archive was built at
     mc_read_fn read; void *read_ud;   // streaming mode
     // streaming scratch: a fetched window of the current chunk blob.
     u8 *cbuf; uint64_t cbuf_off; uint64_t cbuf_len;
@@ -2107,10 +2109,18 @@ struct mc_reader {
     int ntab_next;
 };
 
+static void reader_hdr_load(mc_reader *r, const u8 *hdr){
+    for(int l=0;l<8;++l) memcpy(&r->roots[l], hdr+MCH_ROOTOFF+l*8, 8);
+    uint32_t ux,uy,uz;
+    memcpy(&ux,hdr+MCH_NX,4); memcpy(&uy,hdr+MCH_NY,4); memcpy(&uz,hdr+MCH_NZ,4);
+    r->nx=(int)ux; r->ny=(int)uy; r->nz=(int)uz;
+    memcpy(&r->quality,hdr+MCH_QUALITY,4);
+}
+
 mc_reader *mc_open(const uint8_t *arc, size_t len){
     mc_codec_init();
     mc_reader *r=calloc(1,sizeof *r); r->arc=arc; r->len=len;
-    for(int l=0;l<8;++l) memcpy(&r->roots[l], arc+MCH_ROOTOFF+l*8, 8);
+    reader_hdr_load(r, arc);
     priors_load(arc);
     return r;
 }
@@ -2127,8 +2137,32 @@ mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len){
     if(read(ud,0,MC_HDR,hdr)!=0){ free(r); return NULL; }
     uint32_t magic; memcpy(&magic,hdr+MCH_MAGIC,4);
     if(magic!=MC_MAGIC){ free(r); return NULL; }
-    for(int l=0;l<8;++l) memcpy(&r->roots[l], hdr+MCH_ROOTOFF+l*8, 8);
+    reader_hdr_load(r, hdr);
+    // per-volume priors: flat open gets them via priors_load(arc); a streaming
+    // reader must pull the blob through the callback or HF decode is wrong.
+    uint64_t poff; memcpy(&poff,hdr+MCH_PRIOROFF,8);
+    if(poff){
+        u8 pb[MC_PRIORS_BYTES];
+        uint32_t pm=0;
+        if(read(ud,poff,MC_PRIORS_BYTES,pb)==0) memcpy(&pm,pb,4);
+        if(pm==MC_PRIORS_MAGIC)
+            mc_codec_set_priors((const uint16_t*)(pb+8),(const uint16_t*)(pb+8+8*32*2));
+        else
+            mc_codec_set_priors(NULL,NULL);
+    } else {
+        mc_codec_set_priors(NULL,NULL);
+    }
     return r;
+}
+
+void mc_reader_dims(mc_reader *r, int *nx, int *ny, int *nz){
+    if(nx)*nx=r?r->nx:0; if(ny)*ny=r?r->ny:0; if(nz)*nz=r?r->nz:0;
+}
+float mc_reader_quality(mc_reader *r){ return r?r->quality:0.f; }
+int mc_reader_nlods(mc_reader *r){
+    if(!r) return 0;
+    int n=0; for(int l=0;l<8;++l) if(r->roots[l]) n=l+1;
+    return n;
 }
 
 void mc_close(mc_reader *r){ if(!r)return;

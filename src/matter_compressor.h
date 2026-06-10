@@ -250,6 +250,11 @@ mc_reader *mc_open_streaming(mc_read_fn read, void *ud, uint64_t total_len);
 // (whole-blob fetch amortizes better).
 void mc_reader_set_partial_fetch(mc_reader *r, int on);
 
+// Header metadata (valid for flat and streaming readers).
+void  mc_reader_dims(mc_reader *r, int *nx, int *ny, int *nz);  // LOD0 voxel dims
+float mc_reader_quality(mc_reader *r);                          // build quality
+int   mc_reader_nlods(mc_reader *r);                            // populated LOD count
+
 // metadata region (pointer into arc; not owned). *out_len = bytes stored.
 const char *mc_metadata(const uint8_t *arc, size_t *out_len);
 
