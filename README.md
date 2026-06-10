@@ -26,7 +26,10 @@ dependencies beyond libm/pthreads:
 - **sample + render** (`mc_sample.h`, `mc_render.h`) — volume-cartographer-
   style surface rendering: generic point-grid renderer with plane and quad
   surface generators, nearest/trilinear filtering, min/mean/max/alpha
-  compositing along surface normals. Sources are pluggable (mc_cache,
+  compositing along surface normals, and LOD-matched rendering: the
+  _lod render variants sample the level the zoom can actually show
+  (half-voxel-correct remap; ~2-3x per level on real data, sub-ms
+  zoomed-out frames). Sources are pluggable (mc_cache,
   mc_volume, dense arrays). Fully in-volume 1024² quad-surface render
   (8 threads, dense source): slice 1.5 ms, 9-step trilinear composite
   8.4 ms including surface generation.
