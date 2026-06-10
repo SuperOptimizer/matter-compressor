@@ -17,18 +17,19 @@ endif()
 # Only set fast/native flags + tests when built standalone. When vendored, the parent
 # owns the build type/flags and may build shared libs (so we force PIC below).
 if(MC_STANDALONE)
-  set(CMAKE_C_FLAGS_RELEASE "-O3")
+  set(CMAKE_C_FLAGS_RELEASE "-O3 -ffp-contract=off")
   add_compile_options(-Wall -Wno-stringop-overflow)
   if(NOT DEFINED MC_NO_NATIVE)
     add_compile_options(-march=native)
   endif()
 endif()
 
-# DETERMINISM: archives are byte-identical across ISAs (CI-enforced) because
-# the build is strict-IEEE — do NOT add -ffast-math: it licenses per-target
-# reassociation/reciprocal tricks in the encoder's float air-fill and breaks
-# bitstream identity, while buying zero measured performance (hot paths are
-# integer by design; the fill vectorizes fine under strict semantics).
+# DETERMINISM: archives are byte-identical across ISAs and compilers
+# (CI-enforced). Two requirements: no -ffast-math (per-target reciprocal
+# tricks in the float air-fill diverge; zero measured speedup anyway) and an
+# explicit -ffp-contract=off (gcc contracts mul+add to FMA by default, clang
+# does not — pin one choice). Hot paths are integer by design, so neither
+# flag costs performance.
 
 # Optional ThinLTO + PGO. MEASURED POLICY (bench/RESULTS.md): LTO of either
 # flavor WITHOUT profiles costs ~15% decode (link-time inliner mispredicts the

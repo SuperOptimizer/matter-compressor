@@ -15,12 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: build
-        run: cmake -B build -S . -DMC_NO_NATIVE=ON -DCMAKE_C_FLAGS="${{ matrix.cflags }}" && cmake --build build -j
+        run: CC=clang cmake -B build -S . -DMC_NO_NATIVE=ON -DCMAKE_C_FLAGS="${{ matrix.cflags }}" && cmake --build build -j
       - name: test
         run: ctest --test-dir build --output-on-failure
       - name: deterministic archive digest
         run: |
-          cc -O3 ${{ matrix.cflags }} -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
+          clang -O3 -ffp-contract=off ${{ matrix.cflags }} -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
           mkdir -p digest && ./detarc | tee digest/${{ matrix.os }}.txt
       - uses: actions/upload-artifact@v4
         with: { name: "digest-${{ matrix.os }}", path: digest/ }
