@@ -157,7 +157,7 @@ if(MC_STANDALONE)
     set_property(TARGET matter_compressor_volume PROPERTY C_STANDARD 23)
     # c3d decode output feeds the .mca re-encode, so honor the archive
     # determinism policy: no -ffast-math, explicit -ffp-contract=off.
-    set_source_files_properties(src/c3d.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off")
+    set_source_files_properties(src/c3d.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off;-fno-openmp")
     target_link_libraries(matter_compressor_volume
       matter_compressor CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
     if(OpenMP_C_FOUND)
