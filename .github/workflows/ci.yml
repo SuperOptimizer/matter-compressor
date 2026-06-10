@@ -12,6 +12,12 @@ jobs:
         run: cmake -B build -S . -DMC_NO_NATIVE=ON && cmake --build build -j
       - name: test
         run: ctest --test-dir build --output-on-failure
+      - name: deterministic archive digest
+        run: |
+          cc -O3 -w -Isrc tests/mc_det_archive.c src/matter_compressor.c -lm -lpthread -o detarc
+          mkdir -p digest && ./detarc | tee digest/${{ matrix.os }}.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: "digest-${{ matrix.os }}", path: digest/ }
   asan:
     runs-on: ubuntu-24.04
     steps:
@@ -24,3 +30,13 @@ jobs:
           clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -w -Isrc \
             tests/mc_cache_test.c src/matter_compressor.c -lm -lpthread -o cache_asan
           ./cache_asan
+  bitstream-identity:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: "digest-*", merge-multiple: true, path: digests }
+      - name: assert byte-identical archives across ISAs
+        run: |
+          cat digests/*.txt
+          [ "$(sort -u digests/*.txt | wc -l)" -eq 1 ] && echo IDENTICAL || { echo MISMATCH; exit 1; }
