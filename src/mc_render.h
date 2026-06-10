@@ -108,4 +108,35 @@ int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
                    float x0, float y0, float step, int w, int h,
                    const mc_render_params *p, uint8_t *out, int nthreads);
 
+// ---------------------------------------------------------------------------
+// LOD-matched rendering
+// ---------------------------------------------------------------------------
+// Zoomed-out views shouldn't sample the finest level: at `vox_per_pixel`
+// voxels per output pixel, level floor(log2(vox_per_pixel)) carries all the
+// information the image can show, with 8x fewer voxels per level. Geometry
+// stays in LOD-0 voxel space; the renderer picks the level, remaps
+// coordinates (half-voxel-center correct: c_L = (c_0 + 0.5)/2^L - 0.5) and
+// scales the composite range so the slab covers the same physical depth,
+// stepped at the sampled level's voxel pitch.
+typedef struct {
+    mc_sample_src lods[8];      // [0] = finest; dims halve per level
+    int nlods;
+} mc_sample_lods;
+
+// floor(log2(vox_per_pixel)) clamped to [0, nlods-1]; <2 vox/px -> 0.
+int mc_render_pick_lod(const mc_sample_lods *ls, float vox_per_pixel);
+
+// Mean LOD-0 voxel spacing of one rendered pixel step across the quad's
+// control grid (sparse probe; multiply by your render step).
+float mc_quad_spacing(const mc_quad *q);
+
+// As mc_render_plane / mc_render_quad, but sampling the LOD matched to
+// the render scale (plane: vox/px = scale; quad: step * mc_quad_spacing).
+int mc_render_plane_lod(const mc_sample_lods *ls, const mc_plane *pl,
+                        int w, int h, float scale,
+                        const mc_render_params *p, uint8_t *out, int nthreads);
+int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
+                       float x0, float y0, float step, int w, int h,
+                       const mc_render_params *p, uint8_t *out, int nthreads);
+
 #endif

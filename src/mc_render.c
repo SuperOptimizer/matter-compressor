@@ -482,3 +482,99 @@ int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
     render_bands(src, NULL, NULL, quad_rowgen, &g, w, h, p, out, nthreads);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// LOD-matched rendering
+// ---------------------------------------------------------------------------
+int mc_render_pick_lod(const mc_sample_lods *ls, float vox_per_pixel) {
+    if (!ls || ls->nlods <= 1) return 0;
+    int L = 0;
+    float v = vox_per_pixel;
+    while (v >= 2.0f && L < ls->nlods - 1) { v *= 0.5f; L++; }
+    // skip levels the caller left empty
+    while (L > 0 && (ls->lods[L].nz <= 0 || !ls->lods[L].block)) L--;
+    return L;
+}
+
+float mc_quad_spacing(const mc_quad *q) {
+    if (!q || !q->grid || q->gw < 2 || q->gh < 1) return 1.0f;
+    // probe up to 32 horizontal neighbor pairs along the grid diagonal
+    double sum = 0.0;
+    int n = 0;
+    int probes = q->gh < 32 ? q->gh : 32;
+    for (int i = 0; i < probes; i++) {
+        int gy = (int)(((int64_t)i * (q->gh - 1)) / (probes > 1 ? probes - 1 : 1));
+        int gx = (int)(((int64_t)i * (q->gw - 2)) / (probes > 1 ? probes - 1 : 1));
+        const float *a = q->grid + ((size_t)gy * q->gw + gx) * 3;
+        const float *b = a + 3;
+        if (!qvalid(a) || !qvalid(b)) continue;
+        float dz = b[0] - a[0], dy = b[1] - a[1], dx = b[2] - a[2];
+        sum += sqrtf(dz * dz + dy * dy + dx * dx);
+        n++;
+    }
+    return n ? (float)(sum / n) : 1.0f;
+}
+
+// wrap a rowgen: remap generated LOD-0 points into LOD-L voxel space.
+// c_L = c_0 * 2^-L + (0.5 * 2^-L - 0.5); border points that map a fraction
+// below 0 clamp to 0 (they are inside voxel 0 of the coarse level) instead
+// of tripping the <0 invalid convention.
+typedef struct {
+    rowgen_fn inner;
+    const void *inner_ud;
+    float a, b;
+} lod_rg;
+
+static void lod_rowgen(const void *ud, int row, int w,
+                       float *pts, float *normals) {
+    const lod_rg *g = ud;
+    g->inner(g->inner_ud, row, w, pts, normals);
+    for (int j = 0; j < w; j++) {
+        float *P = pts + (size_t)j * 3;
+        if (!pt_valid(P)) continue;
+        for (int k = 0; k < 3; k++) {
+            float v = P[k] * g->a + g->b;
+            P[k] = v < 0.0f ? 0.0f : v;
+        }
+    }
+    // normals are directions: unchanged under uniform scaling
+}
+
+static int render_lod(const mc_sample_lods *ls, int L,
+                      rowgen_fn inner, const void *inner_ud,
+                      int w, int h, const mc_render_params *p,
+                      uint8_t *out, int nthreads) {
+    const float inv = 1.0f / (float)(1 << L);
+    lod_rg g = { inner, inner_ud, inv, 0.5f * inv - 0.5f };
+    mc_render_params pl_ = *p;
+    pl_.t0 = p->t0 * inv;       // same physical slab ...
+    pl_.t1 = p->t1 * inv;       // ... stepped at the coarse level's pitch
+    render_bands(&ls->lods[L], NULL, NULL, lod_rowgen, &g, w, h, &pl_,
+                 out, nthreads);
+    return 0;
+}
+
+int mc_render_plane_lod(const mc_sample_lods *ls, const mc_plane *pl,
+                        int w, int h, float scale,
+                        const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!ls || !pl || !p || !out || w <= 0 || h <= 0) return -1;
+    int L = mc_render_pick_lod(ls, scale);
+    if (L == 0)
+        return mc_render_plane(&ls->lods[0], pl, w, h, scale, p, out, nthreads);
+    plane_rg g = { *pl, scale, (float)w * 0.5f, (float)h * 0.5f };
+    v3_norm(g.pl.normal);
+    return render_lod(ls, L, plane_rowgen, &g, w, h, p, out, nthreads);
+}
+
+int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
+                       float x0, float y0, float step, int w, int h,
+                       const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!ls || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !p || !out || w <= 0 || h <= 0) return -1;
+    int L = mc_render_pick_lod(ls, step * mc_quad_spacing(q));
+    if (L == 0)
+        return mc_render_quad(&ls->lods[0], q, x0, y0, step, w, h, p, out,
+                              nthreads);
+    quad_rg g = { q, x0, y0, step };
+    return render_lod(ls, L, quad_rowgen, &g, w, h, p, out, nthreads);
+}

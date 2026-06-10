@@ -460,6 +460,14 @@ mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking) {
     return s;
 }
 
+mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking) {
+    mc_sample_lods ls = {0};
+    ls.nlods = v->nlods < 8 ? v->nlods : 8;
+    for (int l = 0; l < ls.nlods; l++)
+        ls.lods[l] = mc_volume_sample_src(v, l, blocking);
+    return ls;
+}
+
 // ---------------------------------------------------------------------------
 // prefetch — region-at-a-time (NO whole-shard download). Each 256^3 region is
 // transcoded by reading only its source inner-chunk(s) via ranged GETs (one for

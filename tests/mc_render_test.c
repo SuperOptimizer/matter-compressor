@@ -200,6 +200,61 @@ int main(void) {
     mc_archive_close(a);
     remove(path);
 
+    // ---- LOD-matched rendering --------------------------------------------
+    // lod1 = 2x mean-pool of vol. At scale >= 2 the _lod renderer must (a)
+    // pick lod1 and (b) produce exactly what rendering lod1 directly with
+    // remapped geometry produces.
+    {
+        enum { M = N / 2 };
+        uint8_t *l1 = malloc((size_t)M * M * M);
+        for (int z = 0; z < M; z++)
+            for (int y = 0; y < M; y++)
+                for (int x = 0; x < M; x++) {
+                    int sum = 0;
+                    for (int dz2 = 0; dz2 < 2; dz2++)
+                        for (int dy2 = 0; dy2 < 2; dy2++)
+                            for (int dx2 = 0; dx2 < 2; dx2++)
+                                sum += vol[((size_t)(2 * z + dz2) * N +
+                                            (2 * y + dy2)) * N + (2 * x + dx2)];
+                    l1[((size_t)z * M + y) * M + x] = (uint8_t)((sum + 4) / 8);
+                }
+        mc_sample_lods ls = {0};
+        ls.nlods = 2;
+        ls.lods[0] = mc_sample_src_dense(vol, N, N, N);
+        ls.lods[1] = mc_sample_src_dense(l1, M, M, M);
+
+        CHECK(mc_render_pick_lod(&ls, 1.0f) == 0);
+        CHECK(mc_render_pick_lod(&ls, 1.9f) == 0);
+        CHECK(mc_render_pick_lod(&ls, 2.0f) == 1);
+        CHECK(mc_render_pick_lod(&ls, 64.0f) == 1);   // clamped to nlods-1
+
+        enum { LW = 64, LH = 64 };
+        uint8_t la[LW * LH], lb[LW * LH];
+        mc_plane lp = { .origin = {128, 128, 128}, .normal = {1, 0, 0},
+                        .u = {0, 0, 1}, .v = {0, 1, 0} };
+        mc_render_params lprm = { .filter = MC_FILTER_TRILINEAR,
+                                  .comp = MC_COMP_MAX, .t0 = -4, .t1 = 4, .dt = 1 };
+        CHECK(mc_render_plane_lod(&ls, &lp, LW, LH, 2.0f, &lprm, la, 1) == 0);
+        // reference: render lod1 directly with remapped geometry
+        // c1 = (c0 + 0.5)/2 - 0.5; scale halves; t-range halves
+        mc_plane rp = lp;
+        for (int k = 0; k < 3; k++)
+            rp.origin[k] = (lp.origin[k] + 0.5f) * 0.5f - 0.5f;
+        mc_render_params rprm = lprm;
+        rprm.t0 = -2; rprm.t1 = 2;
+        CHECK(mc_render_plane(&ls.lods[1], &rp, LW, LH, 1.0f, &rprm, lb, 1) == 0);
+        CHECK(memcmp(la, lb, sizeof la) == 0);
+        // scale 1 -> identical to the plain lod0 render
+        CHECK(mc_render_plane_lod(&ls, &lp, LW, LH, 1.0f, &lprm, la, 1) == 0);
+        CHECK(mc_render_plane(&ls.lods[0], &lp, LW, LH, 1.0f, &lprm, lb, 1) == 0);
+        CHECK(memcmp(la, lb, sizeof la) == 0);
+        // quad spacing estimate: flat unit-spaced grid -> ~1.0
+        float qs = mc_quad_spacing(&q);
+        CHECK(qs > 0.99f && qs < 1.01f);
+        free(l1);
+    }
+    printf("lod rendering OK\n");
+
     mc_sampler_free(s);
     free(grid); free(pa); free(pb); free(ca); free(cb); free(dec); free(vol);
     printf(fails ? "mc_render_test: %d FAILED\n" : "mc_render_test: OK\n", fails);

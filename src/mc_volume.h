@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "mc_sample.h"
+#include "mc_render.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,6 +67,9 @@ void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud);
 //             deduped background transcode (interactive render path).
 // blocking=1: absent regions are transcoded synchronously first (batch path).
 mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking);
+// All levels at once, for LOD-matched rendering (mc_render_plane_lod /
+// mc_render_quad_lod pick the level from the render scale).
+mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking);
 
 typedef struct {
     uint64_t cache_hits, cache_misses;   // mc_cache residency
