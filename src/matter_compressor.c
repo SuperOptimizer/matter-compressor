@@ -1,3 +1,4 @@
+#define _GNU_SOURCE                  // pthread_setname_np (linux)
 // ============================================================================
 // matter_compressor.c — single-file implementation: codec + archive + cache.
 // Unified from mc_dct.h / mc_rangecoder.h / mc_xxhash.h / mc_codec.c /
@@ -4963,6 +4964,18 @@ void mc_s3_close(mc_s3 *s){
 
 static void *decoder_main(void *ud);
 static void *dl_main(void *ud);
+
+// portable thread naming: macOS names the calling thread (1 arg), glibc
+// takes (thread, name)
+static void mc_thread_setname(const char *name) {
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    pthread_setname_np(pthread_self(), name);
+#else
+    (void)name;
+#endif
+}
 static const uint8_t *zero256(void);   // shared 32-aligned 256^3 zero buffer
 
 // ---- timing log (MCV_LOG=1 to enable) -------------------------------------
@@ -5140,6 +5153,7 @@ done:
 // Decode-pool worker: drain decode items, decode off the download thread.
 static void *decoder_main(void *ud) {
     mc_volume *v = ud;
+    mc_thread_setname("mc-decode");        // distinguish in profilers
     for (;;) {
         pthread_mutex_lock(&v->mu);
         while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
@@ -5200,6 +5214,7 @@ static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
 // Download thread: pop the newest request, download its shard (-> decode queue).
 static void *dl_main(void *ud) {
     mc_volume *v = ud;
+    mc_thread_setname("mc-download");      // distinguish in profilers
     for (;;) {
         pthread_mutex_lock(&v->mu);
         while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
