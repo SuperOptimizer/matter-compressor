@@ -10,6 +10,7 @@
 #include "mc_rangecoder.h"   // enc/dec block coefs + bit coders
 
 #define N3 (MC_BLK*MC_BLK*MC_BLK)
+#define MC_GRID3_F 4096
 
 // Quality state is THREAD-LOCAL: format v6 stores q per chunk, so concurrent
 // decodes of different-q chunks each keep their own step/prior tables (rebuilt
@@ -166,6 +167,32 @@ void mc_deblock(mc_u8 *v, int nz, int ny, int nx, float quality){
             mc_u8 *p=v+(size_t)z*szp+(size_t)y*sy+x;
             mc_db_pair(p-2*szp,p-szp,p,p+szp,beta,tc);
         }
+}
+
+// ---- per-chunk material-fraction map (4096 nibbles) -------------------------
+// Smooth field: each nibble coded as 4 adaptive bins conditioned on the
+// previous nibble bucket (0 / 1-14 / 15). ~0.1-0.3% of chunk bytes.
+uint32_t mc_enc_fracmap(const uint8_t *frac, uint8_t *out, size_t cap){
+    rc_enc e; enc_init(&e,out,cap);
+    ctx_t cx[3][4]; for(int b=0;b<3;++b)for(int i=0;i<4;++i) ctx_init(&cx[b][i]);
+    int prev=0;
+    for(int i=0;i<MC_GRID3_F;++i){
+        int v=frac[i]&15, pb=prev==0?0:prev==15?2:1;
+        for(int b=3;b>=0;--b) enc_bit(&e,&cx[pb][b],(v>>b)&1);
+        prev=v;
+    }
+    enc_flush(&e);
+    return (uint32_t)e.len;
+}
+void mc_dec_fracmap(const uint8_t *in, uint32_t len, uint8_t *frac){
+    rc_dec d; dec_init(&d,in,len);
+    ctx_t cx[3][4]; for(int b=0;b<3;++b)for(int i=0;i<4;++i) ctx_init(&cx[b][i]);
+    int prev=0;
+    for(int i=0;i<MC_GRID3_F;++i){
+        int v=0, pb=prev==0?0:prev==15?2:1;
+        for(int b=3;b>=0;--b) v|=dec_bit(&d,&cx[pb][b])<<b;
+        frac[i]=(uint8_t)v; prev=v;
+    }
 }
 
 // block payload layout: ONE range-coded stream, nothing else. The stream starts

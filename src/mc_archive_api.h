@@ -114,6 +114,45 @@ void mc_archive_decode_chunk(mc_archive *a, uint64_t chunk_off, mc_u8 *out, int 
 int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
                                 const mc_u8 vox[256*256*256], float q, int nthreads);
 
+// Decode an arbitrary axis-aligned REGION of `lod` into a caller buffer.
+// Voxel (z,y,x) of the region lands at out[z*sz + y*sy + x] (strides in
+// bytes; sy=dx, sz=dx*dy gives a dense C-order array — pass torch/numpy
+// strides for zero-copy tensor fills). Only the touched blocks are decoded,
+// in parallel (nthreads=0 -> one per core, cap 16). Out-of-volume voxels and
+// absent chunks read as 0. The region primitive for ML dataloaders (random
+// crops) and viewers (slices: dz=1).
+void mc_archive_read_region(mc_archive *a, int lod,
+                            long z0, long y0, long x0,
+                            long dz, long dy, long dx,
+                            mc_u8 *out, size_t sz, size_t sy, int nthreads);
+
+// Occupancy without decoding: is the 16^3 block at block coords (bz,by,bx)
+// of `lod` present (i.e. contains any material)? Bitmap lookup only — use
+// for rejection-free sampling of material-containing patches.
+int mc_archive_block_present(mc_archive *a, int lod, int bz, int by, int bx);
+
+// Material fraction of a block in [0,1] (quantized to 1/15 steps; from the
+// per-chunk fraction map, decoded once per chunk per thread — no voxel
+// decode). 0 for absent blocks/chunks.
+float mc_archive_block_fraction(mc_archive *a, int lod, int bz, int by, int bx);
+
+// Deterministic seeded box sampler for ML dataloaders: draw `count` boxes of
+// size (dz,dy,dx) voxels at `lod`, uniformly over the volume, keeping only
+// boxes whose mean block material fraction >= min_frac. Same seed -> same
+// boxes, independent of thread count or machine. Returns boxes written
+// (< count if the acceptance rate is too low within the attempt budget).
+typedef struct { long z0, y0, x0; } mc_box;
+int mc_archive_sample_boxes(mc_archive *a, int lod, uint64_t seed, int count,
+                            long dz, long dy, long dx, float min_frac,
+                            mc_box *out);
+
+// Batched multi-crop read: decode n same-sized regions into one batch buffer
+// (crop i at out + i*batch_stride, dense C-order dz*dy*dx each). Workers
+// process whole crops in parallel — the ML dataloader primitive.
+void mc_archive_read_regions(mc_archive *a, int lod, const mc_box *boxes, int n,
+                             long dz, long dy, long dx,
+                             mc_u8 *out, size_t batch_stride, int nthreads);
+
 // Flush + close (msync, persist header, truncate to exact length).
 void mc_archive_close(mc_archive *a);
 

@@ -413,6 +413,91 @@ size_t mc_cache_update(mc_cache *c, const mc_block_id *ids, size_t n, int nthrea
     return dec;
 }
 
+int mc_cache_best_lod(mc_cache *c, int finest_lod, int bz, int by, int bx){
+    for(int l=finest_lod;l<8;++l){
+        uint64_t key=bkey(l,bz,by,bx);
+        shard_t *sh=shard_of(c,key);
+        pthread_mutex_lock(&sh->mu);
+        int hit = map_find(sh,key)!=UINT32_MAX;
+        pthread_mutex_unlock(&sh->mu);
+        if(hit) return l;
+        bz>>=1; by>>=1; bx>>=1;
+    }
+    return -1;
+}
+
+// ---- async update tickets ---------------------------------------------------
+struct mc_cache_ticket {
+    mc_cache *c;
+    mc_block_id *ids;            // owned sorted copy
+    uint32_t *group_off;
+    uint32_t ngroups;
+    _Atomic uint32_t next;
+    _Atomic uint32_t groups_done;
+    _Atomic int cancel;
+    pthread_t th[16]; int nth;
+    int joined;
+};
+static void *aupd_worker(void *p){
+    mc_cache_ticket *t=p;
+    for(;;){
+        if(atomic_load_explicit(&t->cancel,memory_order_relaxed)){
+            // mark remaining groups done so done() converges after cancel
+            uint32_t g=atomic_fetch_add_explicit(&t->next,1,memory_order_relaxed);
+            if(g>=t->ngroups) break;
+            atomic_fetch_add_explicit(&t->groups_done,1,memory_order_relaxed);
+            continue;
+        }
+        uint32_t g=atomic_fetch_add_explicit(&t->next,1,memory_order_relaxed);
+        if(g>=t->ngroups) break;
+        for(uint32_t i=t->group_off[g];i<t->group_off[g+1];++i){
+            const mc_block_id *b=&t->ids[i];
+            cache_fill_one(t->c,b->lod,b->bz,b->by,b->bx);
+        }
+        atomic_fetch_add_explicit(&t->groups_done,1,memory_order_relaxed);
+    }
+    return NULL;
+}
+mc_cache_ticket *mc_cache_update_async(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads){
+    if(!c||!ids||!n) return NULL;
+    mc_cache_ticket *t=calloc(1,sizeof *t);
+    t->c=c;
+    t->ids=malloc(n*sizeof *t->ids);
+    memcpy(t->ids,ids,n*sizeof *t->ids);
+    qsort(t->ids,n,sizeof *t->ids,upd_cmp);
+    t->group_off=malloc((n+1)*sizeof *t->group_off);
+    uint32_t ng=0; t->group_off[0]=0;
+    for(size_t i=1;i<n;++i)
+        if((upd_sortkey(&t->ids[i])>>12)!=(upd_sortkey(&t->ids[i-1])>>12)) t->group_off[++ng]=(uint32_t)i;
+    t->group_off[++ng]=(uint32_t)n;
+    t->ngroups=ng;
+    atomic_store(&t->next,0); atomic_store(&t->groups_done,0); atomic_store(&t->cancel,0);
+    int nt=nthreads;
+    if(nt<=0){ long nc=sysconf(_SC_NPROCESSORS_ONLN); nt=(int)(nc>0?nc:4); }
+    if(nt>16)nt=16; if((uint32_t)nt>ng)nt=(int)ng;
+    t->nth=nt;
+    for(int i=0;i<nt;++i) pthread_create(&t->th[i],NULL,aupd_worker,t);
+    return t;
+}
+int mc_cache_ticket_done(mc_cache_ticket *t){
+    if(!t) return 1;
+    return atomic_load_explicit(&t->groups_done,memory_order_acquire)>=t->ngroups;
+}
+void mc_cache_ticket_cancel(mc_cache_ticket *t){
+    if(t) atomic_store_explicit(&t->cancel,1,memory_order_release);
+}
+static void ticket_join(mc_cache_ticket *t){
+    if(t->joined) return;
+    for(int i=0;i<t->nth;++i) pthread_join(t->th[i],NULL);
+    t->joined=1;
+}
+void mc_cache_ticket_wait(mc_cache_ticket *t){ if(t) ticket_join(t); }
+void mc_cache_ticket_free(mc_cache_ticket *t){
+    if(!t) return;
+    ticket_join(t);
+    free(t->ids); free(t->group_off); free(t);
+}
+
 void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         int gz=cz*16+bz, gy=cy*16+by, gx=cx*16+bx;

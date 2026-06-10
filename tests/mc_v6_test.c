@@ -91,6 +91,48 @@ int main(void){
     free(b4);
     printf("parallel: OK (par==serial, verify clean)\n");
 
+    // 5) fractions + sampler + region/batch reads
+    remove(path);
+    a=mc_archive_open_dims(path,512,256,256,6.0f);
+    // chunk 0: top half material, bottom half air (z<128 material)
+    for(int z=0;z<256;++z)for(int y=0;y<256;++y)for(int x=0;x<256;++x)
+        chunk[((size_t)z*256+y)*256+x]=(mc_u8)(z<128?(40+((x+y+z)%150)):0);
+    mc_archive_append_chunk_raw(a,0,0,0,0,chunk);
+    float f_mat=mc_archive_block_fraction(a,0,2,2,2);     // z blocks 0..7 material
+    float f_air=mc_archive_block_fraction(a,0,12,2,2);    // z blocks 8..15 air
+    if(!(f_mat>0.9f)||!(f_air<0.05f)){ fprintf(stderr,"FAIL: fractions %f %f\n",f_mat,f_air); return 1; }
+    if(!mc_archive_block_present(a,0,2,2,2)||mc_archive_block_present(a,0,12,2,2)){
+        fprintf(stderr,"FAIL: occupancy\n"); return 1; }
+    // sampler: deterministic + respects min_frac (volume dims 512x256x256 -> nx=512)
+    mc_box b1[16], b2[16];
+    int n1=mc_archive_sample_boxes(a,0,42,16,64,64,64,0.8f,b1);
+    int n2=mc_archive_sample_boxes(a,0,42,16,64,64,64,0.8f,b2);
+    if(n1!=n2||memcmp(b1,b2,sizeof(mc_box)*n1)!=0){ fprintf(stderr,"FAIL: sampler not deterministic\n"); return 1; }
+    int frac_ok=1;
+    for(int i=0;i<n1;++i) if(b1[i].z0+64>128+16) frac_ok=0;   // boxes must sit in material half
+    if(!n1||!frac_ok){ fprintf(stderr,"FAIL: sampler min_frac (%d boxes)\n",n1); return 1; }
+    // region read == direct blocks; batch read == per-region read
+    static mc_u8 reg[64*64*64], reg2[64*64*64];
+    mc_archive_read_region(a,0,10,20,30,64,64,64,reg,64*64,64,0);
+    long bad5=0;
+    for(int z=0;z<64;++z)for(int y=0;y<64;++y)for(int x=0;x<64;++x){
+        // compare against decoded chunk content via decode_chunk once
+        ;
+    }
+    static mc_u8 whole[256*256*256];
+    uint64_t co5b=mc_archive_chunk_offset(a,0,0,0,0);
+    mc_archive_decode_chunk(a,co5b,whole,0);
+    for(int z=0;z<64;++z)for(int y=0;y<64;++y)for(int x=0;x<64;++x)
+        if(reg[((size_t)z*64+y)*64+x]!=whole[((size_t)(10+z)*256+(20+y))*256+(30+x)]) bad5++;
+    if(bad5){ fprintf(stderr,"FAIL: region read mismatch (%ld)\n",bad5); return 1; }
+    mc_box bx2[4]={{0,0,0},{10,20,30},{60,100,3},{64,64,300}};   // last crosses x beyond 256 into absent chunk
+    static mc_u8 batch[4][64*64*64];
+    mc_archive_read_regions(a,0,bx2,4,64,64,64,&batch[0][0],sizeof batch[0],0);
+    mc_archive_read_region(a,0,10,20,30,64,64,64,reg2,64*64,64,1);
+    if(memcmp(batch[1],reg2,sizeof reg2)!=0){ fprintf(stderr,"FAIL: batch != single region\n"); return 1; }
+    printf("ml: OK (fractions %.2f/%.2f, %d sampled boxes, region+batch reads exact)\n",f_mat,f_air,n1);
+    mc_archive_close(a);
+
     free(arc); remove(path);
     printf("mc_v6: OK\n");
     return 0;

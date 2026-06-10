@@ -35,23 +35,25 @@ static uint64_t mc_resolve_chunk(const uint8_t*arc, uint64_t root_off,int cz,int
     return node;   // chunk-blob offset (0 if absent)
 }
 
-// chunk blob (v6): [f32 q][u64 xxh64][512B block-bitmap][present u16 lens]
-// [payloads]. q is the chunk's own quality (mixed-q archives / rate control);
-// the hash covers everything after the hash field (q is hashed too? no — the
-// hash field follows q, and covers bitmap..payload plus the q word is included
-// via mc_chunk_hash below). Blocks are self-contained.
-#define MC_BLOB_HDR 12
+// chunk blob (v7): [f32 q][u64 xxh64][u16 fmaplen][fmap][512B block-bitmap]
+// [present u16 lens][payloads]. q = the chunk's own quality; the hash covers
+// fmap+bitmap+lens+payloads; fmap = rc-coded per-block material fractions
+// (4096 nibbles, 0..15 ~= 0..100%) for rejection-free ML sampling.
+#define MC_BLOB_HDR 14
 static inline float mc_chunk_q(const uint8_t*arc, uint64_t chunk_off){
     float q; memcpy(&q,arc+chunk_off,4); return q;
 }
 static inline uint64_t mc_chunk_stored_hash(const uint8_t*arc, uint64_t chunk_off){
     uint64_t h; memcpy(&h,arc+chunk_off+4,8); return h;
 }
+static inline uint16_t mc_chunk_fmaplen(const uint8_t*arc, uint64_t chunk_off){
+    uint16_t l; memcpy(&l,arc+chunk_off+12,2); return l;
+}
 // block (bz,by,bx) present? -> 1 + its payload (abs_off, len). 0 = ZERO block. Offsets
 // are implicit (cumulative len of present blocks before it); ZERO blocks cost 1 bitmap bit.
 static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,int bx,
                           uint64_t *abs_off, uint32_t *len){
-    uint64_t bm_off = chunk_off + MC_BLOB_HDR;
+    uint64_t bm_off = chunk_off + MC_BLOB_HDR + mc_chunk_fmaplen(arc,chunk_off);
     const uint8_t*bm = arc + bm_off;
     int bi=(bz*16+by)*16+bx;
     if(!mc_bit_get(bm,bi)) return 0;
@@ -68,7 +70,7 @@ static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,i
 // total byte length of a chunk blob — used to copy a whole compressed chunk verbatim
 // (mc_append_chunk_compressed) and for chunk-blob range queries. chunk_off must be valid.
 static uint64_t mc_chunk_blob_len(const uint8_t*arc, uint64_t chunk_off){
-    uint64_t bm_off = chunk_off + MC_BLOB_HDR;
+    uint64_t bm_off = chunk_off + MC_BLOB_HDR + mc_chunk_fmaplen(arc,chunk_off);
     const uint8_t*bm = arc + bm_off;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
     const uint8_t*lens = arc + bm_off + MC_BITMAP_BYTES;

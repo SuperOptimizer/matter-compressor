@@ -178,6 +178,31 @@ int main(void){
     if(memcmp(g7,want,4096)!=0){ fprintf(stderr,"FAIL: updated block wrong\n"); return 1; }
     mc_cache_free(c);
 
+    // 7) best-resident-LOD + async tickets
+    c=mc_cache_new_archive(64ull<<20,a);
+    (void)mc_cache_get(c,1,1,1,1);                 // make LOD1 parent of (2,2,2)@LOD0 resident
+    if(mc_cache_best_lod(c,0,2,2,2)!=1){ fprintf(stderr,"FAIL: best_lod expected 1\n"); return 1; }
+    if(mc_cache_best_lod(c,0,9,9,9)!=-1){ fprintf(stderr,"FAIL: best_lod expected -1\n"); return 1; }
+    (void)mc_cache_get(c,0,2,2,2);
+    if(mc_cache_best_lod(c,0,2,2,2)!=0){ fprintf(stderr,"FAIL: best_lod expected 0\n"); return 1; }
+    static mc_block_id aw[512]; int na=0;
+    for(int i=0;i<512;++i) aw[na++]=(mc_block_id){0,i%16,(i/16)%16,(i/256)%16};
+    mc_cache_ticket *tk=mc_cache_update_async(c,aw,(size_t)na,4);
+    mc_cache_ticket_wait(tk);
+    if(!mc_cache_ticket_done(tk)){ fprintf(stderr,"FAIL: ticket not done after wait\n"); return 1; }
+    mc_cache_ticket_free(tk);
+    int miss=0; for(int i=0;i<na;++i) if(!mc_cache_contains(c,aw[i].lod,aw[i].bz,aw[i].by,aw[i].bx)) miss++;
+    if(miss){ fprintf(stderr,"FAIL: async update left %d misses\n",miss); return 1; }
+    // cancel path: must terminate and converge
+    mc_cache_clear(c);
+    tk=mc_cache_update_async(c,aw,(size_t)na,2);
+    mc_cache_ticket_cancel(tk);
+    mc_cache_ticket_wait(tk);
+    if(!mc_cache_ticket_done(tk)){ fprintf(stderr,"FAIL: cancelled ticket not done\n"); return 1; }
+    mc_cache_ticket_free(tk);
+    printf("best_lod+async: OK\n");
+    mc_cache_free(c);
+
     mc_archive_close(a);
     remove(path);
     printf("mc_cache: OK\n");

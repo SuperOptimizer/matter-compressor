@@ -84,22 +84,31 @@ static size_t encode_chunk_blob(const u8 *chunk256, out_put_fn put, void *out){
     static _Thread_local mc_buf tmp; tmp.len=0;
     uint8_t bm[MC_BITMAP_BYTES]; memset(bm,0,sizeof bm);
     uint16_t blen[MC_GRID3]; int npresent=0;
+    static _Thread_local uint8_t frac[MC_GRID3];
+    memset(frac,0,MC_GRID3);
     static _Thread_local u8 vox[MC_BLK*MC_BLK*MC_BLK];
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         int bi=(bz*16+by)*16+bx;
         if(!gather_blk256(chunk256,bz,by,bx,vox)) continue;
+        int cnt=0; for(int i=0;i<MC_BLK*MC_BLK*MC_BLK;++i) cnt+=vox[i]!=0;
+        frac[bi]=(uint8_t)((cnt*15+2048)/4096);              // nibble 0..15
+        if(cnt&&!frac[bi]) frac[bi]=1;                        // any material -> >=1
         uint32_t len=0; if(mc_enc_block(vox,&tmp,&len)){ mc_bit_set(bm,bi); blen[bi]=(uint16_t)len; npresent++; }
     }
     if(!npresent) return 0;   // all air -> no blob
-    // v6 blob header: [f32 q][u64 xxh64 over bitmap+lens+payloads]
+    // v7 blob header: [f32 q][u64 xxh64][u16 fmaplen][fmap]
     float q=mc_get_quality();
     static _Thread_local uint16_t lens16[MC_GRID3]; int nl=0;
     for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(bm,bi)) lens16[nl++]=blen[bi];
-    uint64_t h=mc_xxh64(bm,MC_BITMAP_BYTES,0x6D636368756E6Bull);
+    static _Thread_local uint8_t fmap[MC_GRID3/2+64];
+    uint16_t fml=(uint16_t)mc_enc_fracmap(frac,fmap,sizeof fmap);
+    uint64_t h=mc_xxh64(fmap,fml,0x6D636368756E6Bull);
+    h^=mc_xxh64(bm,MC_BITMAP_BYTES,h);
     h^=mc_xxh64(lens16,(size_t)nl*2,h);
     h^=mc_xxh64(tmp.p,tmp.len,h);
-    size_t total=MC_BLOB_HDR+MC_BITMAP_BYTES+(size_t)npresent*2+tmp.len;
-    put(out,&q,4); put(out,&h,8);
+    size_t total=MC_BLOB_HDR+fml+MC_BITMAP_BYTES+(size_t)npresent*2+tmp.len;
+    put(out,&q,4); put(out,&h,8); put(out,&fml,2);
+    put(out,fmap,fml);
     put(out,bm,MC_BITMAP_BYTES);
     put(out,lens16,(size_t)nl*2);
     put(out,tmp.p,tmp.len);
@@ -108,11 +117,14 @@ static size_t encode_chunk_blob(const u8 *chunk256, out_put_fn put, void *out){
 
 // recompute a chunk blob's hash from its bytes (mc_verify / verify-on-decode).
 uint64_t mc_chunk_compute_hash(const uint8_t *blob, uint64_t blob_len){
-    const uint8_t *bm=blob+MC_BLOB_HDR;
+    uint16_t fml; memcpy(&fml,blob+12,2);
+    const uint8_t *fmap=blob+MC_BLOB_HDR;
+    const uint8_t *bm=fmap+fml;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
     const uint8_t *lens=bm+MC_BITMAP_BYTES;
-    uint64_t pay=(uint64_t)MC_BLOB_HDR+MC_BITMAP_BYTES+(uint64_t)npresent*2;
-    uint64_t h=mc_xxh64(bm,MC_BITMAP_BYTES,0x6D636368756E6Bull);
+    uint64_t pay=(uint64_t)MC_BLOB_HDR+fml+MC_BITMAP_BYTES+(uint64_t)npresent*2;
+    uint64_t h=mc_xxh64(fmap,fml,0x6D636368756E6Bull);
+    h^=mc_xxh64(bm,MC_BITMAP_BYTES,h);
     h^=mc_xxh64(lens,(size_t)npresent*2,h);
     h^=mc_xxh64(blob+pay,(size_t)(blob_len-pay),h);
     return h;
@@ -562,6 +574,7 @@ typedef struct {
     mc_buf bufs[ENC_STRIPES];
     uint16_t blen[MC_GRID3];
     uint8_t  bm[MC_BITMAP_BYTES];
+    uint8_t  frac[MC_GRID3];
     pthread_mutex_t bm_mu;
     _Atomic uint32_t next;
 } echunk_ctx;
@@ -576,6 +589,9 @@ static void *echunk_worker(void *p){
         for(uint32_t bi=b0;bi<b1;++bi){
             int bz=(int)(bi>>8), by=(int)((bi>>4)&15), bx=(int)(bi&15);
             if(!gather_blk256(c->vox,bz,by,bx,blk)) continue;
+            { int cnt=0; for(int i=0;i<MC_BLK*MC_BLK*MC_BLK;++i) cnt+=blk[i]!=0;
+              c->frac[bi]=(uint8_t)((cnt*15+2048)/4096);
+              if(cnt&&!c->frac[bi]) c->frac[bi]=1; }
             uint32_t len=0;
             if(mc_enc_block(blk,&c->bufs[s],&len)){
                 c->blen[bi]=(uint16_t)len;
@@ -611,7 +627,10 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
         int nl=0;
         for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(c->bm,bi)) lens16[nl++]=c->blen[bi];
         float qq=c->q; uint64_t h=0;
+        static _Thread_local uint8_t fmap[MC_GRID3/2+64];
+        uint16_t fml=(uint16_t)mc_enc_fracmap(c->frac,fmap,sizeof fmap);
         stage_put(&st,&qq,4); stage_put(&st,&h,8);          // hash patched below
+        stage_put(&st,&fml,2); stage_put(&st,fmap,fml);
         stage_put(&st,c->bm,MC_BITMAP_BYTES);
         stage_put(&st,lens16,(size_t)nl*2);
         for(int s=0;s<ENC_STRIPES;++s) if(c->bufs[s].len) stage_put(&st,c->bufs[s].p,c->bufs[s].len);
@@ -624,6 +643,151 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
     pthread_mutex_destroy(&c->bm_mu);
     free(c);
     return rc;
+}
+
+int mc_archive_block_present(mc_archive *a, int lod, int bz, int by, int bx){
+    if(!a||lod<0||lod>7||bz<0||by<0||bx<0) return 0;
+    uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
+    if(!co) return 0;
+    const u8 *bm=a->base+co+MC_BLOB_HDR+mc_chunk_fmaplen(a->base,co);
+    return mc_bit_get(bm,((bz&15)*16+(by&15))*16+(bx&15));
+}
+
+float mc_archive_block_fraction(mc_archive *a, int lod, int bz, int by, int bx){
+    if(!a||lod<0||lod>7||bz<0||by<0||bx<0) return 0.0f;
+    uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
+    if(!co) return 0.0f;
+    static _Thread_local uint8_t fr[MC_GRID3];
+    static _Thread_local uint64_t fr_key=~0ull;
+    if(fr_key!=co){
+        uint16_t fml=mc_chunk_fmaplen(a->base,co);
+        if(!fml) return 0.0f;
+        mc_dec_fracmap(a->base+co+MC_BLOB_HDR,fml,fr);
+        fr_key=co;
+    }
+    return (float)fr[((bz&15)*16+(by&15))*16+(bx&15)]/15.0f;
+}
+
+static inline uint64_t mc_rng64(uint64_t *s){
+    uint64_t x=*s; x^=x<<13; x^=x>>7; x^=x<<17; *s=x; return x;
+}
+int mc_archive_sample_boxes(mc_archive *a, int lod, uint64_t seed, int count,
+                            long dz, long dy, long dx, float min_frac,
+                            mc_box *out){
+    if(!a||!out||count<=0||dz<=0||dy<=0||dx<=0) return 0;
+    uint32_t unx,uny,unz;
+    memcpy(&unx,a->base+MCH_NX,4); memcpy(&uny,a->base+MCH_NY,4); memcpy(&unz,a->base+MCH_NZ,4);
+    long NXl=(long)unx>>lod, NYl=(long)uny>>lod, NZl=(long)unz>>lod;
+    if(NZl<dz||NYl<dy||NXl<dx) return 0;
+    uint64_t s=seed?seed:0x9E3779B97F4A7C15ull;
+    int got=0; long attempts=0, max_attempts=(long)count*256;
+    while(got<count && attempts++<max_attempts){
+        long z0=(long)(mc_rng64(&s)%(uint64_t)(NZl-dz+1));
+        long y0=(long)(mc_rng64(&s)%(uint64_t)(NYl-dy+1));
+        long x0=(long)(mc_rng64(&s)%(uint64_t)(NXl-dx+1));
+        // mean block fraction over the touched block grid
+        long bz0=z0>>4, bz1=(z0+dz-1)>>4, by0=y0>>4, by1=(y0+dy-1)>>4, bx0=x0>>4, bx1=(x0+dx-1)>>4;
+        double fsum=0; long nb=0;
+        for(long bz=bz0;bz<=bz1;++bz)for(long by=by0;by<=by1;++by)for(long bx=bx0;bx<=bx1;++bx){
+            fsum+=mc_archive_block_fraction(a,lod,(int)bz,(int)by,(int)bx); nb++;
+        }
+        if(nb && fsum/nb>=min_frac){ out[got].z0=z0; out[got].y0=y0; out[got].x0=x0; got++; }
+    }
+    return got;
+}
+
+typedef struct {
+    mc_archive *a; int lod;
+    const mc_box *boxes; int n;
+    long dz,dy,dx;
+    mc_u8 *out; size_t bstride;
+    _Atomic uint32_t next;
+} crops_ctx;
+static void *crops_worker(void *p){
+    crops_ctx *c=p;
+    for(;;){
+        uint32_t i=atomic_fetch_add_explicit(&c->next,1,memory_order_relaxed);
+        if(i>=(uint32_t)c->n) break;
+        mc_archive_read_region(c->a,c->lod,c->boxes[i].z0,c->boxes[i].y0,c->boxes[i].x0,
+                               c->dz,c->dy,c->dx,
+                               c->out+(size_t)i*c->bstride,
+                               (size_t)c->dy*c->dx,(size_t)c->dx,1);
+    }
+    return NULL;
+}
+void mc_archive_read_regions(mc_archive *a, int lod, const mc_box *boxes, int n,
+                             long dz, long dy, long dx,
+                             mc_u8 *out, size_t batch_stride, int nthreads){
+    if(!a||!boxes||n<=0||!out) return;
+    crops_ctx c={.a=a,.lod=lod,.boxes=boxes,.n=n,.dz=dz,.dy=dy,.dx=dx,
+                 .out=out,.bstride=batch_stride};
+    atomic_store(&c.next,0);
+    int nt=auto_threads(nthreads); if(nt>n)nt=n;
+    if(nt<=1){ crops_worker(&c); return; }
+    pthread_t th[16];
+    for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,crops_worker,&c);
+    for(int t=0;t<nt;++t) pthread_join(th[t],NULL);
+}
+
+// ---- region read ------------------------------------------------------------
+typedef struct {
+    mc_archive *a; int lod;
+    long z0,y0,x0,dz,dy,dx;
+    mc_u8 *out; size_t sz,sy;
+    int nbz,nby,nbx; long bz0,by0,bx0;     // touched block range
+    _Atomic uint32_t next;
+} region_ctx;
+static void *region_worker(void *p){
+    region_ctx *c=p;
+    mc_u8 blk[MC_BLK*MC_BLK*MC_BLK];
+    uint32_t nb=(uint32_t)(c->nbz*c->nby*c->nbx);
+    for(;;){
+        uint32_t w=atomic_fetch_add_explicit(&c->next,1,memory_order_relaxed);
+        if(w>=nb) break;
+        long bz=c->bz0+w/(c->nby*c->nbx);
+        long by=c->by0+(w/c->nbx)%c->nby;
+        long bx=c->bx0+w%c->nbx;
+        uint64_t co=mc_archive_chunk_offset(c->a,c->lod,(int)(bz>>4),(int)(by>>4),(int)(bx>>4));
+        long gz=bz*16, gy=by*16, gx=bx*16;            // block origin in voxels
+        // intersection of this block with the region
+        long iz0=gz>c->z0?gz:c->z0, iz1=(gz+16<c->z0+c->dz)?gz+16:c->z0+c->dz;
+        long iy0=gy>c->y0?gy:c->y0, iy1=(gy+16<c->y0+c->dy)?gy+16:c->y0+c->dy;
+        long ix0=gx>c->x0?gx:c->x0, ix1=(gx+16<c->x0+c->dx)?gx+16:c->x0+c->dx;
+        if(iz0>=iz1||iy0>=iy1||ix0>=ix1) continue;
+        int present=0;
+        if(co){
+            const u8 *bm=c->a->base+co+MC_BLOB_HDR+mc_chunk_fmaplen(c->a->base,co);
+            present=mc_bit_get(bm,(int)(((bz&15)*16+(by&15))*16+(bx&15)));
+        }
+        if(present) mc_archive_decode_block(c->a,co,(int)(bz&15),(int)(by&15),(int)(bx&15),blk);
+        long nrow=ix1-ix0;
+        for(long z=iz0;z<iz1;++z)for(long y=iy0;y<iy1;++y){
+            mc_u8 *dst=c->out+(size_t)(z-c->z0)*c->sz+(size_t)(y-c->y0)*c->sy+(size_t)(ix0-c->x0);
+            if(present) memcpy(dst,blk+((size_t)(z-gz)*16+(y-gy))*16+(ix0-gx),(size_t)nrow);
+            else        memset(dst,0,(size_t)nrow);
+        }
+    }
+    return NULL;
+}
+void mc_archive_read_region(mc_archive *a, int lod,
+                            long z0, long y0, long x0,
+                            long dz, long dy, long dx,
+                            mc_u8 *out, size_t sz, size_t sy, int nthreads){
+    if(!a||lod<0||lod>7||!out||dz<=0||dy<=0||dx<=0) return;
+    region_ctx c={.a=a,.lod=lod,.z0=z0,.y0=y0,.x0=x0,.dz=dz,.dy=dy,.dx=dx,
+                  .out=out,.sz=sz,.sy=sy};
+    c.bz0=z0>>4; c.by0=y0>>4; c.bx0=x0>>4;
+    c.nbz=(int)(((z0+dz+15)>>4)-c.bz0);
+    c.nby=(int)(((y0+dy+15)>>4)-c.by0);
+    c.nbx=(int)(((x0+dx+15)>>4)-c.bx0);
+    atomic_store(&c.next,0);
+    int nt=auto_threads(nthreads);
+    uint32_t nb=(uint32_t)(c.nbz*c.nby*c.nbx);
+    if((uint32_t)nt>nb) nt=(int)nb;
+    if(nt<=1){ region_worker(&c); return; }
+    pthread_t th[16];
+    for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,region_worker,&c);
+    for(int t=0;t<nt;++t) pthread_join(th[t],NULL);
 }
 
 void mc_archive_close(mc_archive *a){
@@ -704,7 +868,7 @@ struct mc_reader {
     u8 *cbuf; uint64_t cbuf_off; uint64_t cbuf_len;
     // partial-fetch mode: per-chunk header cache (bitmap + lens) + one payload.
     int partial;
-    u8 hdr[MC_BLOB_HDR + MC_BITMAP_BYTES + MC_GRID3*2]; uint64_t hdr_off; int hdr_np;
+    u8 hdr[MC_BLOB_HDR + MC_BITMAP_BYTES + MC_GRID3*2]; uint64_t hdr_off; int hdr_np; uint16_t hdr_fml;
     u8 *pbuf; size_t pbuf_cap;
     // streaming node-table cache: resolving a chunk needs 3 dependent 32KB
     // table reads; without a cache every resolve re-fetches them (3 GETs per
@@ -782,8 +946,12 @@ uint64_t mc_chunk_offset(mc_reader *r,int lod,int cz,int cy,int cx){
 // streaming: ensure the whole chunk blob at chunk_off is cached in r->cbuf, return ptr.
 static const u8 *sfetch_chunk(mc_reader *r, uint64_t chunk_off){
     if(r->cbuf && r->cbuf_off==chunk_off) return r->cbuf;
-    // fetch the bitmap + lens to compute total length, then the full blob in one GET.
-    uint64_t bm_off = chunk_off + MC_BLOB_HDR;
+    // fetch header (q/hash/fmaplen), then bitmap + lens for total length, then
+    // the full blob in one GET.
+    u8 bh[MC_BLOB_HDR];
+    if(sread(r,chunk_off,MC_BLOB_HDR,bh)!=0) return NULL;
+    uint16_t fml; memcpy(&fml,bh+12,2);
+    uint64_t bm_off = chunk_off + MC_BLOB_HDR + fml;
     u8 bm[MC_BITMAP_BYTES];
     if(sread(r,bm_off,MC_BITMAP_BYTES,bm)!=0) return NULL;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
@@ -801,10 +969,13 @@ static const u8 *sfetch_chunk(mc_reader *r, uint64_t chunk_off){
 // partial-fetch path: header cache + single-payload range read.
 static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst){
     if(r->hdr_off!=chunk_off){
-        if(sread(r,chunk_off,MC_BLOB_HDR+MC_BITMAP_BYTES,r->hdr)!=0) return -1;
+        if(sread(r,chunk_off,MC_BLOB_HDR,r->hdr)!=0) return -1;
+        uint16_t fml; memcpy(&fml,r->hdr+12,2);
+        r->hdr_fml=fml;
+        if(sread(r,chunk_off+MC_BLOB_HDR+fml,MC_BITMAP_BYTES,r->hdr+MC_BLOB_HDR)!=0) return -1;
         const u8 *bm0=r->hdr+MC_BLOB_HDR;
         int np=0; for(int i=0;i<MC_BITMAP_BYTES;++i) np+=__builtin_popcount(bm0[i]);
-        if(np && sread(r,chunk_off+MC_BLOB_HDR+MC_BITMAP_BYTES,(uint32_t)(np*2),r->hdr+MC_BLOB_HDR+MC_BITMAP_BYTES)!=0) return -1;
+        if(np && sread(r,chunk_off+MC_BLOB_HDR+fml+MC_BITMAP_BYTES,(uint32_t)(np*2),r->hdr+MC_BLOB_HDR+MC_BITMAP_BYTES)!=0) return -1;
         r->hdr_np=np; r->hdr_off=chunk_off;
     }
     { float q; memcpy(&q,r->hdr,4); mc_set_quality(q); }
@@ -814,7 +985,7 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
     const u8 *lens=bm+MC_BITMAP_BYTES;
     uint64_t cum=0; for(int s2=0;s2<slot;++s2){ uint16_t l; memcpy(&l,lens+(size_t)s2*2,2); cum+=l; }
     uint16_t mylen; memcpy(&mylen,lens+(size_t)slot*2,2);
-    uint64_t pay=chunk_off+MC_BLOB_HDR+MC_BITMAP_BYTES+(uint64_t)r->hdr_np*2+cum;
+    uint64_t pay=chunk_off+MC_BLOB_HDR+r->hdr_fml+MC_BITMAP_BYTES+(uint64_t)r->hdr_np*2+cum;
     if(r->pbuf_cap<mylen){ r->pbuf=realloc(r->pbuf,mylen); r->pbuf_cap=mylen; }
     if(sread(r,pay,mylen,r->pbuf)!=0) return -1;
     mc_dec_block(r->pbuf,mylen,dst);

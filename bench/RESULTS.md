@@ -241,3 +241,18 @@ q6 146/364, q12 153/471; cold block 0.007-0.023 ms. Parallel chunk:
 Remaining hot spots: the adaptive bin decode itself (serial by nature; the
 rANS alternative was measured and closed) and the mask bins on boundary-heavy
 chunks. Both are at the architecture's serial floor.
+
+## ML + VC3D feature round (format v7)
+
+- Region read (mc_archive_read_region): arbitrary boxes into caller-strided
+  buffers, parallel over touched blocks; batch variant
+  (mc_archive_read_regions) fills N same-sized crops into one batch tensor.
+- Per-chunk material-fraction map (v7 blob field, rc-coded 4-bit, ~0.3%
+  ratio cost at q=6/12): mc_archive_block_fraction with per-thread chunk
+  cache; mc_archive_block_present for occupancy.
+- Deterministic seeded box sampler (mc_archive_sample_boxes): same seed ->
+  same boxes, min-material-fraction rejection at fraction-map speed (no
+  voxel decode).
+- Cache: mc_cache_best_lod (page-table render-now-refine-later pattern) and
+  async update tickets (submit / poll / cancel / wait) for speculative
+  prefetch during camera motion.

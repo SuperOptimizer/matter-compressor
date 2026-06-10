@@ -85,6 +85,24 @@ size_t mc_cache_update(mc_cache *c, const mc_block_id *ids, size_t n, int nthrea
 // Thread-safe against concurrent gets/inserts.
 void mc_cache_invalidate_chunk(mc_cache *c, int lod, int cz, int cy, int cx);
 
+// Finest resident LOD covering block (bz,by,bx in `finest_lod` block coords):
+// probes finest_lod..7 (block coords halve per level) WITHOUT touching
+// recently-used bits. Returns the lod, or -1 if nothing is resident. The
+// page-table pattern: render the best resident level now, refine later.
+int mc_cache_best_lod(mc_cache *c, int finest_lod, int bz, int by, int bx);
+
+// Async batch update: like mc_cache_update but returns immediately with a
+// ticket. Poll mc_cache_ticket_done, or mc_cache_ticket_wait to block.
+// mc_cache_ticket_cancel makes workers stop at the next chunk-group boundary
+// (camera moved -> abandon stale prefetch). Always mc_cache_ticket_free
+// (it joins any remaining workers first).
+typedef struct mc_cache_ticket mc_cache_ticket;
+mc_cache_ticket *mc_cache_update_async(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads);
+int  mc_cache_ticket_done(mc_cache_ticket *t);      // 1 when all work finished/cancelled
+void mc_cache_ticket_cancel(mc_cache_ticket *t);
+void mc_cache_ticket_wait(mc_cache_ticket *t);
+void mc_cache_ticket_free(mc_cache_ticket *t);
+
 // Drop everything (e.g. source archive replaced).
 void mc_cache_clear(mc_cache *c);
 

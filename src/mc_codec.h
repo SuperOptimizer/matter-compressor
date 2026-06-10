@@ -60,4 +60,8 @@ int   mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out);
 // (mask in payload); plen comes from the chunk's block-length table.
 void  mc_dec_block(const mc_u8 *payload, uint32_t plen, mc_u8 *dst);
 
+// per-chunk material-fraction map (4096 nibbles 0..15), context-coded.
+uint32_t mc_enc_fracmap(const mc_u8 *frac, mc_u8 *out, size_t cap);
+void     mc_dec_fracmap(const mc_u8 *in, uint32_t len, mc_u8 *frac);
+
 #endif
