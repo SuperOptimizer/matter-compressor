@@ -72,6 +72,38 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
     int it = 0, done = 0;
 
     if (cfg->filter == MC_FILTER_TRILINEAR) {
+#ifdef MC_S_HAVE_TRI8
+        for (; it + 8 <= cfg->nsteps && !done; it += 8) {
+            float bz[8], by[8], bx[8], v8[8];
+            for (int k = 0; k < 8; k++) {
+                bz[k] = pz; by[k] = py; bx[k] = px;
+                pz += sz_; py += sy_; px += sx_;
+            }
+            mc_s_tri8(s, bz, by, bx, v8);
+            switch (cfg->comp) {
+            case MC_COMP_MIN:
+                for (int k = 0; k < 8; k++) if (v8[k] < mn) mn = v8[k];
+                break;
+            case MC_COMP_MAX:
+                for (int k = 0; k < 8; k++) if (v8[k] > mx) mx = v8[k];
+                break;
+            case MC_COMP_MEAN:
+                for (int k = 0; k < 8; k++) sum += v8[k];
+                break;
+            default:                            // ALPHA
+                for (int k = 0; k < 8 && !done; k++) {
+                    float a = (v8[k] * (1.0f / 255.0f) - a_th) * a_sc;
+                    if (a > 0.0f) {
+                        if (a > 1.0f) a = 1.0f;
+                        acc += (1.0f - A) * a * v8[k];
+                        A   += (1.0f - A) * a;
+                        if (A >= 0.98f) done = 1;
+                    }
+                }
+                break;
+            }
+        }
+#endif
         for (; it + 4 <= cfg->nsteps && !done; it += 4) {
             float bz[4], by[4], bx[4], v4[4];
             for (int k = 0; k < 4; k++) {
@@ -147,8 +179,30 @@ void mc_render_points(mc_sampler *s,
                              ? to_u8(mc_s_nearest(s, P[0], P[1], P[2])) : 0;
             }
         } else {
-            // 4 pixels per mc_s_tri4 call (SIMD gather+lerp where available)
+            // 4/8 pixels per mc_s_tri4/8 call (SIMD gather+lerp)
             size_t k = 0;
+#ifdef MC_S_HAVE_TRI8
+            for (; k + 8 <= n; k += 8) {
+                const float *P = pts + k * 3;
+                int allv = 1;
+                for (int q = 0; q < 8; q++) allv &= pt_valid(P + q * 3);
+                if (allv) {
+                    float bz[8], by[8], bx[8], v8[8];
+                    for (int q = 0; q < 8; q++) {
+                        bz[q] = P[q * 3]; by[q] = P[q * 3 + 1];
+                        bx[q] = P[q * 3 + 2];
+                    }
+                    mc_s_tri8(s, bz, by, bx, v8);
+                    for (int q = 0; q < 8; q++) out[k + q] = to_u8(v8[q]);
+                } else {
+                    for (size_t q = k; q < k + 8; q++) {
+                        const float *Q = pts + q * 3;
+                        out[q] = pt_valid(Q)
+                            ? to_u8(mc_s_trilinear(s, Q[0], Q[1], Q[2])) : 0;
+                    }
+                }
+            }
+#endif
             for (; k + 4 <= n; k += 4) {
                 const float *P = pts + k * 3;
                 if (pt_valid(P) && pt_valid(P + 3) &&

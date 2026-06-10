@@ -217,6 +217,51 @@ static inline __m128 mc_s_lerp8x4(const uint8_t *p0, const uint8_t *p1,
     __m128 c1 = _mm_add_ps(c10, _mm_mul_ps(_mm_sub_ps(c11, c10), dy));
     return _mm_add_ps(c0, _mm_mul_ps(_mm_sub_ps(c1, c0), dz));
 }
+
+#if defined(__AVX2__) && !defined(MC_S_NO_TRI8)
+// 8-wide variant for the x86-64-v3 fleet (Zen 3/4/5, 12th-gen+ Intel).
+#define MC_S_HAVE_TRI8 1
+static inline __m256i mc_s_g8(const uint8_t *const p[8], size_t off) {
+    __m128i lo = _mm_setzero_si128(), hi = lo;
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[0] + off), 0);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[1] + off), 1);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[2] + off), 2);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[3] + off), 3);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[4] + off), 0);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[5] + off), 1);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[6] + off), 2);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[7] + off), 3);
+    return _mm256_set_m128i(hi, lo);
+}
+static inline __m256 mc_s_lerp8x8(const uint8_t *const p[8],
+                                  size_t sy, size_t sx,
+                                  __m256 dz, __m256 dy, __m256 dx) {
+    __m256i g00 = mc_s_g8(p, 0),  g01 = mc_s_g8(p, sx);
+    __m256i g10 = mc_s_g8(p, sy), g11 = mc_s_g8(p, sy + sx);
+    // even byte of each u16 pair = x0 corner, odd = x1 (per 128-bit half)
+    const __m256i me = _mm256_broadcastsi128_si256(
+        _mm_set_epi8(-1, -1, -1, 6, -1, -1, -1, 4,
+                     -1, -1, -1, 2, -1, -1, -1, 0));
+    const __m256i mo = _mm256_broadcastsi128_si256(
+        _mm_set_epi8(-1, -1, -1, 7, -1, -1, -1, 5,
+                     -1, -1, -1, 3, -1, -1, -1, 1));
+#define MC_S_F32E(g) _mm256_cvtepi32_ps(_mm256_shuffle_epi8(g, me))
+#define MC_S_F32O(g) _mm256_cvtepi32_ps(_mm256_shuffle_epi8(g, mo))
+    __m256 f000 = MC_S_F32E(g00), f001 = MC_S_F32O(g00);
+    __m256 f010 = MC_S_F32E(g01), f011 = MC_S_F32O(g01);
+    __m256 f100 = MC_S_F32E(g10), f101 = MC_S_F32O(g10);
+    __m256 f110 = MC_S_F32E(g11), f111 = MC_S_F32O(g11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    __m256 c00 = _mm256_add_ps(f000, _mm256_mul_ps(_mm256_sub_ps(f001, f000), dx));
+    __m256 c01 = _mm256_add_ps(f010, _mm256_mul_ps(_mm256_sub_ps(f011, f010), dx));
+    __m256 c10 = _mm256_add_ps(f100, _mm256_mul_ps(_mm256_sub_ps(f101, f100), dx));
+    __m256 c11 = _mm256_add_ps(f110, _mm256_mul_ps(_mm256_sub_ps(f111, f110), dx));
+    __m256 c0 = _mm256_add_ps(c00, _mm256_mul_ps(_mm256_sub_ps(c01, c00), dy));
+    __m256 c1 = _mm256_add_ps(c10, _mm256_mul_ps(_mm256_sub_ps(c11, c10), dy));
+    return _mm256_add_ps(c0, _mm256_mul_ps(_mm256_sub_ps(c1, c0), dz));
+}
+#endif  /* __AVX2__ */
 #endif
 
 static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
@@ -334,5 +379,63 @@ static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
     out[2] = mc_s_trilinear(s, pz[2], py[2], px[2]);
     out[3] = mc_s_trilinear(s, pz[3], py[3], px[3]);
 }
+
+#ifdef MC_S_HAVE_TRI8
+// 8 positions at once (AVX2). Same fallback discipline as mc_s_tri4.
+static inline void mc_s_tri8(mc_sampler *s, const float *pz, const float *py,
+                             const float *px, float *out) {
+    __m256 zv = _mm256_loadu_ps(pz), yv = _mm256_loadu_ps(py),
+           xv = _mm256_loadu_ps(px);
+    __m256 zf = _mm256_floor_ps(zv), yf = _mm256_floor_ps(yv),
+           xf = _mm256_floor_ps(xv);
+    __m256i zi = _mm256_cvttps_epi32(zf), yi = _mm256_cvttps_epi32(yf),
+            xi = _mm256_cvttps_epi32(xf);
+    __m256i ok = _mm256_and_si256(
+        _mm256_cmpgt_epi32(zi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.nz - 1), zi));
+    ok = _mm256_and_si256(ok, _mm256_and_si256(
+        _mm256_cmpgt_epi32(yi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.ny - 1), yi)));
+    ok = _mm256_and_si256(ok, _mm256_and_si256(
+        _mm256_cmpgt_epi32(xi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.nx - 1), xi)));
+    if (_mm256_movemask_ps(_mm256_castsi256_ps(ok)) == 0xFF) {
+        __m256 dz = _mm256_sub_ps(zv, zf), dy = _mm256_sub_ps(yv, yf),
+               dx = _mm256_sub_ps(xv, xf);
+        int32_t z0[8], y0[8], x0[8];
+        _mm256_storeu_si256((__m256i *)z0, zi);
+        _mm256_storeu_si256((__m256i *)y0, yi);
+        _mm256_storeu_si256((__m256i *)x0, xi);
+        const uint8_t *b[8];
+        if (s->src.dense) {
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            for (int k = 0; k < 8; k++)
+                b[k] = s->src.dense + (size_t)z0[k] * sy +
+                       (size_t)y0[k] * sx + x0[k];
+            _mm256_storeu_ps(out, mc_s_lerp8x8(b, sy, sx, dz, dy, dx));
+            return;
+        }
+        int fast = 1;
+        for (int k = 0; k < 8 && fast; k++)
+            fast = (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
+                   (x0[k] & 15) != 15;
+        if (fast) {
+            for (int k = 0; k < 8 && fast; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { fast = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (fast) {
+                _mm256_storeu_ps(out, mc_s_lerp8x8(b, 256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+    mc_s_tri4(s, pz, py, px, out);
+    mc_s_tri4(s, pz + 4, py + 4, px + 4, out + 4);
+}
+#endif
 
 #endif

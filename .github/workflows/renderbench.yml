@@ -1,0 +1,18 @@
+name: renderbench
+on:
+  push:
+    branches: [renderbench]
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cat /proc/cpuinfo | grep "model name" | head -1
+      - name: build both variants
+        run: |
+          clang -I src -O3 -march=x86-64-v3 -o rb_tri8 bench/render_bench.c src/mc_sample.c src/mc_render.c src/matter_compressor.c -lm -lpthread
+          clang -I src -O3 -march=x86-64-v3 -DMC_S_NO_TRI8 -o rb_tri4 bench/render_bench.c src/mc_sample.c src/mc_render.c src/matter_compressor.c -lm -lpthread
+      - name: bench AVX2 tri8
+        run: ./rb_tri8
+      - name: bench SSE tri4 (8-wide disabled)
+        run: ./rb_tri4
