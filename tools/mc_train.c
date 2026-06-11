@@ -35,7 +35,8 @@ int main(int argc,char**argv){
         if(fread(vol,1,n,f)!=n){fprintf(stderr,"short read\n");return 1;} fclose(f);
         char *ql=strdup(qlist);
         for(char *tok=strtok_r(ql,",",&ql);tok;tok=strtok_r(NULL,",",&ql)){
-            mc_set_quality((float)atof(tok));
+            mc_codec_ctx *cx=mc_codec_ctx_new();
+            mc_codec_ctx_set_quality(cx,(float)atof(tok));
             for(int bz=0;bz+MC_BLK<=D;bz+=MC_BLK)
             for(int by=0;by+MC_BLK<=D;by+=MC_BLK)
             for(int bx=0;bx+MC_BLK<=D;bx+=MC_BLK){
@@ -43,8 +44,9 @@ int main(int argc,char**argv){
                     memcpy(blk+((size_t)z*MC_BLK+y)*MC_BLK,
                            vol+((size_t)(bz+z)*D+(by+y))*D+bx, MC_BLK);
                 uint32_t len=0; out.len=0;
-                mc_enc_block(blk,&out,&len);
+                mc_enc_block(cx,blk,&out,&len);
             }
+            mc_codec_ctx_free(cx);
             fprintf(stderr,"%s q=%s done\n",vp,tok);
         }
         free(vol);

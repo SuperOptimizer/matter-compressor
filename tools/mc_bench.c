@@ -70,7 +70,9 @@ static void run_q(const u8 *vol,int T,int P,float q){
     char path[256]; snprintf(path,sizeof path,"/tmp/mc_bench_%d_%.2f.mc",T,q);
     remove(path);
     mc_archive *a=mc_archive_open(path,P,q);
-    mc_set_max_error(g_tau);
+    mc_codec_ctx *cx_=mc_codec_ctx_new();
+    mc_codec_ctx_set_quality(cx_,q);
+    mc_codec_ctx_set_max_error(cx_,g_tau);
     static _Thread_local u8 *chunk=0; if(!chunk) chunk=malloc((size_t)256*256*256);
 
     // ---- encode ----
@@ -79,9 +81,10 @@ static void run_q(const u8 *vol,int T,int P,float q){
         for(int z=0;z<256;++z)for(int y=0;y<256;++y)
             memcpy(chunk+((size_t)z*256+y)*256,
                    vol+((size_t)(cz*256+z)*P+(cy*256+y))*P+(size_t)cx*256,256);
-        mc_archive_append_chunk_raw(a,0,cz,cy,cx,chunk);
+        mc_archive_append_chunk_ctx(a,cx_,0,cz,cy,cx,chunk);
         vox_in+=(size_t)256*256*256;
     }
+    mc_codec_ctx_free(cx_);
     double enc_s=now()-t0;
 
     // ---- full decode + metrics ----

@@ -15,7 +15,9 @@ int main(int argc,char**argv){
     mc_u8 *vol=malloc(n);
     FILE*f=fopen(argv[1],"rb"); if(!f){perror("in");return 1;}
     if(fread(vol,1,n,f)!=n){fprintf(stderr,"short\n");return 1;} fclose(f);
-    mc_codec_init(); mc_set_quality(q);
+    mc_codec_init();
+    mc_codec_ctx *cx=mc_codec_ctx_new();
+    mc_codec_ctx_set_quality(cx,q);
 
     int NB=D/MC_BLK;
     static mc_u8 vox[N3], dec[N3];
@@ -29,18 +31,18 @@ int main(int argc,char**argv){
         for(int z=0;z<MC_BLK;++z)for(int y=0;y<MC_BLK;++y)
             memcpy(vox+((size_t)z*MC_BLK+y)*MC_BLK, vol+((size_t)(bz*MC_BLK+z)*D+(by*MC_BLK+y))*D+bx*MC_BLK, MC_BLK);
         uint32_t len=0; size_t off=out.len;
-        if(mc_enc_block(vox,&out,&len)){ recs[nrec].off=off; recs[nrec].len=len; nrec++; nblk++; }
+        if(mc_enc_block(cx,vox,&out,&len)){ recs[nrec].off=off; recs[nrec].len=len; nrec++; nblk++; }
     }
     double t_enc=now()-t0;
     t0=now();
-    for(int r=0;r<nrec;++r) mc_dec_block(out.p+recs[r].off,recs[r].len,dec);
+    for(int r=0;r<nrec;++r) mc_dec_block(cx,out.p+recs[r].off,recs[r].len,dec);
     double t_dec=now()-t0;
 
     // DCT micro
     static float a[N3],b[N3];
     for(int i=0;i<N3;++i)a[i]=(float)((i*2654435761u)%255)-127;
-    t0=now(); for(int r=0;r<20000;++r){ mc_dct3_fwd(a,b); } double t_f=(now()-t0)/20000;
-    t0=now(); for(int r=0;r<20000;++r){ mc_dct3_inv(b,a); } double t_i=(now()-t0)/20000;
+    t0=now(); for(int r=0;r<20000;++r){ mc_dct3_fwd(&cx->dct,a,b); } double t_f=(now()-t0)/20000;
+    t0=now(); for(int r=0;r<20000;++r){ mc_dct3_inv(&cx->dct,b,a); } double t_i=(now()-t0)/20000;
 
     printf("blocks %ld  payload %.1f MB\n",nblk,out.len/1e6);
     printf("encode %.2fs (%.1f MB/s)  decode %.2fs (%.1f MB/s)\n",t_enc,n/1e6/t_enc,t_dec,n/1e6/t_dec);

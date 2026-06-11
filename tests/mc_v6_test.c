@@ -10,19 +10,21 @@ static mc_u8 srcv(void *ud, int x,int y,int z){
 }
 
 int main(void){
-    // preset ladder: tau = 2^level, quality ascending, apply() wires globals
+    // preset ladder: tau = 2^level, quality ascending, apply() wires the ctx
     {
         float prev_q = 0.0f;
+        mc_codec_ctx *cx = mc_codec_ctx_new();
         for (int l = 0; l < MC_PRESET_COUNT; l++) {
             if (mc_preset_tau((mc_preset)l) != (1 << l)) { fprintf(stderr, "preset tau l=%d\n", l); return 1; }
-            float q = mc_apply_preset((mc_preset)l);
-            if (!(q >= prev_q) || mc_get_quality() != q ||
-                mc_get_max_error() != (1 << l) || !mc_preset_name((mc_preset)l)) {
+            float q = mc_apply_preset(cx, (mc_preset)l);
+            if (!(q >= prev_q) || mc_codec_ctx_get_quality(cx) != q ||
+                mc_codec_ctx_get_max_error(cx) != (1 << l) ||
+                !mc_preset_name((mc_preset)l)) {
                 fprintf(stderr, "preset apply l=%d\n", l); return 1;
             }
             prev_q = q;
         }
-        mc_set_max_error(0); mc_set_quality(6.0f);   // restore defaults
+        mc_codec_ctx_free(cx);
         printf("presets OK\n");
     }
     // 1) non-cubic build: 300 x 130 x 70 voxels (pads to 512 x 256 x 256)

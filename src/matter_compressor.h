@@ -190,6 +190,13 @@ int mc_archive_append_chunk_raw(mc_archive *a, int lod, int cz,int cy,int cx,
 // (format v6), so decode needs nothing extra.
 int mc_archive_append_chunk_raw_q(mc_archive *a, int lod, int cz,int cy,int cx,
                                   const mc_u8 vox[256*256*256], float q);
+// Caller-context variant: encode with C's quality AND max_error (the raw/raw_q
+// paths build a throwaway default ctx, so tau is off there). Also the
+// efficient path for tight append loops -- one ctx per worker thread, no
+// per-chunk table rebuilds.
+int mc_archive_append_chunk_ctx(mc_archive *a, mc_codec_ctx *C,
+                                int lod, int cz,int cy,int cx,
+                                const mc_u8 vox[256*256*256]);
 // Rate-controlled variant: pick this chunk's q to hit ~target_ratio (raw bytes
 // / compressed bytes) for THIS chunk. One 1/16-block sample encode at the
 // archive's base q plus a single power-law correction (~6% encode overhead,
