@@ -3948,6 +3948,15 @@ typedef struct {
     float t0, dt;
     int nsteps;                 // iterations of the [t0, t1] dt walk
     float a_min, a_op;          // alpha params, clamped
+    // MC_COMP_SHADED (defaults resolved here; see mc_render_params docs)
+    float Lz, Ly, Lx;           // unit light dir, toward the light
+    int headlight;              // light[] was zero: use -ray dir per pixel
+    float ka, kd, ks, shin;     // ambient / diffuse / specular / exponent
+    float sigma;                // extinction per unit density per voxel
+    float shadow, sss;          // shadow strength, translucency weight
+    float g0sq;                 // grad_g0^2 (surface-ness knee)
+    int sh_steps;               // secondary-march steps toward the light
+    float sh_dt;                // secondary-march step, voxels
 } rcfg_t;
 
 static rcfg_t make_cfg(const mc_render_params *p) {
@@ -3964,7 +3973,103 @@ static rcfg_t make_cfg(const mc_render_params *p) {
               p->alpha_min > 0.99f ? 0.99f : p->alpha_min;
     c.a_op  = p->alpha_opacity <= 0.0f ? 1.0f :
               p->alpha_opacity > 1.0f ? 1.0f : p->alpha_opacity;
+    float ll = p->light[0] * p->light[0] + p->light[1] * p->light[1] +
+               p->light[2] * p->light[2];
+    c.headlight = ll < 1e-12f;
+    if (c.headlight) { c.Lz = c.Ly = 0.0f; c.Lx = 1.0f; }
+    else {
+        float inv = 1.0f / sqrtf(ll);
+        c.Lz = p->light[0] * inv; c.Ly = p->light[1] * inv;
+        c.Lx = p->light[2] * inv;
+    }
+    c.ka   = p->ambient   > 0.0f ? p->ambient   : 0.25f;
+    c.kd   = p->diffuse   > 0.0f ? p->diffuse   : 0.75f;
+    c.ks   = p->specular  > 0.0f ? p->specular  : 0.20f;
+    c.shin = p->shininess > 0.0f ? p->shininess : 24.0f;
+    c.sigma = p->absorption > 0.0f ? p->absorption : 1.0f;
+    c.shadow = p->shadow < 0.0f ? 0.0f : p->shadow > 1.0f ? 1.0f : p->shadow;
+    c.sss = p->sss < 0.0f ? 0.0f : p->sss;
+    float g0 = p->grad_g0 > 0.0f ? p->grad_g0 : 8.0f;
+    c.g0sq = g0 * g0;
+    c.sh_steps = 12;            // 24 voxels of reach at sh_dt = 2: enough to
+    c.sh_dt = 2.0f;             // self-shadow a sheet, cheap enough per ray
     return c;
+}
+
+// MC_COMP_SHADED: front-to-back emission-absorption along P + t*N with
+// gradient-normal lighting. Headlight default lights from the camera side
+// (-N); an explicit light dir enables raking. Per contributing sample:
+// 6-tap central-difference gradient -> two-sided diffuse + Blinn-Phong
+// specular, weighted by surface-ness so smooth interiors emit unshaded;
+// optional coarse march toward the light for shadows / translucency.
+static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
+                         float nx, const rcfg_t *cfg) {
+    const mc_filter f = cfg->filter;
+    const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
+    float Lz = cfg->Lz, Ly = cfg->Ly, Lx = cfg->Lx;
+    if (cfg->headlight) { Lz = -nz; Ly = -ny; Lx = -nx; }
+    // view = toward the camera = -ray dir; half vector for Blinn-Phong
+    float hz = Lz - nz, hy = Ly - ny, hx = Lx - nx;
+    float hl = hz * hz + hy * hy + hx * hx;
+    if (hl > 1e-12f) {
+        hl = 1.0f / sqrtf(hl);
+        hz *= hl; hy *= hl; hx *= hl;
+    }
+    const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
+    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
+          px = P[2] + cfg->t0 * nx;
+    float acc = 0.0f, T = 1.0f;
+    const int want_tau = cfg->shadow > 0.0f || cfg->sss > 0.0f;
+    for (int it = 0; it < cfg->nsteps; it++, pz += sz_, py += sy_, px += sx_) {
+        float v = mc_s_sample(s, pz, py, px, f);
+        float d = (v * (1.0f / 255.0f) - a_th) * a_sc;
+        if (d <= 0.0f) continue;                    // air: free skip
+        if (d > 1.0f) d = 1.0f;
+        float a = 1.0f - expf(-cfg->sigma * d * cfg->dt);
+        // gradient (u8 units / voxel), central differences at 1 voxel
+        float gz = mc_s_sample(s, pz + 1, py, px, f) -
+                   mc_s_sample(s, pz - 1, py, px, f);
+        float gy = mc_s_sample(s, pz, py + 1, px, f) -
+                   mc_s_sample(s, pz, py - 1, px, f);
+        float gx = mc_s_sample(s, pz, py, px + 1, f) -
+                   mc_s_sample(s, pz, py, px - 1, f);
+        float g2 = 0.25f * (gz * gz + gy * gy + gx * gx);
+        float w = g2 / (g2 + cfg->g0sq);            // surface-ness
+        float diff = 0.0f, spec = 0.0f;
+        if (g2 > 1e-8f) {
+            float gi = 1.0f / sqrtf(gz * gz + gy * gy + gx * gx);
+            float uz = gz * gi, uy = gy * gi, ux = gx * gi;
+            diff = fabsf(uz * Lz + uy * Ly + ux * Lx);   // two-sided
+            float ndh = fabsf(uz * hz + uy * hy + ux * hx);
+            spec = powf(ndh, cfg->shin);
+        }
+        float lit = cfg->ka + (1.0f - w) * cfg->kd;     // interior: emissive
+        float Tl = 1.0f;
+        if (want_tau && w > 0.05f) {
+            float tau = 0.0f;
+            float qz = pz + cfg->sh_dt * Lz, qy = py + cfg->sh_dt * Ly,
+                  qx = px + cfg->sh_dt * Lx;
+            for (int j = 0; j < cfg->sh_steps && tau < 6.0f; j++) {
+                float sv = mc_s_sample(s, qz, qy, qx, f);
+                float sd = (sv * (1.0f / 255.0f) - a_th) * a_sc;
+                if (sd > 0.0f) {
+                    if (sd > 1.0f) sd = 1.0f;
+                    tau += cfg->sigma * sd * cfg->sh_dt;
+                }
+                qz += cfg->sh_dt * Lz; qy += cfg->sh_dt * Ly;
+                qx += cfg->sh_dt * Lx;
+            }
+            Tl = expf(-tau);
+            lit += cfg->sss * w * expf(-0.3f * tau);    // translucent glow
+        }
+        float shfac = 1.0f - cfg->shadow + cfg->shadow * Tl;
+        lit += w * cfg->kd * diff * shfac;
+        float shade = v * lit + 255.0f * cfg->ks * spec * shfac * w;
+        acc += T * a * shade;
+        T *= 1.0f - a;
+        if (T < 0.02f) break;
+    }
+    return to_u8(acc);
 }
 
 // Composite one ray. Trilinear rays are consumed in chunks of 4 steps via
@@ -3985,12 +4090,15 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
         float nl = 1.0f / sqrtf(n2);
         nz *= nl; ny *= nl; nx *= nl;
     }
+    if (cfg->comp == MC_COMP_SHADED)
+        return shade_ray(s, P, nz, ny, nx, cfg);
 
     const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
     float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
           px = P[2] + cfg->t0 * nx;
     const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
-    float acc = 0.0f, A = 0.0f, mn = 255.0f, mx = 0.0f, sum = 0.0f;
+    float acc = 0.0f, A = 0.0f, mn = 255.0f, mx = 0.0f, sum = 0.0f,
+          sum2 = 0.0f;
     int it = 0, done = 0;
 
     if (cfg->filter == MC_FILTER_TRILINEAR) {
@@ -4017,6 +4125,11 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
             case MC_COMP_MEAN:
                 sum += v4[0] + v4[1] + v4[2] + v4[3];
                 break;
+            case MC_COMP_STDDEV:
+                for (int k = 0; k < 4; k++) {
+                    sum += v4[k]; sum2 += v4[k] * v4[k];
+                }
+                break;
             default:                            // ALPHA
                 for (int k = 0; k < 4 && !done; k++) {
                     float a = (v4[k] * (1.0f / 255.0f) - a_th) * a_sc;
@@ -4037,6 +4150,7 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
         case MC_COMP_MIN:  if (v < mn) mn = v; break;
         case MC_COMP_MAX:  if (v > mx) mx = v; break;
         case MC_COMP_MEAN: sum += v; break;
+        case MC_COMP_STDDEV: sum += v; sum2 += v * v; break;
         default: {                              // ALPHA
             float a = (v * (1.0f / 255.0f) - a_th) * a_sc;
             if (a > 0.0f) {
@@ -4055,6 +4169,12 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
     case MC_COMP_MAX:  return to_u8(mx);
     case MC_COMP_MEAN:
         return to_u8(cfg->nsteps ? sum / (float)cfg->nsteps : 0.0f);
+    case MC_COMP_STDDEV: {
+        if (!cfg->nsteps) return 0;
+        float m = sum / (float)cfg->nsteps;
+        float var = sum2 / (float)cfg->nsteps - m * m;
+        return to_u8(var > 0.0f ? sqrtf(var) : 0.0f);
+    }
     case MC_COMP_ALPHA: return to_u8(acc);
     default:           return 0;
     }

@@ -556,11 +556,16 @@ void mc_sample_points_u8(mc_sampler *s, const float *zyx, size_t n,
                          mc_filter f, uint8_t *out);
 
 typedef enum {
-    MC_COMP_NONE  = 0,
-    MC_COMP_MIN   = 1,
-    MC_COMP_MEAN  = 2,
-    MC_COMP_MAX   = 3,
-    MC_COMP_ALPHA = 4,
+    MC_COMP_NONE   = 0,
+    MC_COMP_MIN    = 1,
+    MC_COMP_MEAN   = 2,
+    MC_COMP_MAX    = 3,
+    MC_COMP_ALPHA  = 4,
+    MC_COMP_STDDEV = 5,     // stddev of the samples along the ray: texture-
+                            // energy projection. Crackle/roughness reads
+                            // bright regardless of absolute density.
+    MC_COMP_SHADED = 6,     // emission-absorption ray march with gradient
+                            // lighting (see the shaded params below)
 } mc_comp;
 
 typedef struct {
@@ -568,8 +573,34 @@ typedef struct {
     mc_comp   comp;         // reduction along the normal
     float t0, t1;           // composite range along the normal, in voxels
     float dt;               // step (<= 0 -> 1.0)
-    float alpha_min;        // MC_COMP_ALPHA: value threshold in [0,1)
-    float alpha_opacity;    // MC_COMP_ALPHA: per-sample opacity scale (0,1]
+    float alpha_min;        // ALPHA/SHADED: value threshold in [0,1)
+    float alpha_opacity;    // ALPHA/SHADED: per-sample opacity scale (0,1]
+
+    // -- MC_COMP_SHADED only (ignored by the other modes) --------------------
+    // Front-to-back emission-absorption: per step, density d = clamped
+    // (v/255 - alpha_min)/(1 - alpha_min) * alpha_opacity gives extinction
+    // sigma = absorption * d, opacity a = 1 - exp(-sigma * dt) (Beer-Lambert).
+    // Contributing samples are lit from the local gradient normal (central
+    // differences): two-sided Lambertian diffuse + Blinn-Phong specular,
+    // blended by surface-ness w = |g|^2 / (|g|^2 + grad_g0^2) so smooth
+    // interior emits unshaded instead of sparkling. When shadow or sss is
+    // set, a coarse secondary march toward the light accumulates optical
+    // depth tau: shadow scales the direct light by exp(-tau), sss adds
+    // back-lit translucency exp(-0.3*tau) ("glow through thin material").
+    // All zero-value fields take the defaults noted below; a zero-initialized
+    // struct renders a sane headlight relief view.
+    float light[3];         // direction TOWARD the light, (z,y,x) volume
+                            // coords; (0,0,0) -> headlight (along -normal).
+                            // Tilt it for raking light: relief pops hardest.
+    float ambient;          // ambient weight             (0 -> 0.25)
+    float diffuse;          // diffuse weight             (0 -> 0.75)
+    float specular;         // Blinn-Phong weight         (0 -> 0.20)
+    float shininess;        // specular exponent          (0 -> 24)
+    float absorption;       // extinction per unit density per voxel (0 -> 1.0)
+    float shadow;           // shadow strength [0,1]      (0 = no shadow rays)
+    float sss;              // translucency weight        (0 = off)
+    float grad_g0;          // gradient magnitude (u8/voxel) at half
+                            // surface-ness               (0 -> 8)
 } mc_render_params;
 
 // ---------------------------------------------------------------------------
