@@ -76,6 +76,13 @@ idea that was implemented and rejected: `bench/RESULTS.md`.
   Archival (±1, below scanner noise) beats true lossless (zstd-19:
   1.96×) — which is why there is no lossless mode. No τ 256 level: it
   exceeds the u8 range and could never bind.
+
+  Ratios are content-dependent: masked air is nearly free, so they scale
+  with air fraction. The table's crop is 41.9% air; the densest 256³
+  window in the same scroll (32% air — fully dense regions don't exist
+  at 2.4 µm) measures archival 1.2×, streaming 11×, fast 22×, while
+  whole ROI-masked volumes (majority air) come out better than the
+  table. Error bounds, PSNR and SSIM are air-independent.
 - **rate targeting** — `mc_archive_append_chunk_target(.., target_ratio,..)`
   picks q per chunk from a 1/16-block sample (+~6 % encode time; lands
   within ~5 % of target on real data).

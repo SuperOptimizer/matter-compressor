@@ -340,3 +340,13 @@ Ratio plateaus per tau as corrections absorb quantization coarseness
 tau 128/256 rejected: unbounded max error is ~70 at q 32 — wider bounds
 never trigger on u8.
 | 128 | 48 (87.5x), **64 (93.4x)**, 96 (101.6x) | q 64 (preview level; q chosen by fiat — SSIM 0.86 at q 96 is past useful) |
+
+### Air-fraction honesty check (densest 256^3 window, 32% air, same scroll)
+
+Ratios include masked air, which is ~free in the format — they scale with
+air fraction. Same ladder points on the densest window the 512^3 crop
+contains: archival 1.2x / streaming 11.0x / fast 21.9x. No padding or
+zero-chunk inflation in the bench accounting (file bytes minus the fixed
+128KB header; 512/256 are exact chunk multiples; no all-zero chunks in
+the crop). Full ROI-masked production volumes are majority-air and land
+ABOVE the table.
