@@ -918,6 +918,8 @@ typedef struct mc_s3 mc_s3;
 mc_s3 *mc_s3_open(const char *url);
 // The reader for all decode calls (mc_chunk_offset / mc_decode_block / ...).
 mc_reader *mc_s3_reader(mc_s3 *s);
+// Total bytes pulled over S3 so far (for a download-rate readout).
+uint64_t mc_s3_net_bytes(mc_s3 *s);
 void mc_s3_close(mc_s3 *s);
 
 // ===========================================================================
@@ -962,6 +964,14 @@ typedef struct {
 mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
                              size_t cache_bytes, float quality,
                              const mc_volume_config *cfg);
+
+// Open an ALREADY-BUILT .mca (remote s3://... / https://..., or a local file path)
+// and stream blocks from it on demand -- no zarr discovery, no transcode pipeline,
+// no download/decode threads. The reader fetches only the bytes a decode needs
+// (partial-fetch over S3); the resident mc_cache (cache_bytes) holds decoded 16^3
+// blocks. All LODs already live in the archive. Returns NULL on failure. Use this
+// (not mc_volume_open) when the URL is a built .mca rather than an NGFF zarr root.
+mc_volume *mc_volume_open_streaming(const char *url, size_t cache_bytes);
 void       mc_volume_free(mc_volume *v);
 
 int  mc_volume_nlods(const mc_volume *v);

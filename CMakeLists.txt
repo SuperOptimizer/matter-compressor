@@ -118,6 +118,10 @@ if(MC_STANDALONE)
   target_link_libraries(mc_render_test matter_compressor)
   add_test(NAME render COMMAND mc_render_test)
 
+  add_executable(mc_stream_volume_test tests/mc_stream_volume_test.c)
+  target_link_libraries(mc_stream_volume_test matter_compressor)
+  add_test(NAME stream_volume COMMAND mc_stream_volume_test)
+
   # archive repacker: Morton order + clustered index for streaming + offline
   add_executable(mc_export tools/mc_export.c)
   target_include_directories(mc_export PRIVATE src tools/vendor/libs3 ${ZSTD_INC})
@@ -146,4 +150,8 @@ if(MC_STANDALONE)
   add_executable(mc_volume_test tests/mc_volume_test.c)
   set_property(TARGET mc_volume_test PROPERTY C_STANDARD 23)
   target_link_libraries(mc_volume_test matter_compressor)
+
+  add_executable(mc_stream_probe tools/mc_stream_probe.c)
+  set_property(TARGET mc_stream_probe PROPERTY C_STANDARD 23)
+  target_link_libraries(mc_stream_probe matter_compressor CURL::libcurl)
 endif()
