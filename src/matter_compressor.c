@@ -5459,8 +5459,18 @@ mc_volume *mc_volume_open(const char *url, const char *cache_dir,
     v->rs_cap = 512;                                   // LIFO request stack
     v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
 
+    // The c3d/wavelet decode is memory-bandwidth-bound: a 256^3 decode streams
+    // ~16MB of coefficient/output buffers, so threads past ~half the cores
+    // saturate the memory bus and only inflate per-decode latency (measured: 1
+    // thread 103ms, 8 threads 176ms, 16 threads 305ms each — ~same throughput
+    // past 8 but 2x the latency). Cap at nproc/2 so each on-screen region
+    // finishes sooner and the downloaders + UI keep cores. Override: MC_DECODERS.
     long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    v->ndecoders = nproc > 2 ? (nproc < 32 ? (int)nproc : 32) : 2;
+    int nd = nproc > 2 ? (int)(nproc / 2) : 2;
+    if (nd < 2) nd = 2; if (nd > 32) nd = 32;
+    const char *nd_env = getenv("MC_DECODERS");
+    if (nd_env) { int e = atoi(nd_env); if (e >= 1 && e <= 32) nd = e; }
+    v->ndecoders = nd;
     for (int i = 0; i < v->ndecoders; ++i)
         pthread_create(&v->decoders[i], NULL, decoder_main, v);
     v->ndl = 8;                                        // download threads (latency-bound)
