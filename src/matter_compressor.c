@@ -4895,6 +4895,23 @@ static uint8_t *v2_decode(const mc_zarr *z, uint8_t *blob, size_t blen, size_t *
     return dense;
 }
 
+// Locate one inner chunk WITHOUT fetching: fill its object key + byte range from
+// the cached shard footer. Returns 0 (found: *off/*nb set, c3d raw range), 1
+// (absent/air), <0 (error). v2 chunks are whole objects -> off=0,nb=0 (full GET).
+// Lets a caller batch many chunks' ranged GETs into one s3_get_batch.
+int mc_zarr_chunk_locate(mc_zarr *z, int cz, int cy, int cx,
+                         char key_out[64], uint64_t *off, uint64_t *nb) {
+    chunk_key(z, cz, cy, cx, key_out);
+    if (z->version == ZV2) { *off = 0; *nb = 0; return 0; }
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 1;                                      // absent shard = air
+    size_t lin = inner_linear(z, cz, cy, cx);
+    int st = index_entry(idx, n_inner, lin, off, nb);
+    if (st != 0) return st < 0 ? -1 : 1;                     // missing/oob -> air
+    return 0;
+}
+
 int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx, uint8_t **raw, size_t *len) {
     *raw = NULL;
     *len = 0;
@@ -5371,20 +5388,73 @@ static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
 }
 
 // Download thread: pop the newest request, download its shard (-> decode queue).
+// Drain up to DL_BATCH region requests from the LIFO stack (newest first) and
+// fetch their source chunks in ONE s3_get_batch — per-region precision (no
+// whole-shard pull) AND high concurrency (32 GETs over the pooled connections),
+// which is what saturates the link. c3d (sub=1) = one chunk per region; v2
+// regions fall back to the per-chunk cube path.
+enum { DL_BATCH = 32 };
 static void *dl_main(void *ud) {
     mc_volume *v = ud;
     mc_thread_setname("mc-download");      // distinguish in profilers
     for (;;) {
+        int lods[DL_BATCH], rz[DL_BATCH], ry[DL_BATCH], rx[DL_BATCH];
+        int m = 0;
         pthread_mutex_lock(&v->mu);
         while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
         if (v->stop && v->rs_n == 0) { pthread_mutex_unlock(&v->mu); return NULL; }
-        uint64_t key = v->reqstk[--v->rs_n];           // pop top (newest)
+        while (m < DL_BATCH && v->rs_n > 0) {           // grab a batch, newest first
+            uint64_t key = v->reqstk[--v->rs_n];
+            runpack(key, &lods[m], &rz[m], &ry[m], &rx[m]);
+            ++m;
+        }
         pthread_mutex_unlock(&v->mu);
-        int lod, cz, cy, cx;
-        runpack(key, &lod, &cz, &cy, &cx);             // region coords
-        MCVLOG("dl_pop    lod%d region(%d,%d,%d) -> download region", lod, cz, cy, cx);
-        const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
-        mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // source coord of region
+
+        // Locate each region's c3d source chunk via the cached footer; build one
+        // batched ranged-GET. v2 (sub>1) and local both use the per-region path.
+        s3_range_req reqs[DL_BATCH];
+        s3_response  resp[DL_BATCH];
+        char urls[DL_BATCH][1280];
+        int ri[DL_BATCH], nq = 0;                       // ri[q] -> request index
+        for (int i = 0; i < m; ++i) {
+            mc_zarr *z = v->lv[lods[i]].z;
+            const int sub = CHUNK / mc_zarr_inner_edge(z);
+            if (v->local || sub != 1) {                 // local / v2: direct per-region
+                mc_volume_prefetch_region(v, lods[i], rz[i]*sub, ry[i]*sub, rx[i]*sub);
+                continue;
+            }
+            if (mc_archive_chunk_coverage(v->arc, lods[i], rz[i], ry[i], rx[i]) != MC_ABSENT)
+                continue;                               // already resident
+            char key[64]; uint64_t off, nb;
+            int st = mc_zarr_chunk_locate(z, rz[i], ry[i], rx[i], key, &off, &nb);
+            if (st != 0) {                              // air/missing -> ZERO region
+                decode_item air = {lods[i], rz[i], ry[i], rx[i], 1, 0, {0},{0},{0}, {0},{0}};
+                decode_push(v, &air);
+                continue;
+            }
+            snprintf(urls[nq], sizeof urls[nq], "%s/%s", v->lv[lods[i]].prefix, key);
+            reqs[nq] = (s3_range_req){urls[nq], off, nb};
+            ri[nq] = i;
+            ++nq;
+        }
+        if (nq == 0) continue;
+        MCVLOG("dl_batch  %d regions -> %d ranged GETs", m, nq);
+        memset(resp, 0, sizeof(s3_response) * nq);
+        s3_get_batch(v->s3, reqs, (size_t)nq, 32, resp);
+        for (int q = 0; q < nq; ++q) {
+            int i = ri[q];
+            if (s3_response_ok(&resp[q]) && resp[q].body_len >= reqs[q].length && reqs[q].length) {
+                uint8_t *raw = malloc(reqs[q].length);
+                if (raw) {
+                    memcpy(raw, resp[q].body, reqs[q].length);
+                    atomic_fetch_add_explicit(&v->net_bytes, reqs[q].length, memory_order_relaxed);
+                    decode_item it = {lods[i], rz[i], ry[i], rx[i], 1, 1, {0},{0},{0}, {0},{0}};
+                    it.raw[0] = raw; it.rlen[0] = reqs[q].length;
+                    decode_push(v, &it);
+                }
+            }
+            s3_response_free(&resp[q]);
+        }
     }
 }
 
@@ -5492,9 +5562,14 @@ mc_volume *mc_volume_open(const char *url, const char *cache_dir,
     // stack) feed a bounded decode queue drained by a decode pool (CPU-bound).
     pthread_cond_init(&v->dq_ne, NULL);
     pthread_cond_init(&v->dq_nf, NULL);
-    v->dq_cap = 256;                                   // bounded decode queue
+    // Deep decode queue so batched downloads run well ahead of the (CPU-bound)
+    // decode pool during a navigation — smooths pop-in. Items hold pointers to
+    // ~300KB compressed chunks, so 2048 deep is ~600MB worst-case buffered.
+    // MC_DQ_CAP overrides.
+    v->dq_cap = 2048;
+    { const char *e = getenv("MC_DQ_CAP"); if (e) { int n = atoi(e); if (n >= 64 && n <= 16384) v->dq_cap = n; } }
     v->dq = calloc((size_t)v->dq_cap, sizeof *v->dq);
-    v->rs_cap = 512;                                   // LIFO request stack
+    v->rs_cap = 2048;                                  // LIFO request stack (match queue depth)
     v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
 
     // The c3d/wavelet decode is memory-bandwidth-bound: a 256^3 decode streams

@@ -749,6 +749,12 @@ int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
 int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx,
                        uint8_t **raw, size_t *len);
 
+// Locate one inner chunk WITHOUT fetching: fills its object key + byte range
+// (off/nb) from the cached shard footer, so a caller can batch many chunks'
+// ranged GETs into one request. 0 found, 1 absent/air, <0 error. v2 -> off=nb=0.
+int mc_zarr_chunk_locate(mc_zarr *z, int cz, int cy, int cx,
+                         char key_out[64], uint64_t *off, uint64_t *nb);
+
 // One present inner chunk of a shard: global coords + its byte range in the
 // shard object. (v2: off/len describe the standalone chunk object, range from 0.)
 typedef struct {
