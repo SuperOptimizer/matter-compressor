@@ -5184,8 +5184,10 @@ struct mc_volume {
     // (decoders run in parallel), instead of serializing download+decode.
     pthread_t decoders[32];
     int ndecoders;
-    struct decode_item *dq;    // bounded ring of pending decode items
-    int dq_cap, dq_head, dq_tail;
+    struct decode_item *dq;    // ring of pending decode items (slot bound is high;
+    int dq_cap, dq_head, dq_tail;        // the real backpressure is dq_bytes below)
+    size_t dq_bytes;           // compressed bytes currently queued (staging size)
+    size_t dq_byte_budget;     // block producers above this (RAM-budgeted staging)
     pthread_cond_t dq_ne;      // not-empty (wake a decoder)
     pthread_cond_t dq_nf;      // not-full  (wake a blocked producer)
     int stop;
@@ -5212,6 +5214,15 @@ typedef struct decode_item {
     uint8_t *raw[8];           // owned compressed bytes (freed by the decoder)
     size_t rlen[8];
 } decode_item;
+
+// RAM the item occupies in the staging queue: its buffered source bytes —
+// c3d compressed, or v2 blosc/zstd/raw decoded-dense, whatever was read. The
+// byte budget thus naturally holds fewer of the larger (decoded) v2 items.
+static size_t decode_item_bytes(const decode_item *it) {
+    size_t b = 0;
+    for (int k = 0; k < it->nsub; ++k) b += it->rlen[k];
+    return b ? b : 1;                                   // ZERO/air items count as 1
+}
 
 // ---------------------------------------------------------------------------
 // s3 byte source for mc_zarr (prepends the level prefix to the object key)
@@ -5360,7 +5371,8 @@ static void *decoder_main(void *ud) {
         if (v->stop && v->dq_head == v->dq_tail) { pthread_mutex_unlock(&v->mu); break; }
         decode_item it = v->dq[v->dq_head];
         v->dq_head = (v->dq_head + 1) % v->dq_cap;
-        pthread_cond_signal(&v->dq_nf);                // a slot freed
+        v->dq_bytes -= decode_item_bytes(&it);         // free staging budget
+        pthread_cond_signal(&v->dq_nf);                // wake a blocked producer
         pthread_mutex_unlock(&v->mu);
         decode_one(v, dec, &it);
         if (v->ready_cb) v->ready_cb(v->ready_ud);     // region became serveable
@@ -5369,22 +5381,33 @@ static void *decoder_main(void *ud) {
     return NULL;
 }
 
-// Producer: push a decode item, BLOCKING if the queue is full (backpressure ->
-// bounded RAM; the download thread waits for decoders to catch up). Takes
-// ownership of the item's raw buffers.
+// Producer: push a decode item. Backpressure is BYTE-budgeted (RAM-budgeted
+// staging): the download thread only blocks when the queued compressed bytes
+// exceed dq_byte_budget — so downloads run far ahead of the CPU-bound decode
+// pool and the network stays saturated, instead of stalling on a slot count.
+// (A secondary slot-full guard covers the unlikely ring-wrap.) Takes ownership
+// of the item's raw buffers.
 static void decode_push(mc_volume *v, const decode_item *it) {
+    const size_t ib = decode_item_bytes(it);
     pthread_mutex_lock(&v->mu);
     int next = (v->dq_tail + 1) % v->dq_cap;
-    int blocked = (next == v->dq_head);
-    while (next == v->dq_head && !v->stop) pthread_cond_wait(&v->dq_nf, &v->mu);
+    int blocked = 0;
+    while (!v->stop &&
+           (next == v->dq_head ||                       // ring full (rare; cap is huge)
+            (v->dq_bytes + ib > v->dq_byte_budget && v->dq_head != v->dq_tail))) {
+        blocked = 1;
+        pthread_cond_wait(&v->dq_nf, &v->mu);
+        next = (v->dq_tail + 1) % v->dq_cap;
+    }
     if (v->stop) { pthread_mutex_unlock(&v->mu);
         for (int k = 0; k < it->nsub; ++k) free(it->raw[k]); return; }
     v->dq[v->dq_tail] = *it;
     v->dq_tail = next;
-    int depth = (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap;
+    v->dq_bytes += ib;
     pthread_cond_signal(&v->dq_ne);
+    size_t qb = v->dq_bytes;
     pthread_mutex_unlock(&v->mu);
-    if (blocked) MCVLOG("decode_q  FULL (backpressure: decoders behind) depth=%d", depth);
+    if (blocked) MCVLOG("decode_q  FULL (staging budget hit) queued=%.0fMB", qb / 1048576.0);
 }
 
 // unpack a region key.
@@ -5596,11 +5619,17 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     // stack) feed a bounded decode queue drained by a decode pool (CPU-bound).
     pthread_cond_init(&v->dq_ne, NULL);
     pthread_cond_init(&v->dq_nf, NULL);
-    // Deep decode queue so batched downloads run well ahead of the (CPU-bound)
-    // decode pool during a navigation — smooths pop-in. Items hold pointers to
-    // ~300KB compressed chunks, so 2048 deep is ~600MB worst-case buffered.
-    v->dq_cap = (cfg && cfg->decode_queue > 0) ? cfg->decode_queue : 2048;
-    if (v->dq_cap < 64) v->dq_cap = 64; if (v->dq_cap > 16384) v->dq_cap = 16384;
+    // Staging queue: downloaded compressed chunks wait here for the (CPU-bound)
+    // decode pool. Backpressure is BYTE-budgeted (default 2GB) so downloads run
+    // far ahead of decode and the network stays saturated, decoupling the two.
+    // The ring slot count just needs to exceed however many items fit in the
+    // budget — size it from the budget assuming small (~64KB) chunks, capped.
+    v->dq_byte_budget = (cfg && cfg->staging_bytes > 0) ? cfg->staging_bytes
+                                                        : (2ull << 30);   // 2 GB
+    if (v->dq_byte_budget < (64ull << 20)) v->dq_byte_budget = 64ull << 20;
+    v->dq_bytes = 0;
+    v->dq_cap = (int)(v->dq_byte_budget / (64ull << 10)) + 8;   // ~budget/64KB slots
+    if (v->dq_cap < 256) v->dq_cap = 256; if (v->dq_cap > 131072) v->dq_cap = 131072;
     v->dq = calloc((size_t)v->dq_cap, sizeof *v->dq);
     // LIFO request stack: just 8-byte region keys, so it can be large — a fast
     // navigation enqueues many thousands of on-screen region misses, and we
@@ -5626,8 +5655,8 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     v->ndl = ndl;
     for (int i = 0; i < v->ndl; ++i)
         pthread_create(&v->dlthreads[i], NULL, dl_main, v);
-    MCVLOG("open      %s  decoders=%d dl_threads=%d dq_cap=%d rs_cap=%d",
-           url, v->ndecoders, v->ndl, v->dq_cap, v->rs_cap);
+    MCVLOG("open      %s  decoders=%d dl_threads=%d staging=%.1fGB(slots=%d) rs_cap=%d",
+           url, v->ndecoders, v->ndl, v->dq_byte_budget / 1073741824.0, v->dq_cap, v->rs_cap);
     return v;
 }
 
@@ -5937,6 +5966,17 @@ void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int 
 
 size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes) {
     return (v && v->cache) ? mc_cache_resize(v->cache, bytes) : 0;
+}
+
+size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes) {
+    if (!v) return 0;
+    if (bytes < (64ull << 20)) bytes = 64ull << 20;    // floor 64MB
+    pthread_mutex_lock(&v->mu);
+    v->dq_byte_budget = bytes;
+    pthread_cond_broadcast(&v->dq_nf);                 // a raise may unblock producers
+    size_t installed = v->dq_byte_budget;
+    pthread_mutex_unlock(&v->mu);
+    return installed;
 }
 
 void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud) {

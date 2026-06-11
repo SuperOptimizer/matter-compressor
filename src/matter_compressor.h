@@ -808,19 +808,22 @@ mc_volume *mc_volume_open(const char *url, const char *cache_dir,
 
 // Streaming-pipeline tuning. Any field left 0 takes the built-in default. These
 // size open-time resources (thread pools + queues), so they apply at open only.
-//   decoders     : decode-pool threads. Default nproc/2 (decode is memory-
-//                  bandwidth-bound; more thrashes the bus, see commit history).
-//   dl_threads   : download threads (each drains a batch -> one s3_get_batch).
-//                  Default 8.
-//   decode_queue : depth of the compressed-chunk decode queue (backpressure
-//                  bound). Default 2048 (~600MB of ~300KB chunks worst-case).
-//   request_stack: depth of the LIFO download-request stack (8-byte region
-//                  keys). Default 65536.
+//   decoders      : decode-pool threads. Default nproc/2 (decode is memory-
+//                   bandwidth-bound; more thrashes the bus, see commit history).
+//   dl_threads    : download threads (each drains a batch -> one s3_get_batch).
+//                   Default 8.
+//   staging_bytes : RAM budget (bytes) for the staging queue of downloaded-but-
+//                   not-yet-decoded compressed chunks. Download blocks only when
+//                   this is exceeded, so the network saturates ahead of the
+//                   CPU-bound decode pool. Default 2 GB. Runtime-settable via
+//                   mc_volume_set_staging_bytes.
+//   request_stack : depth of the LIFO download-request stack (8-byte region
+//                   keys). Default 65536.
 typedef struct {
-    int decoders;
-    int dl_threads;
-    int decode_queue;
-    int request_stack;
+    int    decoders;
+    int    dl_threads;
+    size_t staging_bytes;
+    int    request_stack;
 } mc_volume_config;
 
 // As mc_volume_open, with explicit pipeline tuning. `cfg` may be NULL (all
@@ -893,6 +896,12 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
 // Live-resize the decoded-block RAM cache (bytes). Discards resident blocks;
 // they re-decode on demand. Returns the installed budget, or 0 on failure.
 size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes);
+
+// Live-set the staging-queue RAM budget (bytes): how far downloaded-but-not-yet-
+// decoded compressed chunks may run ahead of the decode pool before download
+// threads block. Bigger = network saturates further ahead of CPU-bound decode.
+// Default 2 GB. Returns the installed budget.
+size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes);
 
 #ifdef __cplusplus
 }
