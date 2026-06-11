@@ -3967,6 +3967,8 @@ typedef struct {
     float g0sq;                 // grad_g0^2 (surface-ness knee)
     int sh_steps;               // secondary-march steps toward the light
     float sh_dt;                // secondary-march step, voxels
+    float curv;                 // ridge/valley shading weight
+    float pct;                  // percentile rank (0,1]
 } rcfg_t;
 
 static rcfg_t make_cfg(const mc_render_params *p) {
@@ -4003,7 +4005,66 @@ static rcfg_t make_cfg(const mc_render_params *p) {
     c.g0sq = g0 * g0;
     c.sh_steps = 12;            // 24 voxels of reach at sh_dt = 2: enough to
     c.sh_dt = 2.0f;             // self-shadow a sheet, cheap enough per ray
+    c.curv = p->curvature;
+    c.pct = (p->percentile > 0.0f && p->percentile <= 1.0f) ? p->percentile
+                                                            : 0.9f;
     return c;
+}
+
+// Hoare quickselect: value at rank k of a[0..n-1] (a is scrambled in place).
+static float rank_select(float *a, int n, int k) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        float p = a[(lo + hi) >> 1];
+        int i = lo, j = hi;
+        while (i <= j) {
+            while (a[i] < p) i++;
+            while (a[j] > p) j--;
+            if (i <= j) { float t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+        }
+        if (k <= j) hi = j; else if (k >= i) lo = i; else return a[k];
+    }
+    return a[k];
+}
+
+// MC_COMP_PERCENTILE: the ray's samples are collected (strided down to a
+// 1024 cap for absurdly deep slabs) and the rank-`pct` value returned.
+static uint8_t pct_ray(mc_sampler *s, const float *P, float nz, float ny,
+                       float nx, const rcfg_t *cfg) {
+    float buf[1024];
+    int stride = (cfg->nsteps + 1023) / 1024;
+    if (stride < 1) stride = 1;
+    float sz_ = cfg->dt * nz * stride, sy_ = cfg->dt * ny * stride,
+          sx_ = cfg->dt * nx * stride;
+    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
+          px = P[2] + cfg->t0 * nx;
+    int n = 0;
+    for (int it = 0; it < cfg->nsteps; it += stride) {
+        buf[n++] = mc_s_sample(s, pz, py, px, cfg->filter);
+        pz += sz_; py += sy_; px += sx_;
+    }
+    if (!n) return 0;
+    int k = (int)(cfg->pct * (float)(n - 1) + 0.5f);
+    return to_u8(rank_select(buf, n, k));
+}
+
+// MC_COMP_DEPTH: first t where the value crosses alpha_min, mapped 1..255
+// over the slab (0 = no hit).
+static uint8_t depth_ray(mc_sampler *s, const float *P, float nz, float ny,
+                         float nx, const rcfg_t *cfg) {
+    const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
+    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
+          px = P[2] + cfg->t0 * nx;
+    for (int it = 0; it < cfg->nsteps; it++) {
+        float v = mc_s_sample(s, pz, py, px, cfg->filter);
+        if (v * (1.0f / 255.0f) > cfg->a_min) {
+            float frac = cfg->nsteps > 1 ? (float)it / (float)(cfg->nsteps - 1)
+                                         : 0.0f;
+            return (uint8_t)(1.0f + 254.0f * frac + 0.5f);
+        }
+        pz += sz_; py += sy_; px += sx_;
+    }
+    return 0;
 }
 
 // MC_COMP_SHADED: front-to-back emission-absorption along P + t*N with
@@ -4037,12 +4098,13 @@ static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
         if (d > 1.0f) d = 1.0f;
         float a = 1.0f - expf(-cfg->sigma * d * cfg->dt);
         // gradient (u8 units / voxel), central differences at 1 voxel
-        float gz = mc_s_sample(s, pz + 1, py, px, f) -
-                   mc_s_sample(s, pz - 1, py, px, f);
-        float gy = mc_s_sample(s, pz, py + 1, px, f) -
-                   mc_s_sample(s, pz, py - 1, px, f);
-        float gx = mc_s_sample(s, pz, py, px + 1, f) -
-                   mc_s_sample(s, pz, py, px - 1, f);
+        float vzp = mc_s_sample(s, pz + 1, py, px, f),
+              vzm = mc_s_sample(s, pz - 1, py, px, f),
+              vyp = mc_s_sample(s, pz, py + 1, px, f),
+              vym = mc_s_sample(s, pz, py - 1, px, f),
+              vxp = mc_s_sample(s, pz, py, px + 1, f),
+              vxm = mc_s_sample(s, pz, py, px - 1, f);
+        float gz = vzp - vzm, gy = vyp - vym, gx = vxp - vxm;
         float g2 = 0.25f * (gz * gz + gy * gy + gx * gx);
         float w = g2 / (g2 + cfg->g0sq);            // surface-ness
         float diff = 0.0f, spec = 0.0f;
@@ -4074,6 +4136,15 @@ static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
         }
         float shfac = 1.0f - cfg->shadow + cfg->shadow * Tl;
         lit += w * cfg->kd * diff * shfac;
+        if (cfg->curv != 0.0f) {
+            // density Laplacian, free from the gradient taps: negative at
+            // ridges/crests (brighten), positive in cracks/pits (darken)
+            float lap = vzp + vzm + vyp + vym + vxp + vxm - 6.0f * v;
+            float cc = -lap * (1.0f / 510.0f);
+            if (cc > 1.0f) cc = 1.0f; else if (cc < -1.0f) cc = -1.0f;
+            lit += cfg->curv * cc * w;
+            if (lit < 0.0f) lit = 0.0f;
+        }
         float shade = v * lit + 255.0f * cfg->ks * spec * shfac * w;
         acc += T * a * shade;
         T *= 1.0f - a;
@@ -4102,6 +4173,10 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
     }
     if (cfg->comp == MC_COMP_SHADED)
         return shade_ray(s, P, nz, ny, nx, cfg);
+    if (cfg->comp == MC_COMP_PERCENTILE)
+        return pct_ray(s, P, nz, ny, nx, cfg);
+    if (cfg->comp == MC_COMP_DEPTH)
+        return depth_ray(s, P, nz, ny, nx, cfg);
 
     const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
     float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
@@ -4533,6 +4608,50 @@ int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
     quad_rg g = { q, x0, y0, step };
     render_bands(src, NULL, NULL, quad_rowgen, &g, w, h, p, out, nthreads);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// screen-space ambient occlusion over a MC_COMP_DEPTH image
+// ---------------------------------------------------------------------------
+// 12 fixed disk taps (two rings of 6, inner ring rotated 30deg); a pixel is
+// occluded by neighbors that sit nearer the camera (smaller depth) by more
+// than a small bias, with a range falloff so a distant other sheet doesn't
+// read as an occluder.
+void mc_image_ssao(const uint8_t *depth, int w, int h,
+                   float radius_px, float strength, uint8_t *img) {
+    if (!depth || !img || w <= 0 || h <= 0) return;
+    const float R = radius_px > 0.0f ? radius_px : 8.0f;
+    const float S = strength <= 0.0f ? 0.7f : strength > 1.0f ? 1.0f
+                                                              : strength;
+    static const float taps[12][2] = {
+        {1.0f, 0.0f},   {0.5f, 0.866f},   {-0.5f, 0.866f},
+        {-1.0f, 0.0f},  {-0.5f, -0.866f}, {0.5f, -0.866f},
+        {0.433f, 0.25f},  {0.0f, 0.5f},  {-0.433f, 0.25f},
+        {-0.433f, -0.25f}, {0.0f, -0.5f}, {0.433f, -0.25f},
+    };
+    for (int i = 0; i < h; i++)
+        for (int j = 0; j < w; j++) {
+            int dc = depth[(size_t)i * w + j];
+            if (!dc) continue;
+            float occ = 0.0f; int n = 0;
+            for (int t = 0; t < 12; t++) {
+                int jj = j + (int)(taps[t][0] * R + (taps[t][0] < 0 ? -0.5f : 0.5f));
+                int ii = i + (int)(taps[t][1] * R + (taps[t][1] < 0 ? -0.5f : 0.5f));
+                if (ii < 0 || ii >= h || jj < 0 || jj >= w) continue;
+                int dn = depth[(size_t)ii * w + jj];
+                if (!dn) continue;
+                float dd = (float)dc - (float)dn - 2.0f;    // nearer by > bias
+                if (dd <= 0.0f) { n++; continue; }
+                float o = dd * (1.0f / 8.0f);
+                if (o > 1.0f) o = 1.0f;
+                if (dd > 24.0f) o *= 24.0f / dd;            // range falloff
+                occ += o; n++;
+            }
+            if (!n) continue;
+            float ao = 1.0f - S * (occ / (float)n);
+            float v = (float)img[(size_t)i * w + j] * ao;
+            img[(size_t)i * w + j] = to_u8(v);
+        }
 }
 
 // ---------------------------------------------------------------------------

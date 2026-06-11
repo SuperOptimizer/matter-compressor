@@ -573,6 +573,14 @@ typedef enum {
                             // bright regardless of absolute density.
     MC_COMP_SHADED = 6,     // emission-absorption ray march with gradient
                             // lighting (see the shaded params below)
+    MC_COMP_PERCENTILE = 7, // value at the `percentile` rank of the ray's
+                            // samples: a robust max. MIP rides single-voxel
+                            // noise spikes; the 90th percentile keeps the
+                            // "locally bright" sensitivity without them.
+    MC_COMP_DEPTH  = 8,     // first-hit depth: the t where the value first
+                            // crosses alpha_min, mapped 1..255 over [t0,t1]
+                            // (0 = no hit). A heightfield of the surface --
+                            // feed mc_image_ssao, or relight externally.
 } mc_comp;
 
 typedef struct {
@@ -608,6 +616,12 @@ typedef struct {
     float sss;              // translucency weight        (0 = off)
     float grad_g0;          // gradient magnitude (u8/voxel) at half
                             // surface-ness               (0 -> 8)
+    float curvature;        // SHADED: ridge/valley weight (0 = off).
+                            // Brightens locally-convex samples (ridges,
+                            // crackle crests), darkens concave (cracks,
+                            // valleys) from the density Laplacian -- reads
+                            // relief without a favorable light angle.
+    float percentile;       // MC_COMP_PERCENTILE rank in (0,1] (0 -> 0.9)
 } mc_render_params;
 
 // ---------------------------------------------------------------------------
@@ -678,6 +692,19 @@ int mc_render_plane(const mc_sample_src *src, const mc_plane *pl,
 int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
                    float x0, float y0, float step, int w, int h,
                    const mc_render_params *p, uint8_t *out, int nthreads);
+
+// ---------------------------------------------------------------------------
+// screen-space ambient occlusion (post-process over MC_COMP_DEPTH)
+// ---------------------------------------------------------------------------
+// Darkens pixels whose neighborhood sits nearer the camera in the depth
+// image -- pits and crevices between crackle gain contact shadow without
+// any extra ray marching. Render the same view twice (SHADED + DEPTH),
+// then modulate the shaded image in place:
+//   mc_image_ssao(depth, w, h, 8.0f, 0.7f, shaded);
+// depth: MC_COMP_DEPTH output (0 = no hit; those pixels are left alone).
+// radius_px: sampling radius in pixels (0 -> 8). strength: [0,1] (0 -> 0.7).
+void mc_image_ssao(const uint8_t *depth, int w, int h,
+                   float radius_px, float strength, uint8_t *img);
 
 // ---------------------------------------------------------------------------
 // LOD-matched rendering

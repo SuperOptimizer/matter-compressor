@@ -376,9 +376,63 @@ int main(void) {
         sh.sss = 0.5f;
         CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg, 1) == 0);
         CHECK(simg[32 * SW + 24] >= dark1);
+
+        // percentile: robust max. A single noise spike on the ray saturates
+        // MAX but leaves the 90th percentile at the slab value.
+        sv[((size_t)24 * SN + 10) * SN + 50] = 255;     // spike above the slab
+        mc_render_params pq = { .filter = MC_FILTER_TRILINEAR,
+                                .comp = MC_COMP_MAX,
+                                .t0 = -8, .t1 = 8, .dt = 1 };
+        CHECK(mc_render_plane(&ssrc, &sp, SW, SH, 1.0f, &pq, simg, 1) == 0);
+        CHECK(simg[10 * SW + 50] == 255);
+        pq.comp = MC_COMP_PERCENTILE;   // default rank 0.9
+        CHECK(mc_render_plane(&ssrc, &sp, SW, SH, 1.0f, &pq, simg, 1) == 0);
+        CHECK(simg[10 * SW + 50] == 180);
+        // explicit low rank: mostly-air ray -> 0
+        pq.percentile = 0.25f;
+        CHECK(mc_render_plane(&ssrc, &sp, SW, SH, 1.0f, &pq, simg, 1) == 0);
+        CHECK(simg[32 * SW + 50] == 0);
+        sv[((size_t)24 * SN + 10) * SN + 50] = 0;       // remove the spike
+
+        // depth: wall top is hit before the slab top; empty slab -> 0
+        mc_render_params dq = { .filter = MC_FILTER_TRILINEAR,
+                                .comp = MC_COMP_DEPTH,
+                                .t0 = 0, .t1 = 20, .dt = 1 };
+        uint8_t dimg[SW * SH];
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &dq, dimg, 1) == 0);
+        CHECK(dimg[32 * SW + 32] > 0);                  // wall: immediate hit
+        CHECK(dimg[32 * SW + 50] > dimg[32 * SW + 32]); // slab: deeper
+        mc_plane ep = { .origin = {2, 32, 32}, .normal = {1, 0, 0},
+                        .u = {0, 0, 1}, .v = {0, 1, 0} };
+        dq.t1 = 10;                                     // z 2..12: all air
+        CHECK(mc_render_plane(&ssrc, &ep, SW, SH, 1.0f, &dq, dimg, 1) == 0);
+        CHECK(dimg[32 * SW + 50] == 0);
+
+        // ssao: a pit in a flat depth field darkens; flat field untouched
+        {
+            enum { AW = 32, AH = 32 };
+            uint8_t dep[AW * AH], aimg[AW * AH];
+            memset(dep, 100, sizeof dep);
+            memset(aimg, 200, sizeof aimg);
+            for (int i = 13; i < 19; i++)
+                for (int j = 13; j < 19; j++) dep[i * AW + j] = 140;
+            mc_image_ssao(dep, AW, AH, 4.0f, 0.8f, aimg);
+            CHECK(aimg[16 * AW + 16] < 200);            // pit floor occluded
+            CHECK(aimg[3 * AW + 3] == 200);             // flat field untouched
+        }
+
+        // curvature: a one-voxel ridge on the slab brightens when enabled
+        sv[((size_t)27 * SN + 32) * SN + 44] = 180;     // bump on the slab top
+        sh.light[0] = 0; sh.light[1] = 0; sh.light[2] = 0;  // headlight
+        sh.shadow = 0; sh.sss = 0;
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg, 1) == 0);
+        int ridge0 = simg[32 * SW + 44];
+        sh.curvature = 0.8f;
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg, 1) == 0);
+        CHECK(simg[32 * SW + 44] > ridge0);
         free(sv);
     }
-    printf("stddev + shaded OK\n");
+    printf("stddev + shaded + percentile + depth + ssao + curvature OK\n");
 
     mc_sampler_free(s);
     free(grid); free(pa); free(pb); free(ca); free(cb); free(dec); free(vol);
