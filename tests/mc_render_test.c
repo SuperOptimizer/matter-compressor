@@ -190,6 +190,17 @@ int main(void) {
     mc_sample_src csrc = mc_sample_src_cache(cache, 0, N, N, N);
     mc_sample_src d2 = mc_sample_src_dense(dec, N, N, N);
     uint8_t *ca = malloc(PW * PH), *cb = malloc(PW * PH);
+    // Zero-lock cache contract: concurrent (multi-band) reads are only valid while
+    // FROZEN. Resolve the working set single-owner, then freeze, then render the
+    // plane in parallel against pure frozen reads. (mc_render_plane with nthreads=0
+    // fans out over rows; an UNFROZEN shared cache would race on decode-insert.)
+    {
+        mc_block_id all[16*16*16]; int na=0;
+        for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx)
+            all[na++]=(mc_block_id){0,bz,by,bx};
+        mc_cache_update(cache, all, (size_t)na, 0);
+        mc_cache_freeze(cache);
+    }
     CHECK(mc_render_plane(&csrc, &pbig, PW, PH, 1.0f, &pp2, ca, 0) == 0);
     CHECK(mc_render_plane(&d2, &pbig, PW, PH, 1.0f, &pp2, cb, 0) == 0);
     CHECK(memcmp(ca, cb, PW * PH) == 0);

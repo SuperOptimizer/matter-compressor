@@ -468,8 +468,11 @@ void mc_cache_thaw(mc_cache *c);
 size_t mc_cache_resolve(mc_cache *c, const mc_block_id *ids, size_t n,
                         const mc_u8 **ptrs, int nthreads);
 
+// Record a block into the dedup miss set from outside the frozen read path.
+void mc_cache_miss_mark(mc_cache *c, int lod, int bz, int by, int bx);
+
 // Drain the frozen-phase miss queue (call after thaw; feed into the next
-// update/resolve batch). Duplicates possible — update() handles them.
+// update/resolve batch). The set is deduped; each unique block appears once.
 size_t mc_cache_misses_drain(mc_cache *c, mc_block_id *out, size_t cap);
 
 // Drop everything (e.g. source archive replaced).
@@ -554,6 +557,9 @@ void        mc_sampler_reset(mc_sampler *s);
 
 // One sample at (z,y,x). Out-of-bounds / NaN -> 0.
 float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f);
+
+// (LOD sampler API — mc_lod_sampler/mc_lod_sample — is declared after
+// mc_sample_lods is defined, below.)
 
 // Batch: n points, zyx[i*3+{0,1,2}] = (z,y,x). Points with any coordinate
 // < 0 (volume-cartographer's invalid marker) or NaN write 0.
@@ -643,6 +649,9 @@ void mc_render_points_par(const mc_sample_src *src,
                           int w, int h, const mc_render_params *p,
                           uint8_t *out, int nthreads);
 
+// (mc_render_points_par_lod — LOD-fallback variant — declared after
+// mc_sample_lods is defined, below.)
+
 // ---------------------------------------------------------------------------
 // plane surface (volume-cartographer PlaneSurface)
 // ---------------------------------------------------------------------------
@@ -720,6 +729,33 @@ typedef struct {
     mc_sample_src lods[8];      // [0] = finest; dims halve per level
     int nlods;
 } mc_sample_lods;
+
+// ---------------------------------------------------------------------------
+// LOD sampler: owns a per-level sampler over a whole pyramid and resolves a
+// requested level with optional coarser-LOD fallback.
+// ---------------------------------------------------------------------------
+typedef struct mc_lod_sampler mc_lod_sampler;
+mc_lod_sampler *mc_lod_sampler_new(const mc_sample_lods *ls);
+void            mc_lod_sampler_free(mc_lod_sampler *s);
+void            mc_lod_sampler_reset(mc_lod_sampler *s);
+
+// Sample (z,y,x) given in NATIVE level-0 voxel space. The sampler downscales
+// to the requested `lod` internally (c_L = (c_0 + 0.5)*2^-L - 0.5).
+//   lod_fallback == 0: sample only `lod`; an absent block reads 0.
+//   lod_fallback != 0: if `lod`'s block is absent, walk coarser levels
+//     (lod+1 .. coarsest) and sample the FINEST level whose block is resident;
+//     0 only if none are. Each coarser step halves the coords again.
+float mc_lod_sample(mc_lod_sampler *s, int lod, int lod_fallback,
+                    float z, float y, float x, mc_filter f);
+
+// LOD-fallback batch render: points are NATIVE level-0 voxel coords; sample the
+// requested `lod` and, where that level's block is absent (not yet streamed in),
+// fall back to the finest resident coarser level so newly-entered LODs show
+// coarse data immediately instead of going black. Slice path (comp==NONE).
+void mc_render_points_par_lod(const mc_sample_lods *ls, int lod,
+                              const float *ptsL0, int w, int h,
+                              const mc_render_params *p,
+                              uint8_t *out, int nthreads);
 
 // ---------------------------------------------------------------------------
 // 3D resampling (surface-aligned volumes)
@@ -976,6 +1012,13 @@ size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes);
 // threads block. Bigger = network saturates further ahead of CPU-bound decode.
 // Default 2 GB. Returns the installed budget.
 size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes);
+
+// Tick-phase bracket for a render game-loop (see mc_cache_freeze/thaw). freeze()
+// makes the resident cache immutable for the frame — get/get_copy then read
+// LOCK-FREE — and thaw() reopens the write phase (new regions land) + bumps the
+// pin epoch. A client clocks: thaw -> (regions arrive) -> freeze -> render -> repeat.
+void mc_volume_freeze(mc_volume *v);
+void mc_volume_thaw(mc_volume *v);
 
 #ifdef __cplusplus
 }

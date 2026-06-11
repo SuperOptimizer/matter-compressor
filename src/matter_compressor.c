@@ -1443,19 +1443,44 @@ static inline uint16_t mc_chunk_fmaplen(const uint8_t*arc, uint64_t chunk_off){
 }
 // block (bz,by,bx) present? -> 1 + its payload (abs_off, len). 0 = ZERO block. Offsets
 // are implicit (cumulative len of present blocks before it); ZERO blocks cost 1 bitmap bit.
-static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,int bx,
-                          uint64_t *abs_off, uint32_t *len){
+// Per-block payload (abs_off,len) within a chunk blob. The on-disk layout stores
+// only present-block lengths (offsets implicit = prefix sum). Computing that prefix
+// sum + rank per call is O(block-index): summed over a chunk's 4096 blocks it is
+// O(n^2) (~16M ops/chunk) -- the render-path cost when a frame samples many blocks
+// of one chunk. We cache, thread-locally, a full per-chunk index built in ONE
+// O(4096) pass: bi -> abs_off (0 = absent block). Render samples are spatially
+// coherent (consecutive blocks share a chunk), so the table is built once per
+// chunk and every block lookup is O(1).
+typedef struct { const uint8_t*arc; uint64_t chunk_off, tag; uint64_t off[MC_GRID3]; uint16_t len[MC_GRID3]; } mc_chunk_idx;
+static const mc_chunk_idx *mc_chunk_index(const uint8_t*arc, uint64_t chunk_off){
+    static _Thread_local mc_chunk_idx idx = { .arc=NULL, .chunk_off=~0ull, .tag=0 };
+    // Key on (arc base, chunk_off, content hash). chunk_off alone is unsafe: it is
+    // reused across archives (same tree position -> same EOF offset) and after a
+    // re-append, so the stored xxh64 disambiguates content. Otherwise a stale index
+    // from a different chunk is served (caught by mc_v6 par-vs-serial).
+    uint64_t tag = mc_chunk_stored_hash(arc, chunk_off);
+    if(idx.arc==arc && idx.chunk_off==chunk_off && idx.tag==tag) return &idx;   // hot
     uint64_t bm_off = chunk_off + MC_BLOB_HDR + mc_chunk_fmaplen(arc,chunk_off);
     const uint8_t*bm = arc + bm_off;
-    int bi=(bz*16+by)*16+bx;
-    if(!mc_bit_get(bm,bi)) return 0;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
     const uint8_t*lens = arc + bm_off + MC_BITMAP_BYTES;
-    uint64_t pay_base = bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*2;
-    int slot = mc_rank(bm,bi);
-    uint64_t cum=0; for(int s=0;s<slot;++s){ uint16_t l; memcpy(&l,lens+(size_t)s*2,2); cum+=l; }
-    uint16_t mylen; memcpy(&mylen, lens+(size_t)slot*2, 2);
-    *abs_off = pay_base + cum; *len = mylen;
+    uint64_t pay = bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*2;   // first payload
+    int slot=0;
+    for(int bi=0; bi<MC_GRID3; ++bi){
+        if(mc_bit_get(bm,bi)){
+            uint16_t l; memcpy(&l, lens+(size_t)slot*2, 2);
+            idx.off[bi]=pay; idx.len[bi]=l; pay+=l; ++slot;
+        } else { idx.off[bi]=0; idx.len[bi]=0; }
+    }
+    idx.arc=arc; idx.chunk_off=chunk_off; idx.tag=tag;
+    return &idx;
+}
+static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,int bx,
+                          uint64_t *abs_off, uint32_t *len){
+    const mc_chunk_idx *ix = mc_chunk_index(arc, chunk_off);
+    int bi=(bz*16+by)*16+bx;
+    if(!ix->off[bi]) return 0;                        // absent (ZERO) block
+    *abs_off = ix->off[bi]; *len = ix->len[bi];
     return 1;
 }
 
@@ -1750,6 +1775,15 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
 #define MC_RESERVE   (10ull*1024*1024*1024*1024)   // 10 TiB virtual reservation (NORESERVE)
 #define MC_GROW_STEP (1ull*1024*1024*1024)          // grow the file 1 GiB at a time
 
+// Coverage memo: an O(1) resident-region set so frozen render reads never walk
+// the node tree (mc_resolve_chunk) per absent block. Keyed by a region key that
+// packs (lod,cz,cy,cx); value bit distinguishes PRESENT from ZERO(air). Open
+// addressing, power-of-two, atomic slots — lock-free inserts from decode threads,
+// lock-free probes from render. Slot 0 = empty. Sized generously; never resizes
+// (a render archive's covered-region count is bounded by the volume's region
+// count, and we cap fill at the reserve anyway).
+#define MC_COV_CAP (1u<<20)            // 1M slots -> up to ~700k regions at 0.7 load
+#define MC_COV_ZERO_BIT (1ull<<63)     // value flag: region is air (MC_ZERO)
 struct mc_archive {
     int fd;
     u8 *base;                  // fixed mmap base (never moves)
@@ -1759,7 +1793,53 @@ struct mc_archive {
     float quality;
     uint64_t reserve;          // mmap reservation size (dims-derived, <= MC_RESERVE)
     pthread_mutex_t grow_mu;   // serializes ftruncate only; decode is lock-free
+    _Atomic uint64_t *cov;     // coverage memo slots (region key | flags), 0 = empty
+    _Atomic uint64_t gen;      // bumped on every publish; invalidates per-thread
+                               // chunk_off memos when a chunk is re-appended
 };
+
+// region key for the coverage memo: same packing as rkey() but defined here so the
+// archive layer is self-contained. lod in high nibble, then cz,cy,cx (20 bits ea).
+static inline uint64_t mc_covkey(int lod,int cz,int cy,int cx){
+    return ((uint64_t)(lod & 7) << 60) | ((uint64_t)(cz & 0xFFFFF) << 40) |
+           ((uint64_t)(cy & 0xFFFFF) << 20) | (uint64_t)(cx & 0xFFFFF);
+}
+// probe the memo. returns MC_PRESENT / MC_ZERO if found, MC_ABSENT if not.
+static mc_cover mc_cov_probe(mc_archive *a,int lod,int cz,int cy,int cx){
+    if(!a->cov) return MC_ABSENT;
+    uint64_t key = mc_covkey(lod,cz,cy,cx);
+    uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>44);
+    for(int p=0;p<32;++p){
+        uint32_t i=(h+(uint32_t)p)&(MC_COV_CAP-1);
+        uint64_t cur=atomic_load_explicit(&a->cov[i],memory_order_acquire);
+        if(cur==0) return MC_ABSENT;
+        if((cur & ~MC_COV_ZERO_BIT)==key) return (cur & MC_COV_ZERO_BIT)?MC_ZERO:MC_PRESENT;
+    }
+    return MC_ABSENT;                  // probe exhausted (over capacity) -> fall back
+}
+// insert/update the memo. PRESENT supersedes ZERO if a region transitions.
+static void mc_cov_put(mc_archive *a,int lod,int cz,int cy,int cx,int is_zero){
+    if(!a->cov) return;
+    uint64_t key = mc_covkey(lod,cz,cy,cx);
+    uint64_t val = key | (is_zero?MC_COV_ZERO_BIT:0);
+    uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>44);
+    for(int p=0;p<32;++p){
+        uint32_t i=(h+(uint32_t)p)&(MC_COV_CAP-1);
+        uint64_t cur=atomic_load_explicit(&a->cov[i],memory_order_relaxed);
+        if((cur & ~MC_COV_ZERO_BIT)==key){      // same region: upgrade air->present if needed
+            if(cur==val) return;
+            atomic_store_explicit(&a->cov[i],val,memory_order_release); return;
+        }
+        if(cur==0){
+            uint64_t exp=0;
+            if(atomic_compare_exchange_strong_explicit(&a->cov[i],&exp,val,
+                   memory_order_release,memory_order_relaxed)) return;
+            if((exp & ~MC_COV_ZERO_BIT)==key){  // lost race to same region
+                if(exp!=val) atomic_store_explicit(&a->cov[i],val,memory_order_release);
+                return; }
+        }
+    }
+}
 
 static int w_ensure(mc_archive *w, uint64_t need){
     uint64_t fl = atomic_load_explicit(&w->file_len, memory_order_acquire);
@@ -1837,6 +1917,8 @@ static int w_mark_zero(mc_archive *w,int lod,int cz,int cy,int cx){
     uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
     if(slot==~0ull) return -1;
     w_write_u64(w, slot, MC_SLOT_ZERO);
+    mc_cov_put(w, lod, cz, cy, cx, 1 /*air*/);
+    atomic_fetch_add_explicit(&w->gen, 1, memory_order_release);
     return 0;
 }
 
@@ -1849,6 +1931,8 @@ static int w_install_blob(mc_archive *w,int lod,int cz,int cy,int cx,const u8 *b
     // release fence so the payload bytes are visible before the commit word.
     atomic_thread_fence(memory_order_release);
     w_write_u64(w, slot, off);   // publish chunk offset = commit
+    mc_cov_put(w, lod, cz, cy, cx, 0 /*present*/);
+    atomic_fetch_add_explicit(&w->gen, 1, memory_order_release);
     // keep the header's total length current so the file is valid if reopened now.
     uint64_t cur = atomic_load_explicit(&w->cursor, memory_order_relaxed);
     w_write_u64(w, MCH_TOTLEN, cur);
@@ -1896,6 +1980,7 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
     w->fd=fd; w->base=base; w->dim=dim; w->quality=quality; w->reserve=reserve;
     pthread_mutex_init(&w->grow_mu,NULL);
     atomic_store(&w->file_len, init_len);
+    w->cov = calloc(MC_COV_CAP, sizeof *w->cov);   // coverage memo (0 = empty)
 
     if(fresh){
         memset(base,0,MC_HDR);
@@ -2026,11 +2111,19 @@ uint64_t mc_archive_data_len(mc_archive *a){
 
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx){
     if(!a||lod<0||lod>7) return MC_ABSENT;
+    // Fast path: the coverage memo. A hit is O(1) and never touches the node tree
+    // (the per-block tree walk on the render worker was the 49ms cost). Regions
+    // made resident this session are always in the memo. A memo-miss falls back to
+    // the tree (covers disk-loaded archives committed in a prior session) and
+    // backfills the memo so the next probe is O(1).
+    mc_cover m = mc_cov_probe(a, lod, cz, cy, cx);
+    if(m != MC_ABSENT) return m;
     uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);
     uint64_t off = mc_resolve_chunk(a->base, root, cz,cy,cx);
     if(off==0) return MC_ABSENT;
-    if(off==MC_SLOT_ZERO) return MC_ZERO;
-    return MC_PRESENT;
+    int zero = (off==MC_SLOT_ZERO);
+    mc_cov_put(a, lod, cz, cy, cx, zero);   // backfill for next time
+    return zero ? MC_ZERO : MC_PRESENT;
 }
 
 uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
@@ -2121,7 +2214,6 @@ typedef struct {
     uint16_t blen[MC_GRID3];
     uint8_t  bm[MC_BITMAP_BYTES];
     uint8_t  frac[MC_GRID3];
-    pthread_mutex_t bm_mu;
     _Atomic uint32_t next;
 } echunk_ctx;
 static void *echunk_worker(void *p){
@@ -2143,9 +2235,9 @@ static void *echunk_worker(void *p){
             uint32_t len=0;
             if(mc_enc_block(C,blk,&c->bufs[s],&len)){
                 c->blen[bi]=(uint16_t)len;
-                pthread_mutex_lock(&c->bm_mu);
+                // No lock: each stripe spans MC_GRID3/ENC_STRIPES=256 blocks = 32
+                // whole bitmap bytes, so stripes set DISJOINT bytes (8 blocks/byte).
                 mc_bit_set(c->bm,bi);
-                pthread_mutex_unlock(&c->bm_mu);
             }
         }
     }
@@ -2157,7 +2249,6 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
     if(!a||lod<0||lod>7||!vox) return -1;
     echunk_ctx *c=calloc(1,sizeof *c);
     c->vox=vox; c->q=q>0?q:a->quality;
-    pthread_mutex_init(&c->bm_mu,NULL);
     atomic_store(&c->next,0);
     int nt=auto_threads(nthreads); if(nt>ENC_STRIPES)nt=ENC_STRIPES;
     if(nt<=1) echunk_worker(c);
@@ -2191,7 +2282,6 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
         free(st.p);
     }
     for(int s=0;s<ENC_STRIPES;++s) free(c->bufs[s].p);
-    pthread_mutex_destroy(&c->bm_mu);
     free(c);
     return rc;
 }
@@ -2346,6 +2436,7 @@ void mc_archive_close(mc_archive *a){
     if(ftruncate(a->fd,(off_t)cur)!=0) perror("mc_archive_close: ftruncate");
     close(a->fd);
     pthread_mutex_destroy(&a->grow_mu);
+    free(a->cov);
     free(a);
 }
 
@@ -2667,9 +2758,9 @@ static inline uint64_t khash(uint64_t k){
     return k;
 }
 
-// one shard: its own slice of the arena, its own map, lock, eviction state.
+// one shard: its own slice of the arena, its own map, eviction state. No lock:
+// all mutation is single-owner (THAW partitions fill by shard), reads are pure.
 typedef struct {
-    pthread_mutex_t mu;
     uint64_t *map_key;        // open addressing, linear probe, backward-shift delete
     uint32_t *map_slot;
     uint32_t  map_cap;        // power of two
@@ -2699,14 +2790,17 @@ struct mc_cache {
                                      // are inert (no behavior change for
                                      // clients that never tick)
     _Atomic uint32_t epoch;          // bumped at thaw; pins compare against it
+    // Miss set: open-addressing dedup table (slot 0 == empty). A thin slice
+    // re-probes the same 16^3 block from many pixels/bands; recording each unique
+    // absent block ONCE (not once per pixel) keeps the per-frame fill set ~= the
+    // real working set instead of ~100x larger. Lock-free insert via CAS.
     _Atomic uint64_t missq[MISSQ_CAP];
-    _Atomic uint32_t miss_w;
+    _Atomic uint32_t miss_n;          // approx live entries (for drain early-out)
     shard_t sh[NSHARD];
     mc_cache_src_fn src; void *src_ud;
     size_t arena_bytes;
     void *arena_base;
-    // reader binding (serialized decode)
-    pthread_mutex_t rd_mu;
+    // reader binding (single-owner decode; no lock)
     struct mc_reader *rd;
     struct mc_archive *ar;
 };
@@ -2714,15 +2808,33 @@ struct mc_cache {
 static uint32_t pow2_at_least(uint32_t v){ uint32_t p=1; while(p<v)p<<=1; return p; }
 static inline int slot_pinned(mc_cache *c, shard_t *sh, uint32_t slot);
 static inline int cache_frozen(mc_cache *c){ return atomic_load_explicit(&c->frozen,memory_order_acquire); }
+// Dedup insert into the miss set. Lock-free: hash, linear-probe a bounded run,
+// CAS an empty slot to `key`. If the key is already present (or lands in the
+// probe run), do nothing — recording the same absent block from another pixel is
+// free. Bounded probe (table is generously sized vs the per-frame working set);
+// on a full run we just drop the record (it re-records next frame).
 static void miss_record(mc_cache *c, uint64_t key){
-    uint32_t i=atomic_fetch_add_explicit(&c->miss_w,1,memory_order_relaxed);
-    atomic_store_explicit(&c->missq[i&(MISSQ_CAP-1)],key,memory_order_relaxed);
+    if(!key) return;
+    uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>40);
+    for(int p=0;p<8;++p){
+        uint32_t i=(h+(uint32_t)p)&(MISSQ_CAP-1);
+        uint64_t cur=atomic_load_explicit(&c->missq[i],memory_order_relaxed);
+        if(cur==key) return;                          // already recorded
+        if(cur==0){
+            uint64_t exp=0;
+            if(atomic_compare_exchange_strong_explicit(&c->missq[i],&exp,key,
+                   memory_order_relaxed,memory_order_relaxed)){
+                atomic_fetch_add_explicit(&c->miss_n,1,memory_order_relaxed);
+                return;
+            }
+            if(exp==key) return;                      // racer inserted same key
+        }
+    }
 }
 
 mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
     mc_cache *c=calloc(1,sizeof *c);
     c->src=src; c->src_ud=src_ud;
-    pthread_mutex_init(&c->rd_mu,NULL);
     size_t nslot_total = bytes/BLK_BYTES; if(nslot_total<NSHARD) nslot_total=NSHARD;
     uint32_t per = (uint32_t)(nslot_total/NSHARD); if(per<1)per=1;
     c->arena_bytes = (size_t)per*NSHARD*BLK_BYTES;
@@ -2736,7 +2848,6 @@ mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
 #endif
     for(int s=0;s<NSHARD;++s){
         shard_t *sh=&c->sh[s];
-        pthread_mutex_init(&sh->mu,NULL);
         sh->nslot=per; sh->hand=0; sh->used=0;
         sh->arena=(mc_u8*)c->arena_base + (size_t)s*per*BLK_BYTES;
         sh->map_cap=pow2_at_least(per*2);
@@ -2786,25 +2897,20 @@ static void shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per){
 
 void mc_cache_free(mc_cache *c){
     if(!c) return;
-    for(int s=0;s<NSHARD;++s){
-        shard_t *sh=&c->sh[s];
-        pthread_mutex_destroy(&sh->mu);
-        shard_free_tables(sh);
-    }
+    for(int s=0;s<NSHARD;++s) shard_free_tables(&c->sh[s]);
 #if MC_CACHE_MMAP
     munmap(c->arena_base,c->arena_bytes);
 #else
     free(c->arena_base);
 #endif
-    pthread_mutex_destroy(&c->rd_mu);
     free(c);
 }
 
 // ---- runtime budget control -------------------------------------------------
 // Live-resize the decoded-block cache to `new_bytes`. The cache is just a cache,
 // so resizing DISCARDS resident blocks (re-decode on demand) rather than
-// migrating them. Locks every shard for the swap. Returns the byte budget
-// actually installed (rounded to whole slots over NSHARD), or 0 on failure.
+// migrating them. Single-owner: call only between ticks (no fill in flight).
+// Returns the byte budget actually installed (rounded to whole slots), or 0.
 size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
     if(!c) return 0;
     size_t nslot_total = new_bytes/BLK_BYTES; if(nslot_total<NSHARD) nslot_total=NSHARD;
@@ -2818,7 +2924,6 @@ size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
     void *na = malloc(new_arena);
     if(!na) return 0;
 #endif
-    for(int s=0;s<NSHARD;++s) pthread_mutex_lock(&c->sh[s].mu);
     for(int s=0;s<NSHARD;++s){
         shard_free_tables(&c->sh[s]);
         shard_init_tables(&c->sh[s], (mc_u8*)na + (size_t)s*per*BLK_BYTES, per);
@@ -2826,7 +2931,6 @@ size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
     void *old = c->arena_base; size_t old_bytes = c->arena_bytes;
     c->arena_base = na; c->arena_bytes = new_arena;
     atomic_fetch_add(&c->epoch,1);   // invalidate outstanding pins
-    for(int s=0;s<NSHARD;++s) pthread_mutex_unlock(&c->sh[s].mu);
 #if MC_CACHE_MMAP
     munmap(old,old_bytes);
 #else
@@ -2840,11 +2944,7 @@ size_t mc_cache_capacity_bytes(const mc_cache *c){ return c ? c->arena_bytes : 0
 size_t mc_cache_used_bytes(mc_cache *c){
     if(!c) return 0;
     size_t used=0;
-    for(int s=0;s<NSHARD;++s){
-        pthread_mutex_lock(&c->sh[s].mu);
-        used += (size_t)c->sh[s].used;
-        pthread_mutex_unlock(&c->sh[s].mu);
-    }
+    for(int s=0;s<NSHARD;++s) used += (size_t)c->sh[s].used;   // racy read ok (stat)
     return used*BLK_BYTES;
 }
 
@@ -2998,174 +3098,131 @@ static inline shard_t *shard_of(mc_cache *c, uint64_t key){
     return &c->sh[(khash(key)>>56)&(NSHARD-1)];
 }
 
+// LOCK-FREE. FROZEN (render): bare probe; miss -> record + return NULL (caller
+// falls to coarser LOD). UNFROZEN (THAW / single-owner CLI): probe; miss ->
+// decode + insert. No lock: every mutation is single-owner by contract (THAW
+// partitions by shard; CLI is single-threaded). The cache arena is an immutable
+// snapshot during a frozen frame, so the probe needs no synchronization.
 const mc_u8 *mc_cache_get(mc_cache *c, int lod, int bz, int by, int bx){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
-    if(cache_frozen(c)){                      // immutable: bare probe, no locks
-        uint32_t mi=map_find(sh,key);
-        if(mi!=UINT32_MAX) return sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES;
-        miss_record(c,key);
-        return NULL;                          // caller: fall back to best_lod
-    }
-    pthread_mutex_lock(&sh->mu);
     uint32_t mi=map_find(sh,key);
     if(mi!=UINT32_MAX){
-        uint32_t slot=sh->map_slot[mi];
-        cache_touch(c,sh,slot); sh->hits++;
-        const mc_u8 *p=sh->arena+(size_t)slot*BLK_BYTES;
-        pthread_mutex_unlock(&sh->mu);
-        return p;
+        if(!cache_frozen(c)){ cache_touch(c,sh,sh->map_slot[mi]); sh->hits++; }
+        return sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES;
     }
+    if(cache_frozen(c)){ miss_record(c,key); return NULL; }
     sh->misses++;
-    pthread_mutex_unlock(&sh->mu);
-
-    mc_u8 tmp[BLK_BYTES];
-    c->src(c->src_ud,lod,bz,by,bx,tmp);            // decode outside the lock
-
-    pthread_mutex_lock(&sh->mu);
-    mi=map_find(sh,key);                           // racing thread may have inserted
-    uint32_t slot;
-    if(mi!=UINT32_MAX) slot=sh->map_slot[mi];
-    else {
-        slot=cache_alloc_slot(c,sh,key);
-        sh->slot_key[slot]=key;
-        map_insert(sh,key,slot);
-        memcpy(sh->arena+(size_t)slot*BLK_BYTES,tmp,BLK_BYTES);
-    }
+    uint32_t slot=cache_alloc_slot(c,sh,key);
+    sh->slot_key[slot]=key;
+    map_insert(sh,key,slot);
+    c->src(c->src_ud,lod,bz,by,bx,sh->arena+(size_t)slot*BLK_BYTES);   // decode in place
     cache_touch(c,sh,slot);
-    const mc_u8 *p=sh->arena+(size_t)slot*BLK_BYTES;
-    pthread_mutex_unlock(&sh->mu);
-    return p;
+    return sh->arena+(size_t)slot*BLK_BYTES;
 }
 
 void mc_cache_get_copy(mc_cache *c, int lod, int bz, int by, int bx, mc_u8 *dst){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
+    uint32_t mi=map_find(sh,key);
+    if(mi!=UINT32_MAX){
+        if(!cache_frozen(c)){ cache_touch(c,sh,sh->map_slot[mi]); sh->hits++; }
+        memcpy(dst,sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES,BLK_BYTES);
+        return;
+    }
     if(cache_frozen(c)){
-        uint32_t mi=map_find(sh,key);
-        if(mi!=UINT32_MAX){ memcpy(dst,sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES,BLK_BYTES); return; }
         miss_record(c,key);
         c->src(c->src_ud,lod,bz,by,bx,dst);   // read-through, no insert
         return;
     }
-    pthread_mutex_lock(&sh->mu);
-    uint32_t mi=map_find(sh,key);
-    if(mi!=UINT32_MAX){
-        uint32_t slot=sh->map_slot[mi];
-        cache_touch(c,sh,slot); sh->hits++;
-        memcpy(dst,sh->arena+(size_t)slot*BLK_BYTES,BLK_BYTES);
-        pthread_mutex_unlock(&sh->mu);
-        return;
-    }
     sh->misses++;
-    pthread_mutex_unlock(&sh->mu);
-    c->src(c->src_ud,lod,bz,by,bx,dst);
-    pthread_mutex_lock(&sh->mu);
-    if(map_find(sh,key)==UINT32_MAX){
-        uint32_t slot=cache_alloc_slot(c,sh,key);
-        sh->slot_key[slot]=key;
-        map_insert(sh,key,slot);
-        memcpy(sh->arena+(size_t)slot*BLK_BYTES,dst,BLK_BYTES);
-        cache_touch(c,sh,slot);
-    }
-    pthread_mutex_unlock(&sh->mu);
+    uint32_t slot=cache_alloc_slot(c,sh,key);
+    sh->slot_key[slot]=key;
+    map_insert(sh,key,slot);
+    c->src(c->src_ud,lod,bz,by,bx,sh->arena+(size_t)slot*BLK_BYTES);
+    memcpy(dst,sh->arena+(size_t)slot*BLK_BYTES,BLK_BYTES);
+    cache_touch(c,sh,slot);
 }
 
 int mc_cache_contains(mc_cache *c, int lod, int bz, int by, int bx){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
-    if(cache_frozen(c)) return map_find(sh,key)!=UINT32_MAX;
-    pthread_mutex_lock(&sh->mu);
-    int r = map_find(sh,key)!=UINT32_MAX;
-    pthread_mutex_unlock(&sh->mu);
-    return r;
+    return map_find(sh,key)!=UINT32_MAX;   // lock-free probe
 }
 
-// lookup-or-decode-insert; returns 1 if a decode happened.
+// lookup-or-decode-insert; returns 1 if a decode happened. LOCK-FREE: the caller
+// guarantees single-owner access to this block's shard (THAW partitions fill work
+// by shard so no two workers touch one shard). All shard mutation -- map, arena,
+// eviction rings -- happens here, only during THAW, only from the shard's owner.
 static int cache_fill_one(mc_cache *c, int lod, int bz, int by, int bx){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
-    pthread_mutex_lock(&sh->mu);
     uint32_t mi=map_find(sh,key);
     if(mi!=UINT32_MAX){
         cache_touch(c,sh,sh->map_slot[mi]); sh->hits++;
-        pthread_mutex_unlock(&sh->mu);
         return 0;
     }
     sh->misses++;
-    pthread_mutex_unlock(&sh->mu);
-    mc_u8 tmp[BLK_BYTES];
-    c->src(c->src_ud,lod,bz,by,bx,tmp);
-    pthread_mutex_lock(&sh->mu);
-    if(map_find(sh,key)==UINT32_MAX){
-        uint32_t slot=cache_alloc_slot(c,sh,key);
-        sh->slot_key[slot]=key;
-        map_insert(sh,key,slot);
-        memcpy(sh->arena+(size_t)slot*BLK_BYTES,tmp,BLK_BYTES);
-        cache_touch(c,sh,slot);
-    }
-    pthread_mutex_unlock(&sh->mu);
+    uint32_t slot=cache_alloc_slot(c,sh,key);
+    sh->slot_key[slot]=key;
+    map_insert(sh,key,slot);
+    c->src(c->src_ud,lod,bz,by,bx,sh->arena+(size_t)slot*BLK_BYTES);   // decode in place
+    cache_touch(c,sh,slot);
     return 1;
 }
 
+// THAW batch fill, partitioned by SHARD ownership. Each block is bucketed by its
+// shard; worker t owns shards { t, t+nt, t+2nt, ... }. Because a shard is touched
+// by exactly one worker, every shard mutation (map insert, slot alloc, eviction,
+// arena write) is single-owner and needs NO lock. This is the partitioned phase
+// update: parallelism by disjoint ownership, not by shared queue. The only sync
+// is the join at the end (the phase barrier). Caller must be UNFROZEN (THAW).
 typedef struct {
     mc_cache *c;
-    const mc_block_id *ids;     // sorted copy, grouped by chunk
-    const uint32_t *group_off;  // group g = ids[group_off[g] .. group_off[g+1])
-    uint32_t ngroups;
-    _Atomic uint32_t next;      // work-stealing group cursor
-    _Atomic size_t decoded;
+    const mc_block_id *ids;     // all blocks (unsorted)
+    const uint32_t *bucket;     // bucket[s] = head index into `link` for shard s (-1 end)
+    const uint32_t *link;       // link[i] = next block index in the same shard (-1 end)
+    int nt, t;                  // this worker owns shards s where s % nt == t
+    size_t decoded;             // written by this worker only
 } upd_ctx;
 static void *upd_worker(void *p){
     upd_ctx *u=p;
-    for(;;){
-        uint32_t g=atomic_fetch_add_explicit(&u->next,1,memory_order_relaxed);
-        if(g>=u->ngroups) break;
-        size_t dec=0;
-        for(uint32_t i=u->group_off[g];i<u->group_off[g+1];++i){
+    size_t dec=0;
+    for(int s=u->t; s<NSHARD; s+=u->nt){            // this worker's disjoint shards
+        for(uint32_t i=u->bucket[s]; i!=UINT32_MAX; i=u->link[i]){
             const mc_block_id *b=&u->ids[i];
             dec+=(size_t)cache_fill_one(u->c,b->lod,b->bz,b->by,b->bx);
         }
-        atomic_fetch_add_explicit(&u->decoded,dec,memory_order_relaxed);
     }
+    u->decoded=dec;
     return NULL;
-}
-static uint64_t upd_sortkey(const mc_block_id *b){    // chunk-major; low 12 bits = in-chunk
-    return ((uint64_t)(b->lod&7)<<60)
-         | ((uint64_t)(b->bz>>4)<<44) | ((uint64_t)(b->by>>4)<<28) | ((uint64_t)(b->bx>>4)<<12)
-         | ((uint64_t)(b->bz&15)<<8)  | ((uint64_t)(b->by&15)<<4)  | (uint64_t)(b->bx&15);
-}
-static int upd_cmp(const void *a,const void *b){
-    uint64_t ka=upd_sortkey(a), kb=upd_sortkey(b);
-    return ka<kb?-1:ka>kb?1:0;
 }
 size_t mc_cache_update(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads){
     if(!c||!ids||!n||cache_frozen(c)) return 0;
-    mc_block_id *s=malloc(n*sizeof *s);
-    memcpy(s,ids,n*sizeof *s);
-    qsort(s,n,sizeof *s,upd_cmp);
-    uint32_t *off=malloc((n+1)*sizeof *off);
-    uint32_t ng=0; off[0]=0;
-    for(size_t i=1;i<n;++i){
-        if((upd_sortkey(&s[i])>>12)!=(upd_sortkey(&s[i-1])>>12)) off[++ng]=(uint32_t)i;
+    // Bucket block indices by shard via per-shard singly-linked lists (no sort,
+    // no shared structure). bucket[s] heads shard s's chain through link[].
+    uint32_t *bucket=malloc(NSHARD*sizeof *bucket);
+    uint32_t *link=malloc(n*sizeof *link);
+    if(!bucket||!link){ free(bucket); free(link); return 0; }
+    for(int s=0;s<NSHARD;++s) bucket[s]=UINT32_MAX;
+    for(size_t i=0;i<n;++i){
+        uint64_t key=bkey(ids[i].lod,ids[i].bz,ids[i].by,ids[i].bx);
+        int s=(int)((khash(key)>>56)&(NSHARD-1));
+        link[i]=bucket[s]; bucket[s]=(uint32_t)i;
     }
-    off[++ng]=(uint32_t)n;
-    upd_ctx u={.c=c,.ids=s,.group_off=off,.ngroups=ng};
-    atomic_store(&u.next,0); atomic_store(&u.decoded,0);
     int nt=nthreads;
-    if(nt<=0){
-        long nc=sysconf(_SC_NPROCESSORS_ONLN);
-        nt=(int)(nc>0?nc:4);
-    }
-    if(nt>16)nt=16; if((uint32_t)nt>ng)nt=(int)ng;
-    if(nt<=1){ upd_worker(&u); }
+    if(nt<=0){ long nc=sysconf(_SC_NPROCESSORS_ONLN); nt=(int)(nc>0?nc:4); }
+    if(nt>16)nt=16; if(nt>NSHARD)nt=NSHARD; if(nt<1)nt=1;
+    upd_ctx u[16];
+    for(int t=0;t<nt;++t) u[t]=(upd_ctx){.c=c,.ids=ids,.bucket=bucket,.link=link,.nt=nt,.t=t,.decoded=0};
+    if(nt<=1){ upd_worker(&u[0]); }
     else {
         pthread_t th[16];
-        for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,upd_worker,&u);
-        for(int t=0;t<nt;++t) pthread_join(th[t],NULL);
+        for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,upd_worker,&u[t]);
+        for(int t=0;t<nt;++t) pthread_join(th[t],NULL);   // phase barrier (join)
     }
-    size_t dec=atomic_load(&u.decoded);
-    free(s); free(off);
+    size_t dec=0; for(int t=0;t<nt;++t) dec+=u[t].decoded;
+    free(bucket); free(link);
     return dec;
 }
 
@@ -3179,68 +3236,72 @@ void mc_cache_thaw(mc_cache *c){
     atomic_store_explicit(&c->frozen,0,memory_order_release);
     atomic_fetch_add_explicit(&c->epoch,1,memory_order_relaxed);
 }
+// Record a block into the dedup miss set from outside the frozen read path
+// (e.g. mc_volume_try_block marking an ABSENT block for the downloader). Same
+// lock-free dedup insert; safe to call concurrently with frozen reads.
+void mc_cache_miss_mark(mc_cache *c, int lod, int bz, int by, int bx){
+    if(c) miss_record(c, bkey(lod,bz,by,bx));
+}
+
+// Drain the dedup miss set: emit each unique block once and clear its slot. Must
+// run while no frozen reads are inserting (thaw window) — consistent with the
+// game loop (thaw drains, then freeze reopens reads).
 size_t mc_cache_misses_drain(mc_cache *c, mc_block_id *out, size_t cap){
     if(!c||!out) return 0;
-    uint32_t w=atomic_load_explicit(&c->miss_w,memory_order_acquire);
-    uint32_t n=w>MISSQ_CAP?MISSQ_CAP:w;
+    if(atomic_load_explicit(&c->miss_n,memory_order_relaxed)==0) return 0;
     size_t m=0;
-    for(uint32_t i=0;i<n&&m<cap;++i){
-        uint64_t k=atomic_load_explicit(&c->missq[i&(MISSQ_CAP-1)],memory_order_relaxed);
+    for(uint32_t i=0;i<MISSQ_CAP;++i){
+        uint64_t k=atomic_load_explicit(&c->missq[i],memory_order_relaxed);
         if(!k) continue;
-        out[m].lod=(int)((k>>60)&7);
-        out[m].bz=(int)((k>>40)&0xFFFFF);
-        out[m].by=(int)((k>>20)&0xFFFFF);
-        out[m].bx=(int)(k&0xFFFFF);
-        m++;
+        atomic_store_explicit(&c->missq[i],0,memory_order_relaxed);   // clear slot
+        if(m<cap){
+            out[m].lod=(int)((k>>60)&7);
+            out[m].bz=(int)((k>>40)&0xFFFFF);
+            out[m].by=(int)((k>>20)&0xFFFFF);
+            out[m].bx=(int)(k&0xFFFFF);
+            m++;
+        }
     }
-    atomic_store_explicit(&c->miss_w,0,memory_order_release);
+    atomic_store_explicit(&c->miss_n,0,memory_order_relaxed);
     return m;
 }
 
 int mc_cache_best_lod(mc_cache *c, int finest_lod, int bz, int by, int bx){
-    int froz=cache_frozen(c);
     for(int l=finest_lod;l<8;++l){
         uint64_t key=bkey(l,bz,by,bx);
         shard_t *sh=shard_of(c,key);
-        int hit;
-        if(froz) hit = map_find(sh,key)!=UINT32_MAX;
-        else { pthread_mutex_lock(&sh->mu); hit = map_find(sh,key)!=UINT32_MAX; pthread_mutex_unlock(&sh->mu); }
-        if(hit) return l;
+        if(map_find(sh,key)!=UINT32_MAX) return l;   // lock-free probe
         bz>>=1; by>>=1; bx>>=1;
     }
     return -1;
 }
 
 // ---- async update tickets ---------------------------------------------------
+// Async ticket: same shard-partitioned, lock-free fill as mc_cache_update, but on
+// detached worker threads. Worker t owns shards { t, t+nth, ... } via per-shard
+// linked buckets -> single-owner, no lock. Cancel sets a flag workers poll.
 struct mc_cache_ticket {
     mc_cache *c;
-    mc_block_id *ids;            // owned sorted copy
-    uint32_t *group_off;
-    uint32_t ngroups;
-    _Atomic uint32_t next;
-    _Atomic uint32_t groups_done;
+    mc_block_id *ids;            // owned copy
+    uint32_t *bucket;           // bucket[s] = head index for shard s (UINT32_MAX end)
+    uint32_t *link;             // link[i]   = next block index in same shard
+    _Atomic uint32_t workers_done;
     _Atomic int cancel;
-    pthread_t th[16]; int nth;
+    pthread_t th[16]; int nth; int t_id[16];
     int joined;
 };
 static void *aupd_worker(void *p){
-    mc_cache_ticket *t=p;
-    for(;;){
-        if(atomic_load_explicit(&t->cancel,memory_order_relaxed)){
-            // mark remaining groups done so done() converges after cancel
-            uint32_t g=atomic_fetch_add_explicit(&t->next,1,memory_order_relaxed);
-            if(g>=t->ngroups) break;
-            atomic_fetch_add_explicit(&t->groups_done,1,memory_order_relaxed);
-            continue;
-        }
-        uint32_t g=atomic_fetch_add_explicit(&t->next,1,memory_order_relaxed);
-        if(g>=t->ngroups) break;
-        for(uint32_t i=t->group_off[g];i<t->group_off[g+1];++i){
+    mc_cache_ticket *t = ((void**)p)[0];
+    int me = (int)(intptr_t)((void**)p)[1];
+    free(p);
+    for(int s=me; s<NSHARD; s+=t->nth){
+        if(atomic_load_explicit(&t->cancel,memory_order_relaxed)) break;
+        for(uint32_t i=t->bucket[s]; i!=UINT32_MAX; i=t->link[i]){
             const mc_block_id *b=&t->ids[i];
             cache_fill_one(t->c,b->lod,b->bz,b->by,b->bx);
         }
-        atomic_fetch_add_explicit(&t->groups_done,1,memory_order_relaxed);
     }
+    atomic_fetch_add_explicit(&t->workers_done,1,memory_order_release);
     return NULL;
 }
 mc_cache_ticket *mc_cache_update_async(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads){
@@ -3249,24 +3310,28 @@ mc_cache_ticket *mc_cache_update_async(mc_cache *c, const mc_block_id *ids, size
     t->c=c;
     t->ids=malloc(n*sizeof *t->ids);
     memcpy(t->ids,ids,n*sizeof *t->ids);
-    qsort(t->ids,n,sizeof *t->ids,upd_cmp);
-    t->group_off=malloc((n+1)*sizeof *t->group_off);
-    uint32_t ng=0; t->group_off[0]=0;
-    for(size_t i=1;i<n;++i)
-        if((upd_sortkey(&t->ids[i])>>12)!=(upd_sortkey(&t->ids[i-1])>>12)) t->group_off[++ng]=(uint32_t)i;
-    t->group_off[++ng]=(uint32_t)n;
-    t->ngroups=ng;
-    atomic_store(&t->next,0); atomic_store(&t->groups_done,0); atomic_store(&t->cancel,0);
+    t->bucket=malloc(NSHARD*sizeof *t->bucket);
+    t->link=malloc(n*sizeof *t->link);
+    for(int s=0;s<NSHARD;++s) t->bucket[s]=UINT32_MAX;
+    for(size_t i=0;i<n;++i){
+        uint64_t key=bkey(t->ids[i].lod,t->ids[i].bz,t->ids[i].by,t->ids[i].bx);
+        int s=(int)((khash(key)>>56)&(NSHARD-1));
+        t->link[i]=t->bucket[s]; t->bucket[s]=(uint32_t)i;
+    }
+    atomic_store(&t->workers_done,0); atomic_store(&t->cancel,0);
     int nt=nthreads;
     if(nt<=0){ long nc=sysconf(_SC_NPROCESSORS_ONLN); nt=(int)(nc>0?nc:4); }
-    if(nt>16)nt=16; if((uint32_t)nt>ng)nt=(int)ng;
+    if(nt>16)nt=16; if(nt>NSHARD)nt=NSHARD; if(nt<1)nt=1;
     t->nth=nt;
-    for(int i=0;i<nt;++i) pthread_create(&t->th[i],NULL,aupd_worker,t);
+    for(int i=0;i<nt;++i){
+        void **arg=malloc(2*sizeof(void*)); arg[0]=t; arg[1]=(void*)(intptr_t)i;
+        pthread_create(&t->th[i],NULL,aupd_worker,arg);
+    }
     return t;
 }
 int mc_cache_ticket_done(mc_cache_ticket *t){
     if(!t) return 1;
-    return atomic_load_explicit(&t->groups_done,memory_order_acquire)>=t->ngroups;
+    return atomic_load_explicit(&t->workers_done,memory_order_acquire)>=(uint32_t)t->nth;
 }
 void mc_cache_ticket_cancel(mc_cache_ticket *t){
     if(t) atomic_store_explicit(&t->cancel,1,memory_order_release);
@@ -3280,12 +3345,12 @@ void mc_cache_ticket_wait(mc_cache_ticket *t){ if(t) ticket_join(t); }
 void mc_cache_ticket_free(mc_cache_ticket *t){
     if(!t) return;
     ticket_join(t);
-    free(t->ids); free(t->group_off); free(t);
+    free(t->ids); free(t->bucket); free(t->link); free(t);
 }
 
-// resolve: ensure resident (parallel via mc_cache_update), then fill the
-// pointer table under shard locks; cache_touch stamps the current epoch so
-// these slots are pinned against eviction until the next thaw().
+// resolve: ensure resident (parallel via mc_cache_update), then fill the pointer
+// table; cache_touch stamps the current epoch so these slots are pinned against
+// eviction until the next thaw(). Lock-free: single-owner (THAW / CLI) contract.
 size_t mc_cache_resolve(mc_cache *c, const mc_block_id *ids, size_t n,
                         const mc_u8 **ptrs, int nthreads){
     if(!c||!ids||!n||!ptrs||cache_frozen(c)) return 0;
@@ -3293,14 +3358,12 @@ size_t mc_cache_resolve(mc_cache *c, const mc_block_id *ids, size_t n,
     for(size_t i=0;i<n;++i){
         uint64_t key=bkey(ids[i].lod,ids[i].bz,ids[i].by,ids[i].bx);
         shard_t *sh=shard_of(c,key);
-        pthread_mutex_lock(&sh->mu);
         uint32_t mi=map_find(sh,key);
         if(mi!=UINT32_MAX){
             uint32_t slot=sh->map_slot[mi];
             cache_touch(c,sh,slot);
             ptrs[i]=sh->arena+(size_t)slot*BLK_BYTES;
         } else ptrs[i]=NULL;   // evicted by same-batch pressure (set > capacity)
-        pthread_mutex_unlock(&sh->mu);
     }
     return dec;
 }
@@ -3309,15 +3372,11 @@ void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         int gz=cz*16+bz, gy=cy*16+by, gx=cx*16+bx;
         uint64_t key=bkey(lod,gz,gy,gx);
-        shard_t *sh=shard_of(c,key);
-        pthread_mutex_lock(&sh->mu);
-        int have = map_find(sh,key)!=UINT32_MAX;
-        pthread_mutex_unlock(&sh->mu);
-        if(!have) (void)mc_cache_get(c,lod,gz,gy,gx);
+        if(map_find(shard_of(c,key),key)==UINT32_MAX) (void)mc_cache_get(c,lod,gz,gy,gx);
     }
 }
 
-// remove one key if present (shard lock held by caller paths below)
+// remove one key if present. Single-owner (UNFROZEN/THAW) — no lock.
 static void shard_remove_key(shard_t *sh, uint64_t key){
     uint32_t mi=map_find(sh,key);
     if(mi==UINT32_MAX) return;
@@ -3331,17 +3390,13 @@ void mc_cache_invalidate_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
     if(cache_frozen(c)) return;
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         uint64_t key=bkey(lod,cz*16+bz,cy*16+by,cx*16+bx);
-        shard_t *sh=shard_of(c,key);
-        pthread_mutex_lock(&sh->mu);
-        shard_remove_key(sh,key);
-        pthread_mutex_unlock(&sh->mu);
+        shard_remove_key(shard_of(c,key),key);
     }
 }
 
 void mc_cache_clear(mc_cache *c){
-    for(int s=0;s<NSHARD;++s){
+    for(int s=0;s<NSHARD;++s){            // single-owner: call only while no fill runs
         shard_t *sh=&c->sh[s];
-        pthread_mutex_lock(&sh->mu);
         memset(sh->map_key,0,(size_t)sh->map_cap*8);
         memset(sh->slot_key,0,(size_t)sh->nslot*8);
         memset(sh->slot_ref,0,sh->nslot);
@@ -3350,7 +3405,6 @@ void mc_cache_clear(mc_cache *c){
         sh->g_head=0; memset(sh->gfp,0,4u*sh->g_cap);
         memset(sh->gset,0xFF,4u*sh->gset_cap);
         memset(sh->slot_inmain,0,sh->nslot);
-        pthread_mutex_unlock(&sh->mu);
     }
 }
 
@@ -3366,7 +3420,17 @@ void mc_cache_get_stats(mc_cache *c, mc_cache_stats *out){
 // ---- bindings ----
 static void src_archive(void *ud, int lod, int bz,int by,int bx, mc_u8 *dst){
     struct mc_archive *a=ud;
-    uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
+    // The tree walk (mc_resolve_chunk) is identical for all 4096 blocks of a chunk;
+    // memoize the last (lod,cz,cy,cx)->chunk_off thread-locally. Render samples are
+    // chunk-coherent so this collapses the per-block walk to one walk per chunk.
+    int cz=bz>>4, cy=by>>4, cx=bx>>4;
+    static _Thread_local const struct mc_archive *la=NULL;
+    static _Thread_local int llod=-1,lcz=-1,lcy=-1,lcx=-1; static _Thread_local uint64_t lco=0,lgen=0;
+    uint64_t gen=atomic_load_explicit(&a->gen,memory_order_acquire);
+    uint64_t co;
+    if(la==a && lgen==gen && llod==lod && lcz==cz && lcy==cy && lcx==cx) co=lco;
+    else { co=mc_archive_chunk_offset(a,lod,cz,cy,cx);   // re-resolve if archive grew
+           la=a; lgen=gen; llod=lod; lcz=cz; lcy=cy; lcx=cx; lco=co; }
     mc_archive_decode_block(a,co,bz&15,by&15,bx&15,dst);
 }
 mc_cache *mc_cache_new_archive(size_t bytes, struct mc_archive *a){
@@ -3376,11 +3440,9 @@ mc_cache *mc_cache_new_archive(size_t bytes, struct mc_archive *a){
 }
 typedef struct { mc_cache *c; } rdwrap_t;
 static void src_reader(void *ud, int lod, int bz,int by,int bx, mc_u8 *dst){
-    mc_cache *c=ud;
-    pthread_mutex_lock(&c->rd_mu);
+    mc_cache *c=ud;                                 // single-owner (THAW/CLI): no lock
     uint64_t co=mc_chunk_offset(c->rd,lod,bz>>4,by>>4,bx>>4);
     mc_decode_block(c->rd,co,bz&15,by&15,bx&15,dst);
-    pthread_mutex_unlock(&c->rd_mu);
 }
 mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r){
     mc_cache *c=mc_cache_new(bytes,NULL,NULL);
@@ -3904,6 +3966,73 @@ float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f) {
     return mc_s_sample(s, z, y, x, f);
 }
 
+// Is the block covering voxel (z,y,x) resident at this sampler's level?
+// Mirrors mc_s_trilinear's block lookup; NULL = absent (frozen miss / air).
+static inline int mc_s_block_resident(mc_sampler *s, float z, float y, float x) {
+    int z0 = (int)floorf(z), y0 = (int)floorf(y), x0 = (int)floorf(x);
+    if (z0 < 0 || y0 < 0 || x0 < 0 ||
+        z0 >= s->src.nz || y0 >= s->src.ny || x0 >= s->src.nx) return 0;
+    return mc_s_block(s, z0 >> 4, y0 >> 4, x0 >> 4) != NULL;
+}
+
+// ---------------------------------------------------------------------------
+// LOD sampler: one sub-sampler per pyramid level + coarser-LOD fallback.
+// ---------------------------------------------------------------------------
+struct mc_lod_sampler {
+    int nlods;
+    mc_sampler *lv[8];          // lv[i] = sampler for level i (NULL if empty)
+};
+
+mc_lod_sampler *mc_lod_sampler_new(const mc_sample_lods *ls) {
+    if (!ls || ls->nlods <= 0) return NULL;
+    mc_lod_sampler *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->nlods = ls->nlods < 8 ? ls->nlods : 8;
+    for (int i = 0; i < s->nlods; i++)
+        if (ls->lods[i].block && ls->lods[i].nz > 0)
+            s->lv[i] = mc_sampler_new(&ls->lods[i]);   // NULL ok: treated as empty
+    return s;
+}
+
+void mc_lod_sampler_free(mc_lod_sampler *s) {
+    if (!s) return;
+    for (int i = 0; i < s->nlods; i++) mc_sampler_free(s->lv[i]);
+    free(s);
+}
+
+void mc_lod_sampler_reset(mc_lod_sampler *s) {
+    if (!s) return;
+    for (int i = 0; i < s->nlods; i++) mc_sampler_reset(s->lv[i]);
+}
+
+float mc_lod_sample(mc_lod_sampler *s, int lod, int lod_fallback,
+                    float z, float y, float x, mc_filter f) {
+    if (!s) return 0.0f;
+    if (!(z == z) || !(y == y) || !(x == x)) return 0.0f;   // NaN
+    if (lod < 0) lod = 0;
+    // L0 -> requested level: c_L = (c_0 + 0.5) * 2^-lod - 0.5
+    if (lod > 0) {
+        const float inv = 1.0f / (float)(1 << lod);
+        z = (z + 0.5f) * inv - 0.5f;
+        y = (y + 0.5f) * inv - 0.5f;
+        x = (x + 0.5f) * inv - 0.5f;
+    }
+    for (int L = lod; L < s->nlods; L++) {
+        mc_sampler *sub = s->lv[L];
+        // Sample this level only if its block for the point is resident. (At the
+        // requested level a resident block samples full quality; an absent one
+        // either falls through to coarser or, without fallback, returns 0.)
+        if (sub && mc_s_block_resident(sub, z, y, x))
+            return mc_s_sample(sub, z, y, x, f);
+        if (!lod_fallback) break;          // no walk: requested level only
+        // descend to next coarser level: c' = (c + 0.5)*0.5 - 0.5
+        z = (z + 0.5f) * 0.5f - 0.5f;
+        y = (y + 0.5f) * 0.5f - 0.5f;
+        x = (x + 0.5f) * 0.5f - 0.5f;
+    }
+    return 0.0f;   // nothing resident along the chain
+}
+
 static inline int pt_valid(const float *p) {
     if (p[0] != p[0] || p[1] != p[1] || p[2] != p[2]) return 0;   // NaN
     return p[0] >= 0.0f && p[1] >= 0.0f && p[2] >= 0.0f;
@@ -4355,10 +4484,85 @@ typedef struct {
     const mc_render_params *p;
     uint8_t *out;
     int row0, row1;
+    // LOD-fallback mode: when ls != NULL, sample via a per-band mc_lod_sampler
+    // at level `lod` with coarser-LOD fallback instead of the single `src`.
+    const mc_sample_lods *ls;
+    int lod;
 } band_t;
+
+// LOD-fallback point render: coords are native level-0 voxel space; each pixel
+// samples the requested level (`lod`) with coarser-LOD fallback. Slice path
+// (comp==NONE) only — the interactive nav case; composites stay single-level.
+//
+// Fast path: the common case is "all blocks resident at `lod`" (steady state and
+// air, since air decodes to a resident zero block). For a group of 8 points whose
+// level-`lod` blocks are ALL resident, sample with the 8-wide SIMD kernel on the
+// level-`lod` sampler — same speed as the non-fallback render. Only groups that
+// touch an ABSENT block fall to the per-lane coarse-LOD walk (transient, while a
+// freshly-entered level streams in).
+static void render_points_lod(mc_lod_sampler *ls, int lod,
+                              const float *pts, int w, int h,
+                              const mc_render_params *p, uint8_t *out) {
+    const mc_filter f = (mc_filter)p->filter;
+    const size_t n = (size_t)w * h;
+    mc_sampler *L = (lod >= 0 && lod < ls->nlods) ? ls->lv[lod] : NULL;
+    const float inv = lod > 0 ? 1.0f / (float)(1 << lod) : 1.0f;
+    // L0 -> level-`lod` voxel coord (half-voxel-center correct).
+    #define MC_L0_TO_L(c) ((c + 0.5f) * inv - 0.5f)
+
+    size_t k = 0;
+#ifdef MC_S_HAVE_TRI8
+    if (L && f == MC_FILTER_TRILINEAR) {
+        float pz[8], py[8], px[8], v8[8];
+        for (; k + 8 <= n; k += 8) {
+            int allv = 1, allres = 1;
+            for (int q = 0; q < 8; q++) {
+                const float *P = pts + (k + q) * 3;
+                if (!pt_valid(P)) { allv = 0; break; }
+                float z = MC_L0_TO_L(P[0]), y = MC_L0_TO_L(P[1]), x = MC_L0_TO_L(P[2]);
+                pz[q] = z; py[q] = y; px[q] = x;
+                // resident block at L? (covers air: air is a resident zero block)
+                if (!mc_s_block_resident(L, z, y, x)) { allres = 0; }
+            }
+            if (allv && allres) {
+                mc_s_tri8(L, pz, py, px, v8);
+                for (int q = 0; q < 8; q++) out[k + q] = to_u8(v8[q]);
+            } else {
+                for (int q = 0; q < 8; q++) {
+                    const float *P = pts + (k + q) * 3;
+                    out[k + q] = pt_valid(P)
+                        ? to_u8(mc_lod_sample(ls, lod, 1, P[0], P[1], P[2], f)) : 0;
+                }
+            }
+        }
+    }
+#endif
+    for (; k < n; k++) {
+        const float *P = pts + k * 3;
+        out[k] = pt_valid(P)
+            ? to_u8(mc_lod_sample(ls, lod, 1, P[0], P[1], P[2], f)) : 0;
+    }
+    #undef MC_L0_TO_L
+}
 
 static void *band_main(void *ud) {
     band_t *b = ud;
+    if (b->ls) {
+        mc_lod_sampler *ls = mc_lod_sampler_new(b->ls);
+        if (!ls) return NULL;
+        float *row = malloc((size_t)b->w * 3 * sizeof(float));
+        if (row) {
+            for (int i = b->row0; i < b->row1; i++) {
+                b->rowgen(b->rg_ud, i, b->w, row, NULL);   // L0 coords, no normals
+                render_points_lod(ls, b->lod, row, b->w, 1, b->p,
+                                  b->out + (size_t)i * b->w);
+            }
+            free(row);
+        } else memset(b->out + (size_t)b->row0 * b->w, 0,
+                      (size_t)(b->row1 - b->row0) * b->w);
+        mc_lod_sampler_free(ls);
+        return NULL;
+    }
     mc_sampler *s = mc_sampler_new(b->src);
     if (!s) return NULL;
     if (!b->rowgen) {
@@ -4385,11 +4589,14 @@ static void *band_main(void *ud) {
     return NULL;
 }
 
-static void render_bands(const mc_sample_src *src,
-                         const float *pts, const float *normals,
-                         rowgen_fn rowgen, const void *rg_ud,
-                         int w, int h, const mc_render_params *p,
-                         uint8_t *out, int nthreads) {
+// ls != NULL selects LOD-fallback mode (rowgen produces level-0 coords, each
+// band builds an mc_lod_sampler at `lod`). Otherwise single-source mode.
+static void render_bands_ex(const mc_sample_src *src,
+                            const float *pts, const float *normals,
+                            rowgen_fn rowgen, const void *rg_ud,
+                            const mc_sample_lods *ls, int lod,
+                            int w, int h, const mc_render_params *p,
+                            uint8_t *out, int nthreads) {
     if (w <= 0 || h <= 0) return;
     if (nthreads <= 0) {
         long nc = sysconf(_SC_NPROCESSORS_ONLN);
@@ -4405,7 +4612,7 @@ static void render_bands(const mc_sample_src *src,
         int r0 = t * per, r1 = r0 + per > h ? h : r0 + per;
         if (r0 >= r1) break;
         bands[nb] = (band_t){ src, pts, normals, rowgen, rg_ud,
-                              w, h, p, out, r0, r1 };
+                              w, h, p, out, r0, r1, ls, lod };
         if (nthreads == 1) { band_main(&bands[nb]); continue; }
         if (pthread_create(&th[nb], NULL, band_main, &bands[nb]) != 0) {
             band_main(&bands[nb]);          // degrade to inline
@@ -4416,11 +4623,40 @@ static void render_bands(const mc_sample_src *src,
     for (int t = 0; t < nb; t++) pthread_join(th[t], NULL);
 }
 
+static void render_bands(const mc_sample_src *src,
+                         const float *pts, const float *normals,
+                         rowgen_fn rowgen, const void *rg_ud,
+                         int w, int h, const mc_render_params *p,
+                         uint8_t *out, int nthreads) {
+    render_bands_ex(src, pts, normals, rowgen, rg_ud, NULL, 0,
+                    w, h, p, out, nthreads);
+}
+
 void mc_render_points_par(const mc_sample_src *src,
                           const float *pts, const float *normals,
                           int w, int h, const mc_render_params *p,
                           uint8_t *out, int nthreads) {
     render_bands(src, pts, normals, NULL, NULL, w, h, p, out, nthreads);
+}
+
+// dense-points renderer (one band-local row scratch fed from the caller's
+// level-0 point grid) with LOD-fallback sampling at `lod`.
+static void densepts_rowgen(const void *ud, int row, int w,
+                            float *pts, float *normals) {
+    (void)normals;
+    const float *base = (const float *)ud;
+    memcpy(pts, base + (size_t)row * w * 3, (size_t)w * 3 * sizeof(float));
+}
+
+void mc_render_points_par_lod(const mc_sample_lods *ls, int lod,
+                              const float *ptsL0, int w, int h,
+                              const mc_render_params *p,
+                              uint8_t *out, int nthreads) {
+    if (!ls || !ptsL0 || !out || w <= 0 || h <= 0) return;
+    if (lod < 0) lod = 0;
+    if (lod >= ls->nlods) lod = ls->nlods - 1;
+    render_bands_ex(NULL, NULL, NULL, densepts_rowgen, ptsL0, ls, lod,
+                    w, h, p, out, nthreads);
 }
 
 // ---------------------------------------------------------------------------
@@ -5538,6 +5774,13 @@ struct mc_volume {
 
     mc_volume_ready_fn ready_cb;   // fired when a region becomes serveable
     void *ready_ud;
+
+    // Frozen snapshot of remaining pipeline work, collated once per THAW and read
+    // during the frozen render (the streaming gate). Written and read by the SAME
+    // tick thread -- plain field, no atomic, no lock. = queued downloads +
+    // downloading + decode-queue depth + undrained misses, i.e. "is data still
+    // moving toward the cache." Stays >0 until the pipeline drains.
+    uint64_t inflight_snapshot;
 };
 
 // One unit of decode work: the sub^3 cube of source chunks covering one 256^3
@@ -6103,7 +6346,12 @@ int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
     int cz = bz / PER, cy = by / PER, cx = bx / PER;
     mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
     if (cov == MC_ABSENT) {
-        req_push(v, lod, cz, cy, cx);   // LIFO download request; render falls to coarser LOD
+        // Record the absent BLOCK miss (cheap, lock-free, deduped) instead of
+        // calling req_push here: req_push locks the global mutex + scans the
+        // request stack per block (4096x/region, O(N^2) on the render worker).
+        // mc_volume_thaw drains these and issues one download request per absent
+        // region, off the render path. Render falls to coarser LOD meanwhile.
+        mc_cache_miss_mark(v->cache, lod, bz, by, bx);
         memset(dst, 0, BLK * BLK * BLK);
         return 0;
     }
@@ -6351,6 +6599,85 @@ size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes) {
     return (v && v->cache) ? mc_cache_resize(v->cache, bytes) : 0;
 }
 
+// Tick-phase bracket for the render game-loop (see mc_cache_freeze/thaw). The
+// volume owns the resident mc_cache; expose its two-phase clock so a client
+// (volume-cartographer's global render tick) can freeze the cache for the
+// duration of a frame's lock-free reads, then thaw between frames to let newly
+// transcoded regions land and to bump the pin epoch.
+void mc_volume_freeze(mc_volume *v) { if (v && v->cache) mc_cache_freeze(v->cache); }
+
+// Thaw = the single batch-apply step of the render game loop. Between a frame's
+// freeze and the next, the lock-free frozen reads recorded their misses (blocks
+// the render wanted but weren't resident). Here, while UNFROZEN, we:
+//   1. thaw the cache (clears frozen, epoch++) so the fill is permitted,
+//   2. drain the recorded miss set,
+//   3. keep only blocks whose 256^3 source region is MC_PRESENT in the archive
+//      (ABSENT = still downloading -> skip; ZERO = air -> already served),
+//   4. fill those from the archive (decode from disk), TIME-BOUNDED so a big
+//      miss set (a zoom across a LOD that misses the whole viewport) can't stall
+//      the render tick more than ~MC_THAW_BUDGET_MS. Leftover blocks re-record
+//      next frame and fill progressively; meanwhile the render shows coarser
+//      resident LODs (mc_lod_sample fallback).
+// INTERMEDIATE: the fill is synchronous on the caller's thread, but bounded.
+// The end-goal game loop runs this fill async on workers (lock-safe vs frozen
+// reads, deferred eviction); that lands incrementally. This stays race-free
+// because mutation happens only here, while unfrozen, before freeze()+render.
+// No network IO happens here; the decode workers staged the bytes to the archive.
+#define MC_THAW_BUDGET_MS 5.0
+#define MC_THAW_CHUNK 256          // blocks per mc_cache_update slice (time-checked)
+void mc_volume_thaw(mc_volume *v) {
+    if (!v || !v->cache) return;
+    mc_cache_thaw(v->cache);                                  // clears frozen, epoch++
+
+    static _Thread_local mc_block_id *miss = NULL;
+    static _Thread_local size_t miss_cap = 0;
+    if (!miss) { miss_cap = MISSQ_CAP; miss = malloc(miss_cap * sizeof *miss); }
+    if (!miss) return;
+
+    size_t n = mc_cache_misses_drain(v->cache, miss, miss_cap);
+
+    // Collate the whole pipeline's remaining work into the frozen snapshot the
+    // render reads. Done here (thaw = the collator) BEFORE any early-out, and
+    // includes this frame's undrained misses (n): blocks still wanting fill keep
+    // the stream "live" so the tick keeps re-rendering until everything's resident.
+    int dqn = (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap;
+    v->inflight_snapshot = (uint64_t)(v->rs_n + v->inflight_n + dqn) + (uint64_t)n;
+
+    if (!n) return;
+
+    // Split the drained misses by archive coverage:
+    //  PRESENT -> keep for the cache fill below.
+    //  ABSENT  -> issue ONE download request per region (deduped via last_rq),
+    //             off the render worker (try_block no longer calls req_push).
+    // The miss set is per-block; many blocks map to one 256^3 region, so collapse
+    // consecutive same-region absent blocks (misses drain roughly in scan order).
+    size_t keep = 0;
+    uint64_t last_rq = ~0ull;
+    for (size_t i = 0; i < n; ++i) {
+        const mc_block_id *b = &miss[i];
+        int cz = b->bz / PER, cy = b->by / PER, cx = b->bx / PER;
+        mc_cover cov = mc_archive_chunk_coverage(v->arc, b->lod, cz, cy, cx);
+        if (cov == MC_PRESENT) { miss[keep++] = *b; }
+        else if (cov == MC_ABSENT) {
+            uint64_t rq = rkey(b->lod, cz, cy, cx);
+            if (rq != last_rq) { req_push(v, b->lod, cz, cy, cx); last_rq = rq; }
+        }
+    }
+    // Fill in time-bounded slices; stop once the budget is spent (the rest
+    // re-records next frame). Slices stay coherent because the miss list is in
+    // scan order and mc_cache_update sorts chunk-major internally.
+    double t0 = mcv_now();
+    size_t filled = 0;
+    for (size_t off = 0; off < keep; off += MC_THAW_CHUNK) {
+        size_t cnt = keep - off < MC_THAW_CHUNK ? keep - off : MC_THAW_CHUNK;
+        filled += mc_cache_update(v->cache, miss + off, cnt, 0 /*nthreads=auto*/);
+        if (mcv_now() - t0 >= MC_THAW_BUDGET_MS) break;
+    }
+    double el = mcv_now() - t0;
+    if (el > 2.0) MCVLOG("thaw fill  drained=%zu present=%zu decoded=%zu in %.1fms (%.3fms/blk)",
+                         n, keep, filled, el, filled ? el/filled : 0.0);
+}
+
 size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes) {
     if (!v) return 0;
     if (bytes < (64ull << 20)) bytes = 64ull << 20;    // floor 64MB
@@ -6376,5 +6703,7 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     out->cache_cap_blocks = cs.slots;
     out->disk_bytes = v->arc ? mc_archive_data_len(v->arc) : 0;
     out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed);
-    out->regions_inflight = (uint64_t)v->rs_n;
+    // Frozen snapshot collated at the last thaw (whole-pipeline depth + undrained
+    // misses). The render's streaming gate reads this, never the live IO counters.
+    out->regions_inflight = v->inflight_snapshot;
 }
