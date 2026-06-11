@@ -57,6 +57,11 @@ idea that was implemented and rejected: `bench/RESULTS.md`.
 - **quality q** — the quant step dial (see table above).
 - **max-error bound** — `mc_set_max_error(tau)`: sparse corrections
   guarantee |error| ≤ τ on every material voxel (τ≈3–4×q costs <1 % ratio).
+- **archival preset** — q 0.5 + τ 1: every material voxel within ±1
+  greylevel (below scanner noise), air bit-exact, **2.9×** on real 2.4 µm
+  scroll data (51.9 dB, SSIM 0.9996, p99 = max = 1) vs 1.96× for true
+  lossless zstd-19 — which is why there is no lossless mode. τ 2 → 4.0×,
+  τ 3 (q 1) → 5.3×.
 - **rate targeting** — `mc_archive_append_chunk_target(.., target_ratio,..)`
   picks q per chunk from a 1/16-block sample (+~6 % encode time; lands
   within ~5 % of target on real data).

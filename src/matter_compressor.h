@@ -40,6 +40,13 @@ float mc_get_quality(void);
 // exceeds tau, so |orig - decoded| <= tau for all material voxels. 0 = off
 // (default). Corrections are self-contained in the block payload (the decoder
 // does not need to know tau). Encode-side cost: one extra inverse DCT per block.
+//
+// ARCHIVAL PRESET: quality 0.5 + tau 1 — every material voxel within +/-1
+// greylevel (below micro-CT reconstruction noise), air bit-exact. Measured on
+// real 2.4um scroll data: 2.9x ratio / 51.9 dB / SSIM 0.9996, vs 1.96x for
+// true lossless (zstd-19) — there is deliberately no lossless mode; the DCT
+// path is not bit-reversible and the entropy ceiling makes one pointless.
+// tau 2 -> 4.0x, tau 3 (q 1) -> 5.3x, all with p99 == max == tau.
 void  mc_set_max_error(int tau);
 int   mc_get_max_error(void);
 void  mc_codec_init(void);             // one-time: build the DCT tables
