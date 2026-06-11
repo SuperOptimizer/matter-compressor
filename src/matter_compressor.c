@@ -4671,11 +4671,17 @@ struct mc_zarr {
 };
 
 // fetch a whole object by key; returns malloc'd buf or NULL (sets *len).
-static uint8_t *fetch_all(mc_zarr *z, const char *key, size_t *len) {
+// `err` (optional): *err=1 if the read FAILED (transient — retry, do NOT treat
+// as air); *err=0 if the object is genuinely absent (clean 404 -> confirmed
+// air) or present. Distinguishes z->read's -1 (error) from 0+NULL (404).
+static uint8_t *fetch_all(mc_zarr *z, const char *key, size_t *len, int *err) {
+    if (err) *err = 0;
     uint8_t *buf = NULL;
     size_t n = 0;
-    if (z->read(z->ud, key, 0, 0, &buf, &n) < 0) { *len = 0; return NULL; }
-    *len = n;
+    if (z->read(z->ud, key, 0, 0, &buf, &n) < 0) {   // transient error
+        free(buf); *len = 0; if (err) *err = 1; return NULL;
+    }
+    *len = n;                                         // 0 + NULL == clean 404 (air)
     return buf;
 }
 
@@ -4814,7 +4820,11 @@ static size_t inner_linear(const mc_zarr *z, int cz, int cy, int cx) {
 // Returns a borrowed pointer valid until the entry is evicted; copy out the
 // (off,len) you need while you still need them (callers do this immediately).
 // NULL if the shard is absent (all air) or on error.
-static const uint8_t *footer_get(mc_zarr *z, int cz, int cy, int cx) {
+// `err` (optional) distinguishes the two NULL returns: *err=1 means the footer
+// READ FAILED (transient — caller must retry, NOT treat as air); *err=0 means
+// the shard is genuinely absent (a clean 404 — confirmed air).
+static const uint8_t *footer_get_ex(mc_zarr *z, int cz, int cy, int cx, int *err) {
+    if (err) *err = 0;
     if (z->version != ZV3) return NULL;
     uint64_t sid = ((uint64_t)(cz / z->per) << 40) |
                    ((uint64_t)(cy / z->per) << 20) | (uint64_t)(cx / z->per);
@@ -4835,9 +4845,15 @@ static const uint8_t *footer_get(mc_zarr *z, int cz, int cy, int cx) {
     size_t idx_bytes = n_inner * 16;
     uint8_t *idx = NULL;
     size_t got = 0;
-    if (z->read(z->ud, key, 0, idx_bytes, &idx, &got) < 0 || !idx || got < idx_bytes) {
+    int rc = z->read(z->ud, key, 0, idx_bytes, &idx, &got);
+    if (rc < 0) {                       // transient read error -> retry, NOT air
         free(idx);
+        if (err) *err = 1;
         return NULL;
+    }
+    if (!idx || got < idx_bytes) {      // clean 404 / short -> genuinely absent shard
+        free(idx);
+        return NULL;                    // *err stays 0
     }
 
     pthread_mutex_lock(&z->fmu);
@@ -4861,6 +4877,9 @@ static const uint8_t *footer_get(mc_zarr *z, int cz, int cy, int cx) {
     z->fcache[victim].lru = ++z->ftick;
     pthread_mutex_unlock(&z->fmu);
     return idx;
+}
+static const uint8_t *footer_get(mc_zarr *z, int cz, int cy, int cx) {
+    return footer_get_ex(z, cz, cy, cx, NULL);
 }
 
 int mc_zarr_shard_all_air(mc_zarr *z, int cz, int cy, int cx) {
@@ -4899,16 +4918,19 @@ static uint8_t *v2_decode(const mc_zarr *z, uint8_t *blob, size_t blen, size_t *
 // the cached shard footer. Returns 0 (found: *off/*nb set, c3d raw range), 1
 // (absent/air), <0 (error). v2 chunks are whole objects -> off=0,nb=0 (full GET).
 // Lets a caller batch many chunks' ranged GETs into one s3_get_batch.
+// 0 found (off/nb set), 1 confirmed air (clean 404 / missing index entry),
+// <0 transient READ ERROR (caller must retry, NOT mark the region air).
 int mc_zarr_chunk_locate(mc_zarr *z, int cz, int cy, int cx,
                          char key_out[64], uint64_t *off, uint64_t *nb) {
     chunk_key(z, cz, cy, cx, key_out);
     if (z->version == ZV2) { *off = 0; *nb = 0; return 0; }
     size_t n_inner = (size_t)z->per * z->per * z->per;
-    const uint8_t *idx = footer_get(z, cz, cy, cx);
-    if (!idx) return 1;                                      // absent shard = air
+    int err = 0;
+    const uint8_t *idx = footer_get_ex(z, cz, cy, cx, &err);
+    if (!idx) return err ? -1 : 1;                          // read error -> retry; else air
     size_t lin = inner_linear(z, cz, cy, cx);
     int st = index_entry(idx, n_inner, lin, off, nb);
-    if (st != 0) return st < 0 ? -1 : 1;                     // missing/oob -> air
+    if (st != 0) return 1;                                   // missing entry -> confirmed air
     return 0;
 }
 
@@ -4919,9 +4941,12 @@ int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx, uint8_t **raw, size_t
     chunk_key(z, cz, cy, cx, key);
 
     if (z->version == ZV2) {
-        size_t blen = 0;
-        uint8_t *blob = fetch_all(z, key, &blen);
-        if (!blob || !blen) { free(blob); return 1; }     // absent = air
+        // v2: a 404 (chunk object doesn't exist on S3) == confirmed air. A read
+        // error must retry, not be recorded as air.
+        size_t blen = 0; int err = 0;
+        uint8_t *blob = fetch_all(z, key, &blen, &err);
+        if (err) { free(blob); return -1; }               // transient -> retry
+        if (!blob || !blen) { free(blob); return 1; }     // clean 404 -> confirmed air
         size_t dl = 0;
         uint8_t *dense = v2_decode(z, blob, blen, &dl);
         if (!dense) return -1;
@@ -4932,16 +4957,17 @@ int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx, uint8_t **raw, size_t
 
     // v3: get the (cached) index footer, then the one inner chunk's payload range.
     size_t n_inner = (size_t)z->per * z->per * z->per;
-    const uint8_t *idx = footer_get(z, cz, cy, cx);
-    if (!idx) return 1;                                      // absent shard = air
+    int ferr = 0;
+    const uint8_t *idx = footer_get_ex(z, cz, cy, cx, &ferr);
+    if (!idx) return ferr ? -1 : 1;                         // read error -> retry; else air
     size_t lin = inner_linear(z, cz, cy, cx);
     uint64_t off, nb;
     int st = index_entry(idx, n_inner, lin, &off, &nb);
-    if (st != 0) return st < 0 ? -1 : 1;                     // missing or oob -> air
+    if (st != 0) return 1;                                   // index air marker -> confirmed air
     uint8_t *payload = NULL;
     size_t plen = 0;
-    if (z->read(z->ud, key, off, nb, &payload, &plen) < 0) { return -1; }
-    if (!payload || plen < nb) { free(payload); return -1; }
+    if (z->read(z->ud, key, off, nb, &payload, &plen) < 0) { return -1; }  // transient
+    if (!payload || plen < nb) { free(payload); return -1; }               // short -> retry
     *raw = payload;
     *len = nb;
     return 0;   // c3d raw bytes — caller decodes.
@@ -5427,7 +5453,9 @@ static void *dl_main(void *ud) {
                 continue;                               // already resident
             char key[64]; uint64_t off, nb;
             int st = mc_zarr_chunk_locate(z, rz[i], ry[i], rx[i], key, &off, &nb);
-            if (st != 0) {                              // air/missing -> ZERO region
+            if (st < 0)                                 // transient read error: leave ABSENT
+                continue;                               // (retry on next miss), do NOT mark air
+            if (st > 0) {                               // CONFIRMED air (footer ok + air marker)
                 decode_item air = {lods[i], rz[i], ry[i], rx[i], 1, 0, {0},{0},{0}, {0},{0}};
                 decode_push(v, &air);
                 continue;
@@ -5732,7 +5760,8 @@ static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int
     if (sub == 1) {                                    // c3d / v2-256: one chunk == region
         uint8_t *raw = NULL; size_t rlen = 0;
         int st = mc_zarr_read_inner(z, cz, cy, cx, &raw, &rlen);
-        if (st != 0 || !raw || !rlen) {                // absent / air / error -> ZERO region
+        if (st < 0) { free(raw); return; }             // transient error -> leave ABSENT, retry
+        if (st > 0 || !raw || !rlen) {                 // CONFIRMED air -> ZERO region
             free(raw);
             decode_item air = {lod, rz, ry, rx, 1, 0, {0},{0},{0}, {0},{0}};
             decode_push(v, &air);
@@ -5745,22 +5774,28 @@ static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int
         return;
     }
 
-    // v2 sub^3 cube: fetch each present source chunk of the region's cube.
+    // v2 sub^3 cube: fetch each present source chunk of the region's cube. A
+    // transient read error on ANY sub-chunk aborts the whole region (leave it
+    // ABSENT to retry) rather than recording a partial/air result.
     int sz0 = rz * sub, sy0 = ry * sub, sx0 = rx * sub;
     decode_item it = {lod, rz, ry, rx, sub, 0, {0},{0},{0}, {0},{0}};
     for (int dz = 0; dz < sub; ++dz)
     for (int dy = 0; dy < sub; ++dy)
     for (int dx = 0; dx < sub; ++dx) {
         uint8_t *raw = NULL; size_t rlen = 0;
-        if (mc_zarr_read_inner(z, sz0 + dz, sy0 + dy, sx0 + dx, &raw, &rlen) != 0 || !raw || !rlen) {
-            free(raw); continue;                       // missing sub-chunk = air there
+        int st = mc_zarr_read_inner(z, sz0 + dz, sy0 + dy, sx0 + dx, &raw, &rlen);
+        if (st < 0) {                                  // transient -> abort, retry region
+            for (int k = 0; k < it.nsub; ++k) free(it.raw[k]);
+            free(raw);
+            return;
         }
+        if (st > 0 || !raw || !rlen) { free(raw); continue; }   // this sub-chunk confirmed air
         atomic_fetch_add_explicit(&v->net_bytes, rlen, memory_order_relaxed);
         int k = it.nsub++;
         it.raw[k] = raw; it.rlen[k] = rlen;
         it.oz[k] = dz * edge; it.oy[k] = dy * edge; it.ox[k] = dx * edge;
     }
-    decode_push(v, &it);                               // nsub may be 0 -> ZERO region
+    decode_push(v, &it);                               // nsub==0 -> all sub-chunks air -> ZERO
 }
 
 // Download a shard's present chunks (one parallel s3_get_batch) and PUSH each
