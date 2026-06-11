@@ -5511,6 +5511,16 @@ void mc_volume_block_grid(const mc_volume *v, int lod, int *nz, int *ny, int *nx
     if (ny) *ny = (sy + BLK - 1) / BLK;
     if (nx) *nx = (sx + BLK - 1) / BLK;
 }
+int mc_volume_get_level_meta(const mc_volume *v, int lod, mc_volume_level_meta *out) {
+    if (!v || !out || lod < 0 || lod >= v->nlods) return -1;
+    const mc_zarr *z = v->lv[lod].z;
+    mc_zarr_shape(z, &out->shape[0], &out->shape[1], &out->shape[2]);
+    out->inner_edge = mc_zarr_inner_edge(z);
+    out->shard_edge = mc_zarr_shard_edge(z);
+    const char *c = mc_zarr_inner_codec(z);
+    snprintf(out->codec, sizeof out->codec, "%s", c ? c : "");
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // block serving

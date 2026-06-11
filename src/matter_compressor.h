@@ -766,6 +766,19 @@ void mc_volume_shape(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
 // block (16^3) grid extent of a level.
 void mc_volume_block_grid(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
 
+// Per-level source metadata for a client that wants to describe the volume
+// without re-reading the zarr (shape in voxels z,y,x; inner_edge = the source
+// inner-chunk edge / render chunk size, e.g. 256 for c3d; shard_edge = the
+// storage chunk edge, e.g. 4096). dtype is always u8 and fill is 0 on the .mca
+// path. Returns 0 on success, <0 if lod is out of range.
+typedef struct {
+    int shape[3];        // voxels (z,y,x)
+    int inner_edge;      // source inner-chunk edge (render chunk), e.g. 256
+    int shard_edge;      // storage chunk edge, e.g. 4096
+    char codec[16];      // "c3d" | "blosc" | "raw"
+} mc_volume_level_meta;
+int mc_volume_get_level_meta(const mc_volume *v, int lod, mc_volume_level_meta *out);
+
 // Serve one 16^3 block (block coords) of `lod` into `dst` (4096 bytes).
 //   present -> decode from mc_cache (sync), return 1.
 //   absent  -> kick one deduped background region transcode, zero `dst`,
