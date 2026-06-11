@@ -649,6 +649,16 @@ void mc_render_points_par(const mc_sample_src *src,
                           int w, int h, const mc_render_params *p,
                           uint8_t *out, int nthreads);
 
+// ---------------------------------------------------------------------------
+// colormap: map mc_render's u8 output -> ARGB32 for display. Every colormap is a
+// baked static [256][3] grayscale->RGB table. ids: ""/"gray"=0, viridis, magma,
+// fire, red, green, blue, cyan, magenta.
+// ---------------------------------------------------------------------------
+int  mc_colormap_id(const char *name);                  // name -> id (0 = gray)
+void mc_colormap_lut(uint32_t lut[256], float win_low, float win_high, int cmap_id);
+void mc_colormap_apply(const uint8_t *vals, int w, int h, const uint32_t lut[256],
+                       uint32_t *out, int out_stride);   // out_stride in pixels
+
 // (mc_render_points_par_lod — LOD-fallback variant — declared after
 // mc_sample_lods is defined, below.)
 
