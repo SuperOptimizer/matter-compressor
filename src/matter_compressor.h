@@ -531,6 +531,11 @@ struct mc_sample_src {
     // thread (the whole point of the fallback). NULL -> resident defaults to
     // block()!=NULL (which may decode). 1 = resident, 0 = not.
     int (*resident)(const mc_sample_src *src, int bz, int by, int bx);
+    // 1 = block() returns a STABLE pointer the sampler can cache directly (e.g. an
+    // mc_cache arena pointer, valid for a frozen frame). 0 = block() synthesizes
+    // into the `tmp` buffer (CLI/dense), so the sampler must give each cache slot
+    // its own scratch. Lets the interactive path drop the per-entry 4KB buffers.
+    int owns_ptr;
     int nz, ny, nx;                       // voxel dims of the sampled level
     // Optional direct path: when set, samplers address voxels straight off
     // this base pointer (voxel (z,y,x) at dense[z*dsy + y*dsx + x]) and

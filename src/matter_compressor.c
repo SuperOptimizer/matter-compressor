@@ -3479,10 +3479,15 @@ mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r){
 
 #define MC_S_MEMO 256   // covers an oblique 1024-px row's block working set
 
+// Pointer-only memo entry (16B, was 4112B). The block() source returns a STABLE
+// pointer the memo caches directly: the cache/arena source (mc_volume interactive
+// path) returns an arena/zero pointer valid for the frozen frame; dense bypasses
+// mc_s_block entirely. The only source that synthesizes into a scratch buffer is
+// the CLI blocking path -- for THAT, owns_ptr is 0 and we use a per-sampler buf[]
+// (allocated only then) so cached pointers don't alias one shared scratch.
 typedef struct {
     int bz, by, bx;             // -1 = empty
     const uint8_t *ptr;         // NULL = known-absent (sampled as 0)
-    uint8_t buf[4096];
 } mc_s_memo;
 
 struct mc_sampler {
@@ -3491,6 +3496,7 @@ struct mc_sampler {
     int lbz, lby, lbx;          // last block touched (ray-coherence cache)
     const uint8_t *lptr;
     int rbz, rby, rbx, rres;    // last residency probe (ray-coherence cache)
+    uint8_t (*scratch)[4096];   // per-entry synth buffers, only if !owns_ptr (else NULL)
     mc_s_memo m[MC_S_MEMO];
 };
 
@@ -3498,10 +3504,14 @@ static inline const uint8_t *mc_s_block(mc_sampler *s, int bz, int by, int bx) {
     if (bz == s->lbz && by == s->lby && bx == s->lbx) return s->lptr;
     unsigned h = ((unsigned)bz * 73856093u) ^ ((unsigned)by * 19349663u) ^
                  ((unsigned)bx * 83492791u);
-    mc_s_memo *e = &s->m[h & (MC_S_MEMO - 1)];
+    unsigned slot = h & (MC_S_MEMO - 1);
+    mc_s_memo *e = &s->m[slot];
     if (!(e->bz == bz && e->by == by && e->bx == bx)) {
         e->bz = bz; e->by = by; e->bx = bx;
-        e->ptr = s->src.block(&s->src, bz, by, bx, e->buf);
+        // owns_ptr sources return a stable pointer (cache arena); cache it directly.
+        // Otherwise synthesize into this slot's own scratch buffer.
+        uint8_t *tmp = s->scratch ? s->scratch[slot] : NULL;
+        e->ptr = s->src.block(&s->src, bz, by, bx, tmp);
     }
     s->lbz = bz; s->lby = by; s->lbx = bx; s->lptr = e->ptr;
     return e->ptr;
@@ -3924,6 +3934,7 @@ mc_sample_src mc_sample_src_cache(struct mc_cache *c, int lod,
                                   int nz, int ny, int nx) {
     mc_sample_src s = {0};
     s.ud = c; s.aux = lod; s.block = cache_block;
+    s.owns_ptr = 1;                       // cache_block returns stable arena pointers
     s.nz = nz; s.ny = ny; s.nx = nx;
     return s;
 }
@@ -3966,11 +3977,16 @@ mc_sampler *mc_sampler_new(const mc_sample_src *src) {
     s->nbz = (src->nz + BLK - 1) / BLK;
     s->nby = (src->ny + BLK - 1) / BLK;
     s->nbx = (src->nx + BLK - 1) / BLK;
+    // Per-entry 4KB scratch only for sources that synthesize into tmp (!owns_ptr).
+    // The interactive cache path (owns_ptr) caches stable arena pointers -> the
+    // sampler is ~5KB instead of ~1MB (no per-frame alloc/page-fault storm).
+    s->scratch = (src->owns_ptr || src->dense) ? NULL
+                 : malloc((size_t)MC_S_MEMO * 4096);
     mc_sampler_reset(s);
     return s;
 }
 
-void mc_sampler_free(mc_sampler *s) { free(s); }
+void mc_sampler_free(mc_sampler *s) { if (s) { free(s->scratch); free(s); } }
 
 void mc_sampler_reset(mc_sampler *s) {
     if (!s) return;
@@ -6832,6 +6848,7 @@ mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking) {
     mc_sample_src s = {0};
     s.ud = v; s.aux = lod; s.aux2 = blocking; s.block = vol_block;
     s.resident = vol_block_resident;
+    s.owns_ptr = !blocking;   // interactive vol_block returns stable arena pointers
     mc_volume_shape(v, lod, &s.nz, &s.ny, &s.nx);
     return s;
 }
