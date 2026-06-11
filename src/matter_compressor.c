@@ -718,6 +718,35 @@ static void step_tab_build(void);
 void  mc_set_quality(float q){ g_quality = q; step_tab_build(); }
 float mc_get_quality(void){ return g_quality; }
 void  mc_set_max_error(int tau){ g_max_err = tau<0?0:tau; }
+
+// ---- calibrated preset ladder (see header; bench/RESULTS.md for the data) --
+static const struct { float q; int tau; const char *name; } g_presets[7] = {
+    { 0.5f,  1, "archival"  },
+    { 0.5f,  2, "master"    },
+    { 1.0f,  4, "high"      },
+    { 2.5f,  8, "balanced"  },
+    { 6.0f, 16, "streaming" },
+    {16.0f, 32, "fast"      },
+    {32.0f, 64, "ultrafast" },
+};
+float mc_preset_quality(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) p=MC_PRESET_STREAMING;
+    return g_presets[p].q;
+}
+int mc_preset_tau(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) p=MC_PRESET_STREAMING;
+    return g_presets[p].tau;
+}
+const char *mc_preset_name(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) return "?";
+    return g_presets[p].name;
+}
+float mc_apply_preset(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) p=MC_PRESET_STREAMING;
+    mc_set_quality(g_presets[p].q);
+    mc_set_max_error(g_presets[p].tau);
+    return g_presets[p].q;
+}
 int   mc_get_max_error(void){ return g_max_err; }
 void  mc_codec_init(void){ mc_dct_init(); }
 void  mc_codec_set_priors(const uint16_t *plo, const uint16_t *phi){ rc_set_priors(plo,phi); }

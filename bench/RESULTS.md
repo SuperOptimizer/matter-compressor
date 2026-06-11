@@ -320,3 +320,22 @@ Instruction-level findings:
   confirming the architecture analysis at the instruction level.
 Verdict: codegen is clean; no further single-thread headroom in the hot
 loops beyond what PGO already captures.
+
+## Preset ladder calibration (2026-06-11, paris4_masked_512, 41.9% air)
+
+Per tau (max-error bound), q swept for best ratio; chosen tuples in bold.
+
+| tau | q sweep (ratio) | chosen |
+|---|---|---|
+| 1 | 0.25 (2.6x), **0.5 (2.9x)**, 1 (2.8x) | q 0.5 |
+| 2 | **0.5 (4.0x)**, 1 (3.9x), 2 (3.2x) | q 0.5 |
+| 4 | **1 (6.6x)**, 1.5 (6.3x) | q 1 |
+| 8 | 2 (12.4x), **2.5 (12.6x)**, 3 (12.3x) | q 2.5 |
+| 16 | 4 (24.1x), 5 (27.0x), **6 (28.5x)** | q 6 |
+| 32 | 8 (40.0x), 10 (45.6x), 12 (50.4x), **16 (57.5x)** | q 16 |
+| 64 | 16 (58.9x), 20 (65.3x), 24 (70.6x), **32 (78.1x)** | q 32 |
+
+Ratio plateaus per tau as corrections absorb quantization coarseness
+(tau 8: q 2/2.5/3 all ~12.5x). True lossless reference: zstd-19 = 1.96x.
+tau 128/256 rejected: unbounded max error is ~70 at q 32 — wider bounds
+never trigger on u8.

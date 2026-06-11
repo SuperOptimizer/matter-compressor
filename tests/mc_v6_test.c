@@ -10,6 +10,21 @@ static mc_u8 srcv(void *ud, int x,int y,int z){
 }
 
 int main(void){
+    // preset ladder: tau = 2^level, quality ascending, apply() wires globals
+    {
+        float prev_q = 0.0f;
+        for (int l = 0; l < MC_PRESET_COUNT; l++) {
+            if (mc_preset_tau((mc_preset)l) != (1 << l)) { fprintf(stderr, "preset tau l=%d\n", l); return 1; }
+            float q = mc_apply_preset((mc_preset)l);
+            if (!(q >= prev_q) || mc_get_quality() != q ||
+                mc_get_max_error() != (1 << l) || !mc_preset_name((mc_preset)l)) {
+                fprintf(stderr, "preset apply l=%d\n", l); return 1;
+            }
+            prev_q = q;
+        }
+        mc_set_max_error(0); mc_set_quality(6.0f);   // restore defaults
+        printf("presets OK\n");
+    }
     // 1) non-cubic build: 300 x 130 x 70 voxels (pads to 512 x 256 x 256)
     mc_build_opts o={.nx=300,.ny=130,.nz=70,.quality=6.0f,.metadata="v6",.meta_len=2};
     size_t alen=0; uint8_t *arc=mc_build(srcv,NULL,&o,&alen);

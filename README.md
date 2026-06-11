@@ -57,11 +57,24 @@ idea that was implemented and rejected: `bench/RESULTS.md`.
 - **quality q** — the quant step dial (see table above).
 - **max-error bound** — `mc_set_max_error(tau)`: sparse corrections
   guarantee |error| ≤ τ on every material voxel (τ≈3–4×q costs <1 % ratio).
-- **archival preset** — q 0.5 + τ 1: every material voxel within ±1
-  greylevel (below scanner noise), air bit-exact, **2.9×** on real 2.4 µm
-  scroll data (51.9 dB, SSIM 0.9996, p99 = max = 1) vs 1.96× for true
-  lossless zstd-19 — which is why there is no lossless mode. τ 2 → 4.0×,
-  τ 3 (q 1) → 5.3×.
+- **preset ladder** — `mc_apply_preset(level)`: 7 calibrated levels,
+  level L guarantees |err| ≤ 2^L on every material voxel (air bit-exact)
+  at the ratio-optimal quality for that bound. Measured on real 2.4 µm
+  scroll data:
+
+  | level | τ | q | ratio | PSNR | SSIM | dec MB/s |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 0 archival | 1 | 0.5 | 2.9× | 51.9 | 0.9996 | 33 |
+  | 1 master | 2 | 0.5 | 4.0× | 48.6 | 0.9991 | 38 |
+  | 2 high | 4 | 1 | 6.6× | 44.3 | 0.9975 | 56 |
+  | 3 balanced | 8 | 2.5 | 12.6× | 39.5 | 0.9925 | 100 |
+  | 4 streaming | 16 | 6 | 28.5× | 35.9 | 0.9823 | 165 |
+  | 5 fast | 32 | 16 | 57.5× | 32.5 | 0.9609 | 241 |
+  | 6 ultrafast | 64 | 32 | 78.1× | 30.4 | 0.9341 | 276 |
+
+  Archival (±1, below scanner noise) beats true lossless (zstd-19:
+  1.96×) — which is why there is no lossless mode. No τ 128/256 levels:
+  the unbounded worst case is ~70 greylevels even at q 32.
 - **rate targeting** — `mc_archive_append_chunk_target(.., target_ratio,..)`
   picks q per chunk from a 1/16-block sample (+~6 % encode time; lands
   within ~5 % of target on real data).
