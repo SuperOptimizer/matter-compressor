@@ -5084,6 +5084,7 @@ void mc_s3_close(mc_s3 *s){
 
 static void *decoder_main(void *ud);
 static void *dl_main(void *ud);
+static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int cx);
 
 // portable thread naming: macOS names the calling thread (1 arg), glibc
 // takes (thread, name)
@@ -5381,9 +5382,9 @@ static void *dl_main(void *ud) {
         pthread_mutex_unlock(&v->mu);
         int lod, cz, cy, cx;
         runpack(key, &lod, &cz, &cy, &cx);             // region coords
-        MCVLOG("dl_pop    lod%d region(%d,%d,%d) -> download shard", lod, cz, cy, cx);
+        MCVLOG("dl_pop    lod%d region(%d,%d,%d) -> download region", lod, cz, cy, cx);
         const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
-        mc_volume_prefetch_shard(v, lod, cz * sub, cy * sub, cx * sub);  // source coord
+        mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // source coord of region
     }
 }
 
@@ -5393,7 +5394,7 @@ static mc_cover ensure_region(mc_volume *v, int lod, int cz, int cy, int cx) {
     mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
     if (cov != MC_ABSENT) return cov;
     const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
-    mc_volume_prefetch_shard(v, lod, cz * sub, cy * sub, cx * sub);   // pushes to decode queue
+    mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // just this region
     // wait for the decoders to drain enough that this region is covered.
     for (int spin = 0; spin < 100000; ++spin) {
         cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
@@ -5630,10 +5631,59 @@ mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking) {
 // by one shard's compressed chunks (a fraction of the decoded shard).
 // (cz,cy,cx) is any source inner-chunk in the target shard.
 // ---------------------------------------------------------------------------
+// Download ONE 256^3 region's source chunk(s) and push it to the decode queue —
+// the interactive path. The shard index (64KB footer) is read once and cached
+// (footer_get / mc_zarr_read_inner), so this is: cached footer lookup + a single
+// ranged GET per source chunk (1 for c3d, up to 8 for a v2 sub^3 cube). NO
+// whole-shard download. (cz,cy,cx) = the source inner-chunk coord of the region.
+static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    if (lod < 0 || lod >= v->nlods) return;
+    mc_zarr *z = v->lv[lod].z;
+    const int edge = mc_zarr_inner_edge(z);            // 256 (c3d) or 128 (v2)
+    const int sub = CHUNK / edge;                      // source chunks per region axis
+    const int rz = cz / sub, ry = cy / sub, rx = cx / sub;   // 256^3 region coords
+    if (mc_archive_chunk_coverage(v->arc, lod, rz, ry, rx) != MC_ABSENT) return;  // already have it
+
+    if (sub == 1) {                                    // c3d / v2-256: one chunk == region
+        uint8_t *raw = NULL; size_t rlen = 0;
+        int st = mc_zarr_read_inner(z, cz, cy, cx, &raw, &rlen);
+        if (st != 0 || !raw || !rlen) {                // absent / air / error -> ZERO region
+            free(raw);
+            decode_item air = {lod, rz, ry, rx, 1, 0, {0},{0},{0}, {0},{0}};
+            decode_push(v, &air);
+            return;
+        }
+        atomic_fetch_add_explicit(&v->net_bytes, rlen, memory_order_relaxed);
+        decode_item it = {lod, rz, ry, rx, 1, 1, {0},{0},{0}, {0},{0}};
+        it.raw[0] = raw; it.rlen[0] = rlen;
+        decode_push(v, &it);
+        return;
+    }
+
+    // v2 sub^3 cube: fetch each present source chunk of the region's cube.
+    int sz0 = rz * sub, sy0 = ry * sub, sx0 = rx * sub;
+    decode_item it = {lod, rz, ry, rx, sub, 0, {0},{0},{0}, {0},{0}};
+    for (int dz = 0; dz < sub; ++dz)
+    for (int dy = 0; dy < sub; ++dy)
+    for (int dx = 0; dx < sub; ++dx) {
+        uint8_t *raw = NULL; size_t rlen = 0;
+        if (mc_zarr_read_inner(z, sz0 + dz, sy0 + dy, sx0 + dx, &raw, &rlen) != 0 || !raw || !rlen) {
+            free(raw); continue;                       // missing sub-chunk = air there
+        }
+        atomic_fetch_add_explicit(&v->net_bytes, rlen, memory_order_relaxed);
+        int k = it.nsub++;
+        it.raw[k] = raw; it.rlen[k] = rlen;
+        it.oz[k] = dz * edge; it.oy[k] = dy * edge; it.ox[k] = dx * edge;
+    }
+    decode_push(v, &it);                               // nsub may be 0 -> ZERO region
+}
+
 // Download a shard's present chunks (one parallel s3_get_batch) and PUSH each
 // region's raw payload(s) to the decode queue — NO decode on this (download)
 // thread. Decoders drain the queue in parallel, so the network stays saturated.
 // Backpressure in decode_push bounds RAM. (cz,cy,cx) = source inner-chunk coord.
+// NOTE: bulk path (CLI prefetch). The interactive render path uses
+// mc_volume_prefetch_region (one region) so navigation never pulls a whole shard.
 void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
     if (lod < 0 || lod >= v->nlods) return;
     level_t *lv = &v->lv[lod];
@@ -5697,6 +5747,11 @@ void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
         }
         { int ok = 0; uint64_t bytes = 0;
           for (int i = 0; i < nq; ++i) if (s3_response_ok(&resp[i])) { ok++; bytes += resp[i].body_len; }
+          // Count ACTUAL transferred bytes per batch (the real network/disk
+          // throughput), not just the kept-chunk bytes accumulated in `got`
+          // below — and do it per batch so a download-rate readout updates
+          // promptly instead of only when the whole shard finishes.
+          atomic_fetch_add_explicit(&v->net_bytes, bytes, memory_order_relaxed);
           MCVLOG("batch#%d  lod%d nq=%d ok=%d %.2fMB in %.0fms = %.1f MB/s",
                  nbatch++, lod, nq, ok, bytes/1048576.0, mcv_now()-tb,
                  bytes/1048576.0/((mcv_now()-tb)/1000.0)); }
@@ -5742,7 +5797,7 @@ void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
             for (int i = 0; i < nq; ++i) s3_response_free(&resp[i]);
         }
     }
-    atomic_fetch_add_explicit(&v->net_bytes, got, memory_order_relaxed);
+    (void)got;   // net_bytes is now counted per batch above (actual transfer)
     free(ranges);
 }
 
