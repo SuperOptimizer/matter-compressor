@@ -62,8 +62,8 @@ int   mc_get_max_error(void);
 //   4 streaming 16  6     28.5x  35.9  0.9823  165
 //   5 fast      32  16    57.5x  32.5  0.9609  241
 //   6 ultrafast 64  32    78.1x  30.4  0.9341  276
-// No tau 128/256 levels: the codec's unbounded worst case is ~70 greylevels
-// even at q 32, so wider bounds never trigger on u8 data.
+//   7 preview  128  64    93.4x  28.2  0.8915  673
+// No tau 256 level: 256 exceeds the u8 range, the bound could never bind.
 typedef enum {
     MC_PRESET_ARCHIVAL  = 0,   // tau   1
     MC_PRESET_MASTER    = 1,   // tau   2
@@ -72,7 +72,8 @@ typedef enum {
     MC_PRESET_STREAMING = 4,   // tau  16
     MC_PRESET_FAST      = 5,   // tau  32
     MC_PRESET_ULTRAFAST = 6,   // tau  64
-    MC_PRESET_COUNT     = 7,
+    MC_PRESET_PREVIEW   = 7,   // tau 128
+    MC_PRESET_COUNT     = 8,
 } mc_preset;
 // Sets mc_set_quality + mc_set_max_error; returns the level's quality (pass
 // it to the mc_archive_append_* calls, which take q explicitly).

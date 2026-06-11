@@ -720,14 +720,15 @@ float mc_get_quality(void){ return g_quality; }
 void  mc_set_max_error(int tau){ g_max_err = tau<0?0:tau; }
 
 // ---- calibrated preset ladder (see header; bench/RESULTS.md for the data) --
-static const struct { float q; int tau; const char *name; } g_presets[7] = {
-    { 0.5f,  1, "archival"  },
-    { 0.5f,  2, "master"    },
-    { 1.0f,  4, "high"      },
-    { 2.5f,  8, "balanced"  },
-    { 6.0f, 16, "streaming" },
-    {16.0f, 32, "fast"      },
-    {32.0f, 64, "ultrafast" },
+static const struct { float q; int tau; const char *name; } g_presets[8] = {
+    { 0.5f,   1, "archival"  },
+    { 0.5f,   2, "master"    },
+    { 1.0f,   4, "high"      },
+    { 2.5f,   8, "balanced"  },
+    { 6.0f,  16, "streaming" },
+    {16.0f,  32, "fast"      },
+    {32.0f,  64, "ultrafast" },
+    {64.0f, 128, "preview"   },
 };
 float mc_preset_quality(mc_preset p){
     if((unsigned)p>=MC_PRESET_COUNT) p=MC_PRESET_STREAMING;

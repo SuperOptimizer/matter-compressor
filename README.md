@@ -71,10 +71,11 @@ idea that was implemented and rejected: `bench/RESULTS.md`.
   | 4 streaming | 16 | 6 | 28.5× | 35.9 | 0.9823 | 165 |
   | 5 fast | 32 | 16 | 57.5× | 32.5 | 0.9609 | 241 |
   | 6 ultrafast | 64 | 32 | 78.1× | 30.4 | 0.9341 | 276 |
+  | 7 preview | 128 | 64 | 93.4× | 28.2 | 0.8915 | 673 |
 
   Archival (±1, below scanner noise) beats true lossless (zstd-19:
-  1.96×) — which is why there is no lossless mode. No τ 128/256 levels:
-  the unbounded worst case is ~70 greylevels even at q 32.
+  1.96×) — which is why there is no lossless mode. No τ 256 level: it
+  exceeds the u8 range and could never bind.
 - **rate targeting** — `mc_archive_append_chunk_target(.., target_ratio,..)`
   picks q per chunk from a 1/16-block sample (+~6 % encode time; lands
   within ~5 % of target on real data).

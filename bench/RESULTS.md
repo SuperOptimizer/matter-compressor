@@ -339,3 +339,4 @@ Ratio plateaus per tau as corrections absorb quantization coarseness
 (tau 8: q 2/2.5/3 all ~12.5x). True lossless reference: zstd-19 = 1.96x.
 tau 128/256 rejected: unbounded max error is ~70 at q 32 — wider bounds
 never trigger on u8.
+| 128 | 48 (87.5x), **64 (93.4x)**, 96 (101.6x) | q 64 (preview level; q chosen by fiat — SSIM 0.86 at q 96 is past useful) |
