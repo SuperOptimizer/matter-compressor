@@ -999,6 +999,12 @@ void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx);
 // polled to abort early.
 void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel);
 
+// Predictive prefetch: request the 256^3 region (cz,cy,cx) at `lod` be downloaded
+// + transcoded if absent. Cheap, non-blocking, deduped (LIFO download stack). A
+// no-op if the region is already present/air/in-flight. Feed it the geometry-
+// predicted working set at the start of a tick so data front-runs the render.
+void mc_volume_request_region(mc_volume *v, int lod, int cz, int cy, int cx);
+
 // Register a callback fired (from a worker thread) each time a background
 // transcode completes a region — lets an interactive client schedule a repaint.
 // `cb` must be cheap and thread-safe (e.g. set a flag / post to the UI loop).

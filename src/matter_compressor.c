@@ -6160,10 +6160,15 @@ struct mc_volume {
     pthread_cond_t dq_nf;      // not-full  (wake a blocked producer)
     int stop;
 
-    // Interactive download-request stack (LIFO): a render miss pushes "fetch the
-    // shard around region R". Download threads pop the NEWEST request (current
-    // view) first; when full, the OLDEST (stalest, camera moved on) is dropped.
-    uint64_t *reqstk;          // region keys
+    // Interactive download-request stack (LIFO): a render miss / prefetch pushes
+    // "fetch region R". Download threads pop the NEWEST (current view) first; when
+    // full, the OLDEST (stalest, camera moved on) is dropped. DEDUPING: an open-
+    // addressing membership set (rs_set) gives O(1) push-dedup instead of an O(n)
+    // stack scan -- the prefetch blasts the predicted set every tick, so the stack
+    // absorbs duplicates natively without the caller deduping.
+    uint64_t *reqstk;          // region keys (the LIFO order)
+    uint64_t *rs_set;          // membership set, power-of-two, 0 = empty slot
+    int rs_set_mask;           // rs_set capacity - 1
     int rs_cap, rs_n;
     pthread_t dlthreads[16];
     int ndl;
@@ -6446,17 +6451,45 @@ static void inflight_del(mc_volume *v, uint64_t key) {
         }
 }
 
+// Deduping-stack membership set (open addressing, linear probe). key != 0 always
+// (rkey packs lod in the high nibble; region 0,0,0 at lod>0 is fine, and lod0
+// 0,0,0 -> key 0 would alias empty; guard below treats key 0 specially -- but
+// rkey for (0,0,0,0) is 0, which never occurs as a real interactive request).
+static int rs_set_has(mc_volume *v, uint64_t key) {
+    uint32_t i = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & (uint32_t)v->rs_set_mask;
+    for (int p = 0; p <= v->rs_set_mask; ++p) {
+        uint64_t cur = v->rs_set[i];
+        if (cur == 0) return 0;
+        if (cur == key) return 1;
+        i = (i + 1) & (uint32_t)v->rs_set_mask;
+    }
+    return 0;
+}
+static void rs_set_add(mc_volume *v, uint64_t key) {
+    uint32_t i = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & (uint32_t)v->rs_set_mask;
+    for (int p = 0; p <= v->rs_set_mask; ++p) {
+        if (v->rs_set[i] == 0 || v->rs_set[i] == key) { v->rs_set[i] = key; return; }
+        i = (i + 1) & (uint32_t)v->rs_set_mask;
+    }
+}
+// Rebuild the set from the stack (after a removal leaves probe-chain holes).
+static void rs_set_rebuild(mc_volume *v) {
+    memset(v->rs_set, 0, ((size_t)v->rs_set_mask + 1) * sizeof(uint64_t));
+    for (int i = 0; i < v->rs_n; ++i) rs_set_add(v, v->reqstk[i]);
+}
+
 static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
     uint64_t key = rkey(lod, cz, cy, cx);
     pthread_mutex_lock(&v->mu);
     if (inflight_has(v, key)) { pthread_mutex_unlock(&v->mu); return; }  // already fetching/decoding
-    for (int i = 0; i < v->rs_n; ++i)
-        if (v->reqstk[i] == key) { pthread_mutex_unlock(&v->mu); return; }   // already queued
-    if (v->rs_n == v->rs_cap) {                         // full -> drop bottom
+    if (rs_set_has(v, key)) { pthread_mutex_unlock(&v->mu); return; }    // already queued (O(1))
+    if (v->rs_n == v->rs_cap) {                         // full -> drop bottom (stalest)
         memmove(&v->reqstk[0], &v->reqstk[1], (size_t)(v->rs_cap - 1) * sizeof(uint64_t));
         v->rs_n--;
+        rs_set_rebuild(v);                              // membership shifted; rebuild
     }
     v->reqstk[v->rs_n++] = key;                         // push on top
+    rs_set_add(v, key);
     MCVLOG("req_push  lod%d region(%d,%d,%d) stack_depth=%d", lod, cz, cy, cx, v->rs_n);
     pthread_cond_signal(&v->cv);
     pthread_mutex_unlock(&v->mu);
@@ -6478,13 +6511,16 @@ static void *dl_main(void *ud) {
         pthread_mutex_lock(&v->mu);
         while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
         if (v->stop && v->rs_n == 0) { pthread_mutex_unlock(&v->mu); return NULL; }
+        int popped = 0;
         while (m < DL_BATCH && v->rs_n > 0) {           // grab a batch, newest first
             uint64_t key = v->reqstk[--v->rs_n];
+            popped = 1;
             if (inflight_has(v, key)) continue;          // another dl thread already has it
             inflight_add(v, key);                        // single-flight: claim it
             runpack(key, &lods[m], &rz[m], &ry[m], &rx[m]);
             ++m;
         }
+        if (popped) rs_set_rebuild(v);                  // popped keys leave the set
         pthread_mutex_unlock(&v->mu);
 
         // Locate each region's c3d source chunk via the cached footer; build one
@@ -6676,6 +6712,10 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     v->rs_cap = (cfg && cfg->request_stack > 0) ? cfg->request_stack : 65536;
     if (v->rs_cap < 256) v->rs_cap = 256; if (v->rs_cap > (1<<22)) v->rs_cap = (1<<22);
     v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
+    // Membership set: next pow2 >= 2*rs_cap (load factor <= 0.5 -> short probes).
+    int sc = 1; while (sc < v->rs_cap * 2) sc <<= 1;
+    v->rs_set_mask = sc - 1;
+    v->rs_set = calloc((size_t)sc, sizeof *v->rs_set);
 
     // Decoders default to nproc/2: the c3d/wavelet decode is memory-bandwidth-
     // bound (a 256^3 decode streams ~16MB), so threads past ~half the cores
@@ -6724,6 +6764,7 @@ void mc_volume_free(mc_volume *v) {
     if (v->s3) s3_client_free(v->s3);
     free(v->dq);
     free(v->reqstk);
+    free(v->rs_set);
     free(v->inflight);
     pthread_mutex_destroy(&v->mu);
     pthread_cond_destroy(&v->cv);
@@ -6798,6 +6839,18 @@ const uint8_t *mc_volume_block_ptr(mc_volume *v, int lod, int bz, int by, int bx
     }
     // present: arena pointer on a RAM hit; NULL (+ recorded miss) otherwise.
     return mc_cache_get(v->cache, lod, bz, by, bx);
+}
+
+// Predictive prefetch: request the 256^3 REGION (cz,cy,cx) be downloaded +
+// transcoded if it isn't already resident/in-flight. Cheap and non-blocking: a
+// coverage probe (O(1) memo) + a push onto the LIFO download stack (deduped vs
+// in-flight/queued). No decode, no scratch. Present/air -> no-op. Called from the
+// tick BEFORE freeze, from the geometry-predicted working set, so regions stream
+// in ahead of the render instead of being discovered as misses a cycle late.
+void mc_volume_request_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    if (!v || lod < 0 || lod >= v->nlods) return;
+    if (mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx) != MC_ABSENT) return;
+    req_push(v, lod, cz, cy, cx);
 }
 
 int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
