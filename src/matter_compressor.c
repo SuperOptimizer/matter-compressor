@@ -1783,7 +1783,14 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
 // (a render archive's covered-region count is bounded by the volume's region
 // count, and we cap fill at the reserve anyway).
 #define MC_COV_CAP (1u<<20)            // 1M slots -> up to ~700k regions at 0.7 load
-#define MC_COV_ZERO_BIT (1ull<<63)     // value flag: region is air (MC_ZERO)
+// memo value = state(2 bits) | packed region key. Region coords are 256^3-chunk
+// indices (<= ~4096 even for a 77824^3 volume) so 12 bits/axis is ample; the key
+// fits in 39 bits, leaving the top free for state. state 0 = empty slot.
+#define MC_COV_PRESENT 1ull
+#define MC_COV_ZERO    2ull
+#define MC_COV_ABSENT  3ull            // VISITED-and-absent: memoized so re-probes
+                                       // of a not-yet-downloaded region are O(1)
+                                       // (overwritten -> PRESENT when it lands).
 struct mc_archive {
     int fd;
     u8 *base;                  // fixed mmap base (never moves)
@@ -1798,35 +1805,41 @@ struct mc_archive {
                                // chunk_off memos when a chunk is re-appended
 };
 
-// region key for the coverage memo: same packing as rkey() but defined here so the
-// archive layer is self-contained. lod in high nibble, then cz,cy,cx (20 bits ea).
+// region key for the coverage memo: state in the top 2 bits, then lod(3)+12/axis.
 static inline uint64_t mc_covkey(int lod,int cz,int cy,int cx){
-    return ((uint64_t)(lod & 7) << 60) | ((uint64_t)(cz & 0xFFFFF) << 40) |
-           ((uint64_t)(cy & 0xFFFFF) << 20) | (uint64_t)(cx & 0xFFFFF);
+    return ((uint64_t)(lod & 7) << 36) | ((uint64_t)(cz & 0xFFF) << 24) |
+           ((uint64_t)(cy & 0xFFF) << 12) | (uint64_t)(cx & 0xFFF);
 }
-// probe the memo. returns MC_PRESENT / MC_ZERO if found, MC_ABSENT if not.
-static mc_cover mc_cov_probe(mc_archive *a,int lod,int cz,int cy,int cx){
-    if(!a->cov) return MC_ABSENT;
+#define MC_COV_STATE_SHIFT 62
+#define MC_COV_KEYMASK ((1ull<<MC_COV_STATE_SHIFT)-1)
+// probe the memo. PRESENT/ZERO/ABSENT if memoized, MC_ABSENT(== not found) only
+// when the slot is empty or the probe run is exhausted (caller then tree-walks).
+static int mc_cov_probe(mc_archive *a,int lod,int cz,int cy,int cx){
+    if(!a->cov) return -1;
     uint64_t key = mc_covkey(lod,cz,cy,cx);
     uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>44);
     for(int p=0;p<32;++p){
         uint32_t i=(h+(uint32_t)p)&(MC_COV_CAP-1);
         uint64_t cur=atomic_load_explicit(&a->cov[i],memory_order_acquire);
-        if(cur==0) return MC_ABSENT;
-        if((cur & ~MC_COV_ZERO_BIT)==key) return (cur & MC_COV_ZERO_BIT)?MC_ZERO:MC_PRESENT;
+        if(cur==0) return -1;                  // empty -> not memoized
+        if((cur & MC_COV_KEYMASK)==key){
+            uint64_t st = cur >> MC_COV_STATE_SHIFT;
+            return st==MC_COV_PRESENT?MC_PRESENT : st==MC_COV_ZERO?MC_ZERO : MC_ABSENT;
+        }
     }
-    return MC_ABSENT;                  // probe exhausted (over capacity) -> fall back
+    return -1;                                 // probe exhausted -> tree-walk
 }
-// insert/update the memo. PRESENT supersedes ZERO if a region transitions.
-static void mc_cov_put(mc_archive *a,int lod,int cz,int cy,int cx,int is_zero){
+// insert/update the memo with an explicit state (PRESENT/ZERO/ABSENT). A later
+// PRESENT publish overwrites a prior ABSENT/ZERO for the same region in place.
+static void mc_cov_put_state(mc_archive *a,int lod,int cz,int cy,int cx,uint64_t state){
     if(!a->cov) return;
     uint64_t key = mc_covkey(lod,cz,cy,cx);
-    uint64_t val = key | (is_zero?MC_COV_ZERO_BIT:0);
+    uint64_t val = key | (state<<MC_COV_STATE_SHIFT);
     uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>44);
     for(int p=0;p<32;++p){
         uint32_t i=(h+(uint32_t)p)&(MC_COV_CAP-1);
         uint64_t cur=atomic_load_explicit(&a->cov[i],memory_order_relaxed);
-        if((cur & ~MC_COV_ZERO_BIT)==key){      // same region: upgrade air->present if needed
+        if((cur & MC_COV_KEYMASK)==key && cur!=0){   // same region: update state
             if(cur==val) return;
             atomic_store_explicit(&a->cov[i],val,memory_order_release); return;
         }
@@ -1834,11 +1847,14 @@ static void mc_cov_put(mc_archive *a,int lod,int cz,int cy,int cx,int is_zero){
             uint64_t exp=0;
             if(atomic_compare_exchange_strong_explicit(&a->cov[i],&exp,val,
                    memory_order_release,memory_order_relaxed)) return;
-            if((exp & ~MC_COV_ZERO_BIT)==key){  // lost race to same region
+            if((exp & MC_COV_KEYMASK)==key){  // lost race to same region
                 if(exp!=val) atomic_store_explicit(&a->cov[i],val,memory_order_release);
                 return; }
         }
     }
+}
+static inline void mc_cov_put(mc_archive *a,int lod,int cz,int cy,int cx,int is_zero){
+    mc_cov_put_state(a,lod,cz,cy,cx, is_zero?MC_COV_ZERO:MC_COV_PRESENT);
 }
 
 static int w_ensure(mc_archive *w, uint64_t need){
@@ -2116,11 +2132,11 @@ mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx)
     // made resident this session are always in the memo. A memo-miss falls back to
     // the tree (covers disk-loaded archives committed in a prior session) and
     // backfills the memo so the next probe is O(1).
-    mc_cover m = mc_cov_probe(a, lod, cz, cy, cx);
-    if(m != MC_ABSENT) return m;
+    int m = mc_cov_probe(a, lod, cz, cy, cx);
+    if(m >= 0) return (mc_cover)m;           // memoized (incl ABSENT) -> O(1)
     uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);
     uint64_t off = mc_resolve_chunk(a->base, root, cz,cy,cx);
-    if(off==0) return MC_ABSENT;
+    if(off==0){ mc_cov_put_state(a,lod,cz,cy,cx,MC_COV_ABSENT); return MC_ABSENT; }
     int zero = (off==MC_SLOT_ZERO);
     mc_cov_put(a, lod, cz, cy, cx, zero);   // backfill for next time
     return zero ? MC_ZERO : MC_PRESENT;
@@ -3474,6 +3490,7 @@ struct mc_sampler {
     int nbz, nby, nbx;
     int lbz, lby, lbx;          // last block touched (ray-coherence cache)
     const uint8_t *lptr;
+    int rbz, rby, rbx, rres;    // last residency probe (ray-coherence cache)
     mc_s_memo m[MC_S_MEMO];
 };
 
@@ -3960,6 +3977,7 @@ void mc_sampler_reset(mc_sampler *s) {
     for (int i = 0; i < MC_S_MEMO; i++) s->m[i].bz = -1;
     s->lbz = s->lby = s->lbx = -1;
     s->lptr = NULL;
+    s->rbz = s->rby = s->rbx = -1; s->rres = 0;
 }
 
 float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f) {
@@ -3972,7 +3990,15 @@ static inline int mc_s_block_resident(mc_sampler *s, float z, float y, float x) 
     int z0 = (int)floorf(z), y0 = (int)floorf(y), x0 = (int)floorf(x);
     if (z0 < 0 || y0 < 0 || x0 < 0 ||
         z0 >= s->src.nz || y0 >= s->src.ny || x0 >= s->src.nx) return 0;
-    return mc_s_block(s, z0 >> 4, y0 >> 4, x0 >> 4) != NULL;
+    if (s->src.dense) return 1;                    // dense source: always resident
+    int bz = z0 >> 4, by = y0 >> 4, bx = x0 >> 4;
+    if (bz == s->rbz && by == s->rby && bx == s->rbx) return s->rres;  // ray-coherent
+    // CHEAP probe if the source provides one: this must NOT decode (the LOD
+    // fallback's whole point is to skip the fine-level decode-on-render-thread).
+    int r = s->src.resident ? s->src.resident(&s->src, bz, by, bx)
+                            : (mc_s_block(s, bz, by, bx) != NULL);   // may decode
+    s->rbz = bz; s->rby = by; s->rbx = bx; s->rres = r;
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -6138,12 +6164,16 @@ struct mc_volume {
     mc_volume_ready_fn ready_cb;   // fired when a region becomes serveable
     void *ready_ud;
 
-    // Frozen snapshot of remaining pipeline work, collated once per THAW and read
-    // during the frozen render (the streaming gate). Written and read by the SAME
-    // tick thread -- plain field, no atomic, no lock. = queued downloads +
-    // downloading + decode-queue depth + undrained misses, i.e. "is data still
-    // moving toward the cache." Stays >0 until the pipeline drains.
-    uint64_t inflight_snapshot;
+    // Two frozen snapshots, collated once per THAW, read during the frozen render.
+    // Same tick thread writes + reads -> plain fields, no atomic, no lock.
+    //  net_inflight: ACTUAL download/decode pipeline work = queued downloads +
+    //    downloading + decode-queue depth. This is the user-facing "downloading N"
+    //    -- stable, reflects real network/transcode work.
+    //  work_pending: net_inflight + this frame's undrained misses. The render gate
+    //    keys off this ("keep ticking while anything is still settling"). The miss
+    //    term swings 0..thousands per frame, so it must NOT leak into the status bar.
+    uint64_t net_inflight;
+    uint64_t work_pending;
 };
 
 // One unit of decode work: the sub^3 cube of source chunks covering one 256^3
@@ -6321,8 +6351,13 @@ static void *decoder_main(void *ud) {
         pthread_mutex_lock(&v->mu);
         while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
         if (v->stop && v->dq_head == v->dq_tail) { pthread_mutex_unlock(&v->mu); break; }
-        decode_item it = v->dq[v->dq_head];
-        v->dq_head = (v->dq_head + 1) % v->dq_cap;
+        // LIFO: decode the NEWEST queued region first (pop from the producer's end).
+        // Like the download stack, interactive coords go stale as the user moves --
+        // the freshest region is what's on screen now, so decode it before the
+        // backlog. The ring is used as a deque: producer pushes at dq_tail, we pop
+        // dq_tail-1.
+        v->dq_tail = (v->dq_tail + v->dq_cap - 1) % v->dq_cap;
+        decode_item it = v->dq[v->dq_tail];
         v->dq_bytes -= decode_item_bytes(&it);         // free staging budget
         pthread_cond_signal(&v->dq_nf);                // wake a blocked producer
         pthread_mutex_unlock(&v->mu);
@@ -6709,18 +6744,44 @@ int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
     int cz = bz / PER, cy = by / PER, cx = bx / PER;
     mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
     if (cov == MC_ABSENT) {
-        // Record the absent BLOCK miss (cheap, lock-free, deduped) instead of
-        // calling req_push here: req_push locks the global mutex + scans the
-        // request stack per block (4096x/region, O(N^2) on the render worker).
-        // mc_volume_thaw drains these and issues one download request per absent
-        // region, off the render path. Render falls to coarser LOD meanwhile.
-        mc_cache_miss_mark(v->cache, lod, bz, by, bx);
+        // Record the absent miss at REGION granularity (the region's corner block),
+        // NOT per 16^3 block. A thin slice touches thousands of blocks across an
+        // absent region but they all dedupe to one region key -- so the per-frame
+        // miss set is ~tens (one per absent region) instead of ~thousands. THAW
+        // drains these region keys and issues one download each. (Per-block absent
+        // recording flooded the 64K miss table every frame -> the ~2ms thaw floor.)
+        mc_cache_miss_mark(v->cache, lod, cz * PER, cy * PER, cx * PER);
         memset(dst, 0, BLK * BLK * BLK);
         return 0;
     }
     if (cov == MC_ZERO) { memset(dst, 0, BLK * BLK * BLK); return 1; }
     mc_cache_get_copy(v->cache, lod, bz, by, bx, dst);
     return 1;
+}
+
+// Shared 16^3 zero block (air). One static, read-only -- samplers point at it
+// instead of each copying zeros into a per-entry buffer.
+static const uint8_t *mc_zero16(void) {
+    static uint8_t z[BLK * BLK * BLK];   // zero-initialized (BSS)
+    return z;
+}
+
+// Pointer-returning block accessor (NO copy). Returns a STABLE pointer valid for
+// the duration of a frozen frame: into the cache arena (RAM hit), the shared zero
+// block (air), or NULL (absent or present-but-not-cached -> caller falls coarser).
+// This replaces the copy-into-tmp path so the sampler memo can hold pointers, not
+// 4KB buffers -- killing the per-frame 8MB sampler alloc + a per-block memcpy.
+const uint8_t *mc_volume_block_ptr(mc_volume *v, int lod, int bz, int by, int bx) {
+    if (lod < 0 || lod >= v->nlods) return NULL;
+    int cz = bz / PER, cy = by / PER, cx = bx / PER;
+    mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    if (cov == MC_ZERO) return mc_zero16();
+    if (cov == MC_ABSENT) {
+        mc_cache_miss_mark(v->cache, lod, cz * PER, cy * PER, cx * PER);
+        return NULL;
+    }
+    // present: arena pointer on a RAM hit; NULL (+ recorded miss) otherwise.
+    return mc_cache_get(v->cache, lod, bz, by, bx);
 }
 
 int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
@@ -6738,14 +6799,39 @@ int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
 static const uint8_t *vol_block(const mc_sample_src *src,
                                 int bz, int by, int bx, uint8_t *tmp) {
     mc_volume *v = src->ud;
-    int r = src->aux2 ? mc_volume_get_block(v, src->aux, bz, by, bx, tmp)
-                      : mc_volume_try_block(v, src->aux, bz, by, bx, tmp);
-    return r == 1 ? tmp : NULL;
+    if (src->aux2) {   // blocking (CLI): keep the copy-into-tmp path
+        int r = mc_volume_get_block(v, src->aux, bz, by, bx, tmp);
+        return r == 1 ? tmp : NULL;
+    }
+    // interactive: return a STABLE arena/zero pointer (no copy). tmp unused.
+    (void)tmp;
+    return mc_volume_block_ptr(v, src->aux, bz, by, bx);
+}
+
+// CHEAP residency for the LOD fallback: sample-able NOW without a decode? Yes iff
+// the region is air (ZERO -> samples 0 trivially) or the 16^3 block is already in
+// the RAM cache. A PRESENT-but-not-cached block returns 0 here so the fallback
+// samples a coarser resident level instead of decoding the fine block on the
+// render thread (also records the miss so THAW fills it -> next frame sharpens).
+static int vol_block_resident(const mc_sample_src *src, int bz, int by, int bx) {
+    mc_volume *v = src->ud;
+    int lod = src->aux;
+    int cz = bz / PER, cy = by / PER, cx = bx / PER;
+    mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    if (cov == MC_ZERO) return 1;                        // air: trivially sample-able
+    if (cov != MC_PRESENT) {                             // absent: record + fall coarser
+        mc_cache_miss_mark(v->cache, lod, cz * PER, cy * PER, cx * PER);
+        return 0;
+    }
+    if (mc_cache_contains(v->cache, lod, bz, by, bx)) return 1;   // RAM hit
+    mc_cache_miss_mark(v->cache, lod, bz, by, bx);       // present but uncached -> fill
+    return 0;                                            // fall coarser this frame
 }
 
 mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking) {
     mc_sample_src s = {0};
     s.ud = v; s.aux = lod; s.aux2 = blocking; s.block = vol_block;
+    s.resident = vol_block_resident;
     mc_volume_shape(v, lod, &s.nz, &s.ny, &s.nx);
     return s;
 }
@@ -6999,12 +7085,12 @@ void mc_volume_thaw(mc_volume *v) {
 
     size_t n = mc_cache_misses_drain(v->cache, miss, miss_cap);
 
-    // Collate the whole pipeline's remaining work into the frozen snapshot the
-    // render reads. Done here (thaw = the collator) BEFORE any early-out, and
-    // includes this frame's undrained misses (n): blocks still wanting fill keep
-    // the stream "live" so the tick keeps re-rendering until everything's resident.
+    // Collate (thaw = the collator), BEFORE any early-out. net_inflight is the
+    // real pipeline depth (status bar); work_pending adds this frame's undrained
+    // misses so the render gate keeps ticking until everything's resident.
     int dqn = (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap;
-    v->inflight_snapshot = (uint64_t)(v->rs_n + v->inflight_n + dqn) + (uint64_t)n;
+    v->net_inflight = (uint64_t)(v->rs_n + v->inflight_n + dqn);
+    v->work_pending = v->net_inflight + (uint64_t)n;
 
     if (!n) return;
 
@@ -7026,16 +7112,20 @@ void mc_volume_thaw(mc_volume *v) {
             if (rq != last_rq) { req_push(v, b->lod, cz, cy, cx); last_rq = rq; }
         }
     }
-    // Fill in time-bounded slices; stop once the budget is spent (the rest
-    // re-records next frame). Slices stay coherent because the miss list is in
-    // scan order and mc_cache_update sorts chunk-major internally.
+    // Fill the PRESENT set in ONE mc_cache_update call: it spawns its worker
+    // threads exactly once (the old per-256-slice loop respawned 16 threads per
+    // slice -- ~2-3ms of pure pthread_create/join overhead per tick, dwarfing the
+    // ~0.01ms/block decode). Small fills run single-threaded (threading <~512
+    // blocks costs more in spawn than it saves). No time-slicing: the fill is the
+    // frame's working set, decode is cheap, and the thread overhead was the cost.
     double t0 = mcv_now();
     size_t filled = 0;
-    for (size_t off = 0; off < keep; off += MC_THAW_CHUNK) {
-        size_t cnt = keep - off < MC_THAW_CHUNK ? keep - off : MC_THAW_CHUNK;
-        filled += mc_cache_update(v->cache, miss + off, cnt, 0 /*nthreads=auto*/);
-        if (mcv_now() - t0 >= MC_THAW_BUDGET_MS) break;
-    }
+    // Single-threaded fill. The working set per tick is now small (~hundreds of
+    // blocks after region-granular absent dedup) and decode is ~0.02ms/block, so a
+    // fill is a few ms. mc_cache_update's 16-thread spawn+join (~ms of pthread
+    // overhead per call) is NOT worth it at this size -- it made fills slower.
+    // (A persistent fill pool would beat both; that's the next step.)
+    if (keep) filled = mc_cache_update(v->cache, miss, keep, 1);
     double el = mcv_now() - t0;
     if (el > 2.0) MCVLOG("thaw fill  drained=%zu present=%zu decoded=%zu in %.1fms (%.3fms/blk)",
                          n, keep, filled, el, filled ? el/filled : 0.0);
@@ -7066,7 +7156,8 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     out->cache_cap_blocks = cs.slots;
     out->disk_bytes = v->arc ? mc_archive_data_len(v->arc) : 0;
     out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed);
-    // Frozen snapshot collated at the last thaw (whole-pipeline depth + undrained
-    // misses). The render's streaming gate reads this, never the live IO counters.
-    out->regions_inflight = v->inflight_snapshot;
+    // Frozen snapshots collated at the last thaw. regions_inflight = real pipeline
+    // depth (status bar); work_pending = + undrained misses (render gate).
+    out->regions_inflight = v->net_inflight;
+    out->work_pending = v->work_pending;
 }

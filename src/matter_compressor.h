@@ -525,6 +525,12 @@ struct mc_sample_src {
     int aux, aux2;                        // binding-private (lod, flags, ...)
     const uint8_t *(*block)(const mc_sample_src *src,
                             int bz, int by, int bx, uint8_t *tmp);
+    // Optional CHEAP residency probe: is block (bz,by,bx) in the RAM cache right
+    // now WITHOUT decoding? Used by the LOD-fallback render to decide "sample this
+    // level vs fall coarser" without triggering a fine-level decode-on-render-
+    // thread (the whole point of the fallback). NULL -> resident defaults to
+    // block()!=NULL (which may decode). 1 = resident, 0 = not.
+    int (*resident)(const mc_sample_src *src, int bz, int by, int bx);
     int nz, ny, nx;                       // voxel dims of the sampled level
     // Optional direct path: when set, samplers address voxels straight off
     // this base pointer (voxel (z,y,x) at dense[z*dsy + y*dsx + x]) and
@@ -1009,7 +1015,12 @@ typedef struct {
     uint64_t cache_cap_blocks;           // decoded-block capacity (budget/4096)
     uint64_t disk_bytes;                 // .mca append cursor
     uint64_t net_bytes;                  // bytes pulled from the source
-    uint64_t regions_inflight;           // single-flight depth right now
+    uint64_t regions_inflight;           // real pipeline depth: queued downloads +
+                                         // downloading + decode queue (the user-
+                                         // facing "downloading N"). Stable.
+    uint64_t work_pending;               // regions_inflight + this frame's undrained
+                                         // cache-fill misses; the render gate keys
+                                         // off this. Swings per frame -- NOT for UI.
 } mc_volume_stats;
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
 
