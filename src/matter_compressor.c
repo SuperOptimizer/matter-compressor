@@ -5501,6 +5501,12 @@ static void rstrip_slash(char *s) {
 
 mc_volume *mc_volume_open(const char *url, const char *cache_dir,
                           size_t cache_bytes, float quality) {
+    return mc_volume_open_ex(url, cache_dir, cache_bytes, quality, NULL);
+}
+
+mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
+                             size_t cache_bytes, float quality,
+                             const mc_volume_config *cfg) {
     if (!url || !cache_dir) return NULL;
     mc_volume *v = calloc(1, sizeof *v);
     if (!v) return NULL;
@@ -5565,31 +5571,35 @@ mc_volume *mc_volume_open(const char *url, const char *cache_dir,
     // Deep decode queue so batched downloads run well ahead of the (CPU-bound)
     // decode pool during a navigation — smooths pop-in. Items hold pointers to
     // ~300KB compressed chunks, so 2048 deep is ~600MB worst-case buffered.
-    // MC_DQ_CAP overrides.
-    v->dq_cap = 2048;
-    { const char *e = getenv("MC_DQ_CAP"); if (e) { int n = atoi(e); if (n >= 64 && n <= 16384) v->dq_cap = n; } }
+    v->dq_cap = (cfg && cfg->decode_queue > 0) ? cfg->decode_queue : 2048;
+    if (v->dq_cap < 64) v->dq_cap = 64; if (v->dq_cap > 16384) v->dq_cap = 16384;
     v->dq = calloc((size_t)v->dq_cap, sizeof *v->dq);
-    v->rs_cap = 2048;                                  // LIFO request stack (match queue depth)
+    // LIFO request stack: just 8-byte region keys, so it can be large — a fast
+    // navigation enqueues many thousands of on-screen region misses, and we
+    // don't want to drop ones still in view. 64K keys = 512KB.
+    v->rs_cap = (cfg && cfg->request_stack > 0) ? cfg->request_stack : 65536;
+    if (v->rs_cap < 256) v->rs_cap = 256; if (v->rs_cap > (1<<22)) v->rs_cap = (1<<22);
     v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
 
-    // The c3d/wavelet decode is memory-bandwidth-bound: a 256^3 decode streams
-    // ~16MB of coefficient/output buffers, so threads past ~half the cores
-    // saturate the memory bus and only inflate per-decode latency (measured: 1
-    // thread 103ms, 8 threads 176ms, 16 threads 305ms each — ~same throughput
-    // past 8 but 2x the latency). Cap at nproc/2 so each on-screen region
-    // finishes sooner and the downloaders + UI keep cores. Override: MC_DECODERS.
+    // Decoders default to nproc/2: the c3d/wavelet decode is memory-bandwidth-
+    // bound (a 256^3 decode streams ~16MB), so threads past ~half the cores
+    // saturate the bus and only inflate per-decode latency (measured: 1T 103ms,
+    // 8T 176ms, 16T 305ms — ~same throughput past 8 but 2x the latency). Caller
+    // may override via mc_volume_config; clamp to the fixed pool arrays.
     long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    int nd = nproc > 2 ? (int)(nproc / 2) : 2;
-    if (nd < 2) nd = 2; if (nd > 32) nd = 32;
-    const char *nd_env = getenv("MC_DECODERS");
-    if (nd_env) { int e = atoi(nd_env); if (e >= 1 && e <= 32) nd = e; }
+    int nd = (cfg && cfg->decoders > 0) ? cfg->decoders
+                                        : (nproc > 2 ? (int)(nproc / 2) : 2);
+    if (nd < 1) nd = 1; if (nd > 32) nd = 32;          // decoders[32]
     v->ndecoders = nd;
     for (int i = 0; i < v->ndecoders; ++i)
         pthread_create(&v->decoders[i], NULL, decoder_main, v);
-    v->ndl = 8;                                        // download threads (latency-bound)
+    int ndl = (cfg && cfg->dl_threads > 0) ? cfg->dl_threads : 8;
+    if (ndl < 1) ndl = 1; if (ndl > 16) ndl = 16;      // dlthreads[16]
+    v->ndl = ndl;
     for (int i = 0; i < v->ndl; ++i)
         pthread_create(&v->dlthreads[i], NULL, dl_main, v);
-    MCVLOG("open      %s  decoders=%d dl_threads=%d dq_cap=%d", url, v->ndecoders, v->ndl, v->dq_cap);
+    MCVLOG("open      %s  decoders=%d dl_threads=%d dq_cap=%d rs_cap=%d",
+           url, v->ndecoders, v->ndl, v->dq_cap, v->rs_cap);
     return v;
 }
 

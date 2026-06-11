@@ -798,12 +798,36 @@ extern "C" {
 
 typedef struct mc_volume mc_volume;
 
-// Open a remote volume rooted at `url` (an NGFF multiscales zarr group; levels
-// are its "0","1",... arrays). `cache_dir` holds the local <name>.mca; pass the
-// resident mc_cache budget in `cache_bytes`. `quality` is the local re-encode
-// quality (mc q scale). Returns NULL on failure (unreachable / unparseable).
+// Open a remote (s3/https) OR local (filesystem path) NGFF multiscales zarr
+// rooted at `url`/path; levels are its "0","1",... arrays. `cache_dir` holds the
+// local <name>.mca; `cache_bytes` is the resident mc_cache budget; `quality` is
+// the local re-encode q. Returns NULL on failure. Uses default tuning (see
+// mc_volume_config); call mc_volume_open_ex to tune.
 mc_volume *mc_volume_open(const char *url, const char *cache_dir,
                           size_t cache_bytes, float quality);
+
+// Streaming-pipeline tuning. Any field left 0 takes the built-in default. These
+// size open-time resources (thread pools + queues), so they apply at open only.
+//   decoders     : decode-pool threads. Default nproc/2 (decode is memory-
+//                  bandwidth-bound; more thrashes the bus, see commit history).
+//   dl_threads   : download threads (each drains a batch -> one s3_get_batch).
+//                  Default 8.
+//   decode_queue : depth of the compressed-chunk decode queue (backpressure
+//                  bound). Default 2048 (~600MB of ~300KB chunks worst-case).
+//   request_stack: depth of the LIFO download-request stack (8-byte region
+//                  keys). Default 65536.
+typedef struct {
+    int decoders;
+    int dl_threads;
+    int decode_queue;
+    int request_stack;
+} mc_volume_config;
+
+// As mc_volume_open, with explicit pipeline tuning. `cfg` may be NULL (all
+// defaults). Fields set to 0 also take their default.
+mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
+                             size_t cache_bytes, float quality,
+                             const mc_volume_config *cfg);
 void       mc_volume_free(mc_volume *v);
 
 int  mc_volume_nlods(const mc_volume *v);
