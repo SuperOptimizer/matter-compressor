@@ -2004,8 +2004,6 @@ struct c3d_decoder {
      * indices 1..N-1 are allocated on first parallel decode and reused
      * across chunks.  Arena-style to avoid malloc/free on the hot path. */
     uint8_t *thread_sub_symbols[C3D_OMP_MAX_THREADS];
-
-    bool             denoise_enabled;
 };
 
 c3d_encoder *c3d_encoder_new(void) {
@@ -2061,12 +2059,12 @@ c3d_decoder *c3d_decoder_new(void) {
     c3d_assert(d->coeff_buf && d->sub_symbols);
     memset(d->thread_sub_symbols, 0, sizeof d->thread_sub_symbols);
     d->thread_sub_symbols[0] = d->sub_symbols;
-    d->denoise_enabled = true;
     return d;
 }
+/* c3d_decoder_set_denoise: retained as a no-op for ABI/source compat; the
+ * post-decode denoiser was removed. */
 void c3d_decoder_set_denoise(c3d_decoder *d, bool enabled) {
-    c3d_assert(d);
-    d->denoise_enabled = enabled;
+    (void)d; (void)enabled;
 }
 void c3d_decoder_free(c3d_decoder *d) {
     if (!d) return;
@@ -3121,10 +3119,6 @@ size_t c3d_encoder_chunk_encode_at_q(c3d_encoder *e, const uint8_t *in, float q,
     return c3d_emit_entropy_at_q(q, e, out, out_cap);
 }
 
-/* Forward declaration — defined in §Q2 below but called by the encoder
- * to compute the in-loop denoise alpha stored in header byte 7. */
-static float c3d_denoise_strength(size_t in_len);
-
 /* Public: rate-controlled encode targeting `target_ratio`.
  * Uses log-space bisection on q, capped at 8 iterations.  Last attempt's
  * output is committed (may not be best if didn't converge). */
@@ -3309,20 +3303,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
         total = c3d_emit_entropy_at_q(q, e, out, out_cap);
     }
 
-    /* In-loop denoiser (§Q2 v2): encoder picks the post-decode denoise alpha
-     * and writes it to the chunk header (byte 7).  The decoder reads it
-     * instead of computing from in_len.  For now the encoder uses the same
-     * formula as the old decoder-side auto-alpha; the value is just stored
-     * explicitly so the decoder doesn't have to guess, and future versions
-     * can do per-chunk alpha optimization (self-decode sweep). */
-    {
-        float dn = c3d_denoise_strength(total);
-        const char *dn_env = getenv("C3D_DENOISE_ALPHA");
-        if (dn_env) dn = (float)atof(dn_env);
-        int dv = (int)(dn * 400.0f + 0.5f);
-        if (dv > 255) dv = 255;
-        out[7] = (uint8_t)dv;
-    }
+    out[7] = 0;   /* denoiser removed; header byte 7 (alpha) no longer used */
 
     e->last_q = q;
     e->last_target_ratio = target_ratio;
@@ -3449,173 +3430,10 @@ void c3d_encoder_chunks_encode(c3d_encoder *e,
     }
 }
 
-/* ------------------------------------------------------------------------- *
- *  §Q2  Post-decode denoiser                                                *
- * ------------------------------------------------------------------------- *
- *
- * Separable 3×3×3 box blur blended with the identity at strength α:
- *   out = (1−α)·in + α · mean3( ... ) applied independently on each axis.
- * Three single-pass in-place 1D passes, no extra scratch buffer.  Cumulative
- * smoothing is roughly proportional to α.  Called from the decoder at LOD 0
- * after IDWT, before the u8 denormalise — strength chosen from encoded/input
- * byte ratio so the filter is a no-op at near-lossless and a mild blur at
- * high ratios where quantisation ringing dominates. */
-
-/* §T10: 3-tap 3D denoiser.  Previous implementation maintained l/c/r state
- * across the inner loop iterations, which created a first-order recurrence
- * the auto-vectorizer can't break.  This rewrite uses a single scratch row
- * (X pass) and a scratch plane (Y/Z passes) so each inner loop is a pure
- * unit-stride SIMD-friendly filter with no iteration-carried state.  Clang
- * and GCC both vectorize the inner float loops to 4/8-wide NEON/AVX2. */
-
-static inline void c3d_denoise_blur_x_row(float *restrict row, size_t N,
-                                          float alpha, float *restrict scratch)
-{
-    if (N < 3) return;
-    float one_minus_a = 1.0f - alpha;
-    float third = alpha * (1.0f / 3.0f);
-    memcpy(scratch, row, N * sizeof(float));
-    /* Boundary: replicate endpoints (scratch[0] used as left of row[0],
-     * scratch[N-1] as right of row[N-1]). */
-    row[0] = one_minus_a * scratch[0]
-           + third * (scratch[0] + scratch[0] + scratch[1]);
-    for (size_t i = 1; i + 1 < N; ++i) {
-        row[i] = one_minus_a * scratch[i]
-               + third * (scratch[i - 1] + scratch[i] + scratch[i + 1]);
-    }
-    row[N - 1] = one_minus_a * scratch[N - 1]
-               + third * (scratch[N - 2] + scratch[N - 1] + scratch[N - 1]);
-}
-
-/* Generic "blur one axis" pass.  Treats `buf` as a 3D array of side³ with
- * strides (SZ, SY, 1) in (z, y, x) order.  Blurs along `axis` in {0=Z, 1=Y, 2=X}
- * using a 3-tap [1, 1, 1] / 3 kernel weighted by alpha: out = (1-α)·c + (α/3)·(l+c+r),
- * with edge replication at boundaries.
- *
- * Implementation: for each (slice, row) of the two non-axis dimensions, read
- * three adjacent rows/columns, write one filtered output row/column into
- * scratch_plane, then copy scratch_plane back.  Inner loop is always unit-stride
- * on the innermost axis, so vectorization works even on Y/Z passes. */
-static void c3d_denoise_axis(float *restrict buf, size_t side,
-                             unsigned axis, float alpha,
-                             float *restrict scratch_plane,
-                             float *restrict scratch_row)
-{
-    (void)scratch_plane; (void)scratch_row;   /* per-thread now */
-    const size_t SY = C3D_STRIDE_Y;
-    const size_t SZ = C3D_STRIDE_Z;
-    const float one_minus_a = 1.0f - alpha;
-    const float third = alpha * (1.0f / 3.0f);
-
-    if (axis == 2u) {
-        /* X pass: each (z,y) row is independent.  One per-thread row scratch. */
-        #pragma omp parallel
-        {
-            float row_scratch[256];
-            #pragma omp for schedule(static)
-            for (size_t z = 0; z < side; ++z)
-            for (size_t y = 0; y < side; ++y)
-                c3d_denoise_blur_x_row(&buf[z * SZ + y * SY], side, alpha,
-                                       row_scratch);
-        }
-        return;
-    }
-
-    /* Y pass: each z-slice is independent.  Per-thread plane scratch. */
-    if (axis == 1u) {
-        #pragma omp parallel
-        {
-            float plane_scratch[256 * 256];
-            #pragma omp for schedule(static)
-            for (size_t z = 0; z < side; ++z) {
-                float *plane = buf + z * SZ;
-                for (size_t y = 0; y < side; ++y) {
-                    size_t y_l = (y > 0) ? y - 1 : y;
-                    size_t y_r = (y + 1 < side) ? y + 1 : y;
-                    const float *rl = plane + y_l * SY;
-                    const float *rc = plane + y   * SY;
-                    const float *rr = plane + y_r * SY;
-                    float *out = plane_scratch + y * side;
-                    for (size_t x = 0; x < side; ++x) {
-                        out[x] = one_minus_a * rc[x]
-                               + third * (rl[x] + rc[x] + rr[x]);
-                    }
-                }
-                for (size_t y = 0; y < side; ++y) {
-                    memcpy(plane + y * SY, plane_scratch + y * side,
-                           side * sizeof(float));
-                }
-            }
-        }
-        return;
-    }
-
-    /* Z pass: each y-slab is independent.  Per-thread scratch. */
-    if (axis == 0u) {
-        #pragma omp parallel
-        {
-            float plane_scratch[256 * 256];
-            #pragma omp for schedule(static)
-            for (size_t y = 0; y < side; ++y) {
-                for (size_t z = 0; z < side; ++z) {
-                    size_t z_l = (z > 0) ? z - 1 : z;
-                    size_t z_r = (z + 1 < side) ? z + 1 : z;
-                    const float *rl = buf + z_l * SZ + y * SY;
-                    const float *rc = buf + z   * SZ + y * SY;
-                    const float *rr = buf + z_r * SZ + y * SY;
-                    float *out = plane_scratch + z * side;
-                    for (size_t x = 0; x < side; ++x) {
-                        out[x] = one_minus_a * rc[x]
-                               + third * (rl[x] + rc[x] + rr[x]);
-                    }
-                }
-                for (size_t z = 0; z < side; ++z) {
-                    memcpy(buf + z * SZ + y * SY, plane_scratch + z * side,
-                           side * sizeof(float));
-                }
-            }
-        }
-        return;
-    }
-}
-
-static void c3d_denoise_3d(float *buf, size_t side, float alpha)
-{
-    if (alpha <= 0.0f || side < 3) return;
-    /* Scratch: one plane (side²) for Y/Z passes, one row (side) for X pass.
-     * At side=256 that's 256 KiB + 1 KiB on the stack.  Fits within a
-     * typical 8 MiB pthread stack comfortably; for smaller LODs it's <<1 KiB. */
-    float scratch_plane[256 * 256];
-    float scratch_row[256];
-    c3d_assert(side <= 256);
-    c3d_denoise_axis(buf, side, 2, alpha, scratch_plane, scratch_row); /* X */
-    c3d_denoise_axis(buf, side, 1, alpha, scratch_plane, scratch_row); /* Y */
-    c3d_denoise_axis(buf, side, 0, alpha, scratch_plane, scratch_row); /* Z */
-}
-
-/* Denoiser strength as a piecewise function of achieved ratio.
- * Re-calibrated after R-D allocator + dz=0.55 + softness=0.60 + T1c
- * spatial sign + T2a α clamp landed.  The sweet spot grows much
- * faster with ratio than the old curve assumed:
- *   r=5:    α=0 (denoise hurts near-lossless)
- *   r=10:   α=0.04 (+0.07 dB)
- *   r=25:   α=0.05 (+0.02 dB)
- *   r=50:   α=0.07 (+0.03 dB)
- *   r=100:  α=0.22 (+0.08 dB)
- *   r=200:  α=0.35 (+0.12 dB)
- * Sharp bump above r≈70 because at high ratios the wavelet noise
- * floor (sentinel-zeroed coefficients reconstructing to dz_half×sign
- * artifacts in the spatial domain) becomes the dominant error term —
- * a wide denoise blur smooths it out cheaply. */
-static float c3d_denoise_strength(size_t in_len)
-{
-    double ratio = (double)C3D_VOXELS_PER_CHUNK / (double)in_len;
-    if (ratio <=   8.0) return 0.0f;
-    if (ratio <=  30.0) return 0.05f;
-    if (ratio <=  70.0) return 0.08f;
-    if (ratio <= 150.0) return 0.22f;
-    return 0.35f;
-}
+/* The post-decode denoiser (§Q2/§T10) was removed: a separable 3-tap blur run
+ * at LOD0 after IDWT. It cost ~14% of decode CPU for ~0.03-0.12 dB and is not
+ * used by the render path (mc disabled it). Header byte 7 (the encoder's alpha)
+ * is now ignored on decode and written as 0 on encode. */
 
 /* ------------------------------------------------------------------------- *
  *  §I  Chunk decoder                                                        *
@@ -3860,20 +3678,6 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
 
     unsigned n_synth = C3D_N_DWT_LEVELS - lod;
     c3d_dwt3_inv_levels(d->coeff_buf, n_synth, d->dwt_scratch);
-
-    /* Q2 post-decode denoiser at LOD 0 only.  In-loop: read the encoder-
-     * chosen alpha from header byte 7.  If zero (old-format or encode_at_q
-     * which doesn't set it), fall back to the ratio-based heuristic.
-     * Opt-out via C3D_DENOISE=0 for bench comparisons, or per-decoder via
-     * c3d_decoder_set_denoise(d, false) for throughput-first callers. */
-    if (lod == 0 && d->denoise_enabled) {
-        uint8_t hdr_dn = in[7];
-        float denoise_alpha = hdr_dn ? ((float)hdr_dn / 400.0f)
-                                     : c3d_denoise_strength(in_len);
-        const char *env = getenv("C3D_DENOISE");
-        if (env && env[0] == '0') denoise_alpha = 0.0f;
-        c3d_denoise_3d(d->coeff_buf, C3D_CHUNK_SIDE, denoise_alpha);
-    }
 
     /* Encoder v2: coeff_scale is already absorbed into per-subband step, so
      * dequant produces raw-magnitude coefficients.  coeff_scale in the header
