@@ -2642,14 +2642,39 @@ mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
 }
 void mc_cache_set_policy(mc_cache *c, mc_cache_policy p){ if(c) c->policy=(int)p; }
 
+// free a shard's lookup/eviction tables (NOT its mutex, NOT the shared arena).
+static void shard_free_tables(shard_t *sh){
+    free(sh->map_key); free(sh->map_slot); free(sh->slot_key); free(sh->slot_ref);
+    free(sh->fs); free(sh->fm); free(sh->gfp); free(sh->gset); free(sh->slot_inmain);
+    free(sh->slot_epoch);
+}
+
+// (re)allocate a shard's tables for `per` slots pointing at `arena_slice`.
+// Resets the shard to empty. Mutex assumed already init'd + held during resize.
+static void shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per){
+    sh->nslot=per; sh->hand=0; sh->used=0;
+    sh->arena=arena_slice;
+    sh->map_cap=pow2_at_least(per*2);
+    sh->map_key=calloc(sh->map_cap,8);
+    sh->map_slot=calloc(sh->map_cap,4);
+    sh->slot_key=calloc(per,8);
+    sh->slot_ref=calloc(per,1);
+    sh->fs_cap=per+1; sh->fm_cap=per+1;
+    sh->fs=malloc(4u*sh->fs_cap); sh->fm=malloc(4u*sh->fm_cap);
+    sh->fs_head=sh->fs_tail=sh->fm_head=sh->fm_tail=0;
+    sh->g_cap=per; sh->gfp=calloc(sh->g_cap,4);
+    sh->gset_cap=pow2_at_least(per*2); sh->gset=malloc(4u*sh->gset_cap);
+    memset(sh->gset,0xFF,4u*sh->gset_cap);
+    sh->slot_inmain=calloc(per,1);
+    sh->slot_epoch=calloc(per,4);
+}
+
 void mc_cache_free(mc_cache *c){
     if(!c) return;
     for(int s=0;s<NSHARD;++s){
         shard_t *sh=&c->sh[s];
         pthread_mutex_destroy(&sh->mu);
-        free(sh->map_key); free(sh->map_slot); free(sh->slot_key); free(sh->slot_ref);
-        free(sh->fs); free(sh->fm); free(sh->gfp); free(sh->gset); free(sh->slot_inmain);
-        free(sh->slot_epoch);
+        shard_free_tables(sh);
     }
 #if MC_CACHE_MMAP
     munmap(c->arena_base,c->arena_bytes);
@@ -2658,6 +2683,59 @@ void mc_cache_free(mc_cache *c){
 #endif
     pthread_mutex_destroy(&c->rd_mu);
     free(c);
+}
+
+// ---- runtime budget control -------------------------------------------------
+// Live-resize the decoded-block cache to `new_bytes`. The cache is just a cache,
+// so resizing DISCARDS resident blocks (re-decode on demand) rather than
+// migrating them. Locks every shard for the swap. Returns the byte budget
+// actually installed (rounded to whole slots over NSHARD), or 0 on failure.
+size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
+    if(!c) return 0;
+    size_t nslot_total = new_bytes/BLK_BYTES; if(nslot_total<NSHARD) nslot_total=NSHARD;
+    uint32_t per = (uint32_t)(nslot_total/NSHARD); if(per<1)per=1;
+    size_t new_arena = (size_t)per*NSHARD*BLK_BYTES;
+#if MC_CACHE_MMAP
+    void *na = mmap(NULL,new_arena,PROT_READ|PROT_WRITE,
+                    MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    if(na==MAP_FAILED) return 0;
+#else
+    void *na = malloc(new_arena);
+    if(!na) return 0;
+#endif
+    for(int s=0;s<NSHARD;++s) pthread_mutex_lock(&c->sh[s].mu);
+    for(int s=0;s<NSHARD;++s){
+        shard_free_tables(&c->sh[s]);
+        shard_init_tables(&c->sh[s], (mc_u8*)na + (size_t)s*per*BLK_BYTES, per);
+    }
+    void *old = c->arena_base; size_t old_bytes = c->arena_bytes;
+    c->arena_base = na; c->arena_bytes = new_arena;
+    atomic_fetch_add(&c->epoch,1);   // invalidate outstanding pins
+    for(int s=0;s<NSHARD;++s) pthread_mutex_unlock(&c->sh[s].mu);
+#if MC_CACHE_MMAP
+    munmap(old,old_bytes);
+#else
+    free(old);
+#endif
+    return new_arena;
+}
+
+size_t mc_cache_capacity_bytes(const mc_cache *c){ return c ? c->arena_bytes : 0; }
+
+size_t mc_cache_used_bytes(mc_cache *c){
+    if(!c) return 0;
+    size_t used=0;
+    for(int s=0;s<NSHARD;++s){
+        pthread_mutex_lock(&c->sh[s].mu);
+        used += (size_t)c->sh[s].used;
+        pthread_mutex_unlock(&c->sh[s].mu);
+    }
+    return used*BLK_BYTES;
+}
+
+double mc_cache_usage_fraction(mc_cache *c){
+    if(!c||c->arena_bytes==0) return 0.0;
+    return (double)mc_cache_used_bytes(c)/(double)c->arena_bytes;
 }
 
 // ---- shard map ops (shard lock held) ----
@@ -5571,6 +5649,10 @@ void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int 
             }
 }
 
+size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes) {
+    return (v && v->cache) ? mc_cache_resize(v->cache, bytes) : 0;
+}
+
 void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud) {
     v->ready_cb = cb;
     v->ready_ud = ud;
@@ -5581,6 +5663,8 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     if (v->cache) mc_cache_get_stats(v->cache, &cs);
     out->cache_hits = cs.hits;
     out->cache_misses = cs.misses;
+    out->cache_used_blocks = cs.used;
+    out->cache_cap_blocks = cs.slots;
     out->disk_bytes = v->arc ? mc_archive_data_len(v->arc) : 0;
     out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed);
     out->regions_inflight = (uint64_t)v->rs_n;

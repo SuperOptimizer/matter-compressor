@@ -424,6 +424,15 @@ void mc_cache_clear(mc_cache *c);
 typedef struct { uint64_t hits, misses, evictions; size_t slots, used; } mc_cache_stats;
 void mc_cache_get_stats(mc_cache *c, mc_cache_stats *out);
 
+// ---- runtime budget control ----
+// Resize the decoded-block cache budget live. DISCARDS resident blocks (a cache
+// loses nothing; they re-decode on demand). Returns the installed byte budget
+// (rounded to whole slots over the shards), or 0 on alloc failure (unchanged).
+size_t mc_cache_resize(mc_cache *c, size_t new_bytes);
+size_t mc_cache_capacity_bytes(const mc_cache *c);   // installed budget
+size_t mc_cache_used_bytes(mc_cache *c);             // resident decoded bytes
+double mc_cache_usage_fraction(mc_cache *c);         // used/cap in [0,1]
+
 // ---- ready-made source bindings ----
 struct mc_archive; struct mc_reader;
 // Bind to a local archive handle (lock-free concurrent decode).
@@ -791,11 +800,17 @@ mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking);
 
 typedef struct {
     uint64_t cache_hits, cache_misses;   // mc_cache residency
+    uint64_t cache_used_blocks;          // decoded 16^3 blocks resident now
+    uint64_t cache_cap_blocks;           // decoded-block capacity (budget/4096)
     uint64_t disk_bytes;                 // .mca append cursor
     uint64_t net_bytes;                  // bytes pulled from the source
     uint64_t regions_inflight;           // single-flight depth right now
 } mc_volume_stats;
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
+
+// Live-resize the decoded-block RAM cache (bytes). Discards resident blocks;
+// they re-decode on demand. Returns the installed budget, or 0 on failure.
+size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes);
 
 #ifdef __cplusplus
 }
