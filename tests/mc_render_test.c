@@ -316,6 +316,70 @@ int main(void) {
     }
     printf("3d resampling OK\n");
 
+    // ---- MC_COMP_STDDEV + MC_COMP_SHADED --------------------------------
+    {
+        // 64^3 scene: a flat slab (papyrus) with a dense wall poking through
+        // it (occluder). Slab z in [28,36) = 180; wall z in [16,30),
+        // x in [30,36), all y = 220.
+        enum { SN = 64, SW = 64, SH = 64 };
+        uint8_t *sv = calloc((size_t)SN * SN * SN, 1);
+        for (int z = 0; z < SN; z++)
+            for (int y = 0; y < SN; y++)
+                for (int x = 0; x < SN; x++) {
+                    uint8_t v = 0;
+                    if (z >= 28 && z < 36) v = 180;
+                    if (z >= 16 && z < 30 && x >= 30 && x < 36) v = 220;
+                    sv[((size_t)z * SN + y) * SN + x] = v;
+                }
+        mc_sample_src ssrc = mc_sample_src_dense(sv, SN, SN, SN);
+        uint8_t simg[SW * SH], simg2[SW * SH];
+        mc_plane sp = { .origin = {32, 32, 32}, .normal = {1, 0, 0},
+                        .u = {0, 0, 1}, .v = {0, 1, 0} };
+
+        // stddev: ray inside the uniform slab -> 0; ray spanning the
+        // slab/air boundary -> strong texture energy
+        mc_render_params sd = { .filter = MC_FILTER_TRILINEAR,
+                                .comp = MC_COMP_STDDEV,
+                                .t0 = -2, .t1 = 2, .dt = 1 };
+        CHECK(mc_render_plane(&ssrc, &sp, SW, SH, 1.0f, &sd, simg, 1) == 0);
+        CHECK(simg[32 * SW + 50] == 0);
+        sd.t0 = -8; sd.t1 = 8;
+        CHECK(mc_render_plane(&ssrc, &sp, SW, SH, 1.0f, &sd, simg, 1) == 0);
+        CHECK(simg[32 * SW + 50] > 50);
+
+        // shaded, top-down view (rays march +z from above the slab)
+        mc_plane tp = { .origin = {20, 32, 32}, .normal = {1, 0, 0},
+                        .u = {0, 0, 1}, .v = {0, 1, 0} };
+        mc_render_params sh = { .filter = MC_FILTER_TRILINEAR,
+                                .comp = MC_COMP_SHADED,
+                                .t0 = 0, .t1 = 20, .dt = 1 };
+        // defaults (headlight, no shadows): slab renders non-trivially
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg, 1) == 0);
+        CHECK(simg[32 * SW + 50] > 30);
+        // parallel == serial
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg2, 0) == 0);
+        CHECK(memcmp(simg, simg2, sizeof simg) == 0);
+
+        // raking light from up-and-+x; the slab's top face has the same
+        // geometry at x=24 (behind the wall, light-wise) and x=50 (open).
+        // Without shadow rays the two pixels match; with them the wall
+        // shadows x=24.
+        sh.light[0] = -1; sh.light[1] = 0; sh.light[2] = 1;
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg, 1) == 0);
+        int open0 = simg[32 * SW + 50], dark0 = simg[32 * SW + 24];
+        CHECK(abs(open0 - dark0) <= 3);
+        sh.shadow = 1.0f;
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg, 1) == 0);
+        int open1 = simg[32 * SW + 50], dark1 = simg[32 * SW + 24];
+        CHECK(open1 > dark1 + 10);
+        // translucency adds back some light in the shadowed region
+        sh.sss = 0.5f;
+        CHECK(mc_render_plane(&ssrc, &tp, SW, SH, 1.0f, &sh, simg, 1) == 0);
+        CHECK(simg[32 * SW + 24] >= dark1);
+        free(sv);
+    }
+    printf("stddev + shaded OK\n");
+
     mc_sampler_free(s);
     free(grid); free(pa); free(pb); free(ca); free(cb); free(dec); free(vol);
     printf(fails ? "mc_render_test: %d FAILED\n" : "mc_render_test: OK\n", fails);
