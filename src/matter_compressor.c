@@ -5090,8 +5090,9 @@ typedef struct {
 } level_t;
 
 struct mc_volume {
-    s3_client *s3;
-    char root[1024];           // s3://bucket/root (no trailing slash)
+    s3_client *s3;             // NULL for a local-filesystem source
+    int local;                 // 1 => root is a local dir, read via file_read
+    char root[1024];           // s3://bucket/root, or /local/dir (no trailing slash)
     int nlods;
     level_t lv[MAXLOD];
     mc_archive *arc;           // ONE archive, all LODs
@@ -5164,6 +5165,36 @@ static int s3_read(void *ud, const char *key, uint64_t off, uint64_t len,
     atomic_fetch_add_explicit(&lv->vol->net_bytes, n, memory_order_relaxed);
     *out = buf;
     *out_len = n;
+    return 0;
+}
+
+// Local-filesystem source: mirror of s3_read but reads "<prefix>/<key>" from
+// disk. Same contract: return 0 with *out=NULL on a missing key (so the level
+// probe / air detection behaves like a 404), <0 on real I/O error, 0 with a
+// malloc'd buffer otherwise. `off`/`len` honor ranged reads (footer/index).
+static int file_read(void *ud, const char *key, uint64_t off, uint64_t len,
+                     uint8_t **out, size_t *out_len) {
+    level_t *lv = ud;
+    char path[1280];
+    snprintf(path, sizeof path, "%s/%s", lv->prefix, key);
+    *out = NULL; *out_len = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;                              // missing key == 404
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long fsz = ftell(f);
+    if (fsz < 0) { fclose(f); return -1; }
+    uint64_t start = off;
+    uint64_t want  = (len == 0) ? (uint64_t)fsz : len;
+    if (start > (uint64_t)fsz) { fclose(f); return 0; }      // past EOF
+    if (start + want > (uint64_t)fsz) want = (uint64_t)fsz - start;
+    if (fseek(f, (long)start, SEEK_SET) != 0) { fclose(f); return -1; }
+    uint8_t *buf = malloc(want ? want : 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t got = want ? fread(buf, 1, want, f) : 0;
+    fclose(f);
+    if (got != want) { free(buf); return -1; }
+    atomic_fetch_add_explicit(&lv->vol->net_bytes, got, memory_order_relaxed);
+    *out = buf; *out_len = got;
     return 0;
 }
 
@@ -5370,13 +5401,19 @@ mc_volume *mc_volume_open(const char *url, const char *cache_dir,
     pthread_mutex_init(&v->mu, NULL);
     pthread_cond_init(&v->cv, NULL);
 
-    // s3 client: full credential resolution (profile/IMDS/SSO/env), else anonymous.
-    s3_config cfg = {0};
-    s3_credentials creds = {0};
-    if (s3_credentials_load(NULL, &creds) == S3_OK) cfg.creds = creds;
-    v->s3 = s3_client_new(&cfg);
-    s3_credentials_free(&creds);
-    if (!v->s3) { free(v); return NULL; }
+    // Local vs remote: a URL with a "scheme://" is remote (s3/https), otherwise
+    // `url` is a local filesystem directory read via file_read (no S3 client).
+    v->local = (strstr(url, "://") == NULL);
+    if (!v->local) {
+        // s3 client: full credential resolution (profile/IMDS/SSO/env), else anonymous.
+        s3_config cfg = {0};
+        s3_credentials creds = {0};
+        if (s3_credentials_load(NULL, &creds) == S3_OK) cfg.creds = creds;
+        v->s3 = s3_client_new(&cfg);
+        s3_credentials_free(&creds);
+        if (!v->s3) { free(v); return NULL; }
+    }
+    mc_zarr_read_fn read_cb = v->local ? file_read : s3_read;
 
     snprintf(v->root, sizeof v->root, "%s", url);
     rstrip_slash(v->root);
@@ -5386,12 +5423,12 @@ mc_volume *mc_volume_open(const char *url, const char *cache_dir,
         level_t *lv = &v->lv[i];
         lv->vol = v;
         snprintf(lv->prefix, sizeof lv->prefix, "%s/%d", v->root, i);
-        mc_zarr *z = mc_zarr_open(s3_read, lv);
+        mc_zarr *z = mc_zarr_open(read_cb, lv);
         if (!z) { lv->prefix[0] = 0; break; }
         lv->z = z;
         v->nlods = i + 1;
     }
-    if (v->nlods == 0) { s3_client_free(v->s3); free(v); return NULL; }
+    if (v->nlods == 0) { if (v->s3) s3_client_free(v->s3); free(v); return NULL; }
 
     // local .mca dims from LOD0 shape (padded to 256 internally by mc).
     int nz, ny, nx;
@@ -5583,7 +5620,24 @@ void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
         if (nq == 0) continue;
         memset(resp, 0, sizeof resp);
         double tb = mcv_now();
-        s3_get_batch(v->s3, reqs, (size_t)nq, 32, resp);   // partial ok; check each
+        if (v->local) {
+            // Local: each req is a ranged read of the shard file. No network, no
+            // batching win — just pread each range into an s3_response so the
+            // decode-push path below is identical to the remote case.
+            FILE *lf = fopen(shard_url, "rb");
+            for (int i = 0; i < nq; ++i) {
+                if (!lf) { resp[i].status = 404; continue; }
+                if (fseek(lf, (long)reqs[i].offset, SEEK_SET) != 0) { resp[i].status = 500; continue; }
+                uint8_t *b = malloc(reqs[i].length ? reqs[i].length : 1);
+                if (!b) { resp[i].status = 500; continue; }
+                size_t g = reqs[i].length ? fread(b, 1, reqs[i].length, lf) : 0;
+                if (g != reqs[i].length) { free(b); resp[i].status = 500; continue; }
+                resp[i].status = 200; resp[i].body = b; resp[i].body_len = g;
+            }
+            if (lf) fclose(lf);
+        } else {
+            s3_get_batch(v->s3, reqs, (size_t)nq, 32, resp);   // partial ok; check each
+        }
         { int ok = 0; uint64_t bytes = 0;
           for (int i = 0; i < nq; ++i) if (s3_response_ok(&resp[i])) { ok++; bytes += resp[i].body_len; }
           MCVLOG("batch#%d  lod%d nq=%d ok=%d %.2fMB in %.0fms = %.1f MB/s",
