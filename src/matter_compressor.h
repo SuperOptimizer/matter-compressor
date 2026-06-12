@@ -302,6 +302,10 @@ mc_reader *mc_open(const uint8_t *arc, size_t len);       // in-memory / mmap'd 
 void       mc_close(mc_reader *r);
 void       mc_reader_set_quality(mc_reader *r, float q);  // must match the build quality to decode
 uint64_t   mc_chunk_offset(mc_reader *r, int lod, int cz,int cy,int cx);  // 0 = empty
+// As mc_chunk_offset but sets *err=1 when a streaming node-table read FAILED
+// (network) -- ret 0 + *err 0 means confirmed-absent. Callers that map 0 to
+// permanent air MUST use this or transient errors poison regions as ZERO.
+uint64_t   mc_chunk_offset_chk(mc_reader *r, int lod, int cz,int cy,int cx, int *err);
 void       mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst);
 
 // ---- streaming read side: open an archive WITHOUT holding it whole in memory ----

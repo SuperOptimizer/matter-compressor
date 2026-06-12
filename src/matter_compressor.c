@@ -2687,12 +2687,12 @@ static const u8 *sfetch_node(mc_reader *r, uint64_t off){
     r->ntab_off[slot]=off;
     return r->ntab[slot];
 }
-static uint64_t sresolve_chunk(mc_reader *r,int lod,int cz,int cy,int cx){
+static uint64_t sresolve_chunk(mc_reader *r,int lod,int cz,int cy,int cx,int *err){
     uint64_t node = r->roots[lod];
     for(int nib=MC_TREE_LEVELS-1; nib>=0; --nib){
-        if(!node) return 0;
+        if(!node) return 0;                       // genuinely absent (air)
         const u8 *tbl=sfetch_node(r,node);
-        if(!tbl) return 0;
+        if(!tbl){ if(err)*err=1; return 0; }      // FETCH FAILED -- not absent!
         int idx=(mc_nib(cz,nib)*16+mc_nib(cy,nib))*16+mc_nib(cx,nib);
         uint64_t child; memcpy(&child,tbl+(size_t)idx*8,8);
         node=child;
@@ -2700,10 +2700,21 @@ static uint64_t sresolve_chunk(mc_reader *r,int lod,int cz,int cy,int cx){
     return node;
 }
 
+// As mc_chunk_offset, but distinguishes "resolved to absent" (ret 0, *err 0)
+// from "node-table read FAILED" (ret 0, *err 1). A streaming caller that maps
+// offset 0 to permanent air MUST use this: a transient network error (expired
+// creds, timeout) otherwise poisons the region as ZERO forever.
+uint64_t mc_chunk_offset_chk(mc_reader *r,int lod,int cz,int cy,int cx,int *err){
+    if(err)*err=0;
+    if(!r||lod<0||lod>7) return 0;
+    if(r->arc) return mc_resolve_chunk(r->arc,r->roots[lod],cz,cy,cx);  // flat: no I/O
+    return sresolve_chunk(r,lod,cz,cy,cx,err);
+}
+
 uint64_t mc_chunk_offset(mc_reader *r,int lod,int cz,int cy,int cx){
     if(lod<0||lod>7) return 0;
     if(r->arc) return mc_resolve_chunk(r->arc,r->roots[lod],cz,cy,cx);
-    return sresolve_chunk(r,lod,cz,cy,cx);
+    return sresolve_chunk(r,lod,cz,cy,cx,NULL);
 }
 
 // streaming: ensure the whole chunk blob at chunk_off is cached in r->cbuf, return ptr.
@@ -6563,8 +6574,10 @@ enum { DL_BATCH = 64 };   // per-batch regions; streaming GETs run this deep
 // source path and the fallback for a header window too small to parse).
 static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx) {
     if (mc_archive_chunk_coverage(v->arc, lod, rz, ry, rx) != MC_ABSENT) return;  // already have it
-    uint64_t off = mc_chunk_offset(v->rd, lod, rz, ry, rx);
-    if (off == 0) {                                    // remote air -> local ZERO region
+    int rerr = 0;
+    uint64_t off = mc_chunk_offset_chk(v->rd, lod, rz, ry, rx, &rerr);
+    if (rerr) return;                                  // transient: leave ABSENT, retry
+    if (off == 0) {                                    // CONFIRMED air -> local ZERO region
         mc_archive_append_chunk_raw(v->arc, lod, rz, ry, rx, zero256());
         return;
     }
@@ -6615,8 +6628,10 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
     for (int i = 0; i < m; ++i) {
         if (mc_archive_chunk_coverage(v->arc, lods[i], rz[i], ry[i], rx[i]) != MC_ABSENT)
             continue;                                          // already resident
-        uint64_t o = mc_chunk_offset(v->rd, lods[i], rz[i], ry[i], rx[i]);
-        if (o == 0) {                                          // air -> ZERO region
+        int rerr = 0;
+        uint64_t o = mc_chunk_offset_chk(v->rd, lods[i], rz[i], ry[i], rx[i], &rerr);
+        if (rerr) continue;                                    // transient: leave ABSENT, retry
+        if (o == 0) {                                          // CONFIRMED air -> ZERO region
             mc_archive_append_chunk_raw(v->arc, lods[i], rz[i], ry[i], rx[i], zero256());
             continue;
         }
