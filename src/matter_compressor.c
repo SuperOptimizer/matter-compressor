@@ -3616,7 +3616,58 @@ static inline float mc_s_trilinear(mc_sampler *s, float z, float y, float x) {
         float c1 = c10 + (c11 - c10) * dy;
         return c0 + (c1 - c0) * dz;
     }
-    // slow path: block/bounds handled per corner (edges mix with 0)
+    // in-bounds cell that straddles a block face (the hot fallback: ~18% of
+    // uniform samples, every 16th step along an axis): fetch each DISTINCT
+    // block once -- 2 for a face straddle (the common case), 4 edge, 8 corner
+    // -- instead of 8 per-corner mc_s_block lookups (whose 1-entry last-block
+    // cache thrashes between the two blocks).
+    if (!s->src.dense &&
+        (unsigned)z0 < (unsigned)(s->src.nz - 1) &&
+        (unsigned)y0 < (unsigned)(s->src.ny - 1) &&
+        (unsigned)x0 < (unsigned)(s->src.nx - 1)) {
+        const int sz = (z0 & 15) == 15, sy = (y0 & 15) == 15, sx = (x0 & 15) == 15;
+        const int bz = z0 >> 4, by = y0 >> 4, bx = x0 >> 4;
+        // B[a][b][c] = block holding corner (z0+a, y0+b, x0+c); reuse pointers
+        // along non-straddling axes so each distinct block is fetched once.
+        const uint8_t *B[2][2][2];
+        B[0][0][0] = mc_s_block(s, bz, by, bx);
+        B[0][0][1] = sx ? mc_s_block(s, bz, by, bx + 1) : B[0][0][0];
+        B[0][1][0] = sy ? mc_s_block(s, bz, by + 1, bx) : B[0][0][0];
+        B[0][1][1] = sy ? (sx ? mc_s_block(s, bz, by + 1, bx + 1) : B[0][1][0])
+                        : B[0][0][1];
+        if (sz) {
+            B[1][0][0] = mc_s_block(s, bz + 1, by, bx);
+            B[1][0][1] = sx ? mc_s_block(s, bz + 1, by, bx + 1) : B[1][0][0];
+            B[1][1][0] = sy ? mc_s_block(s, bz + 1, by + 1, bx) : B[1][0][0];
+            B[1][1][1] = sy ? (sx ? mc_s_block(s, bz + 1, by + 1, bx + 1) : B[1][1][0])
+                            : B[1][0][1];
+        } else {
+            B[1][0][0] = B[0][0][0]; B[1][0][1] = B[0][0][1];
+            B[1][1][0] = B[0][1][0]; B[1][1][1] = B[0][1][1];
+        }
+        const int oz0 = (z0 & 15) << 8, oz1 = ((z0 + 1) & 15) << 8;
+        const int oy0 = (y0 & 15) << 4, oy1 = ((y0 + 1) & 15) << 4;
+        const int ox0 = x0 & 15,        ox1 = (x0 + 1) & 15;
+        #define MC_S_C(a, b, c, oz, oy, ox) \
+            (B[a][b][c] ? (float)B[a][b][c][(oz) | (oy) | (ox)] : 0.0f)
+        float c000 = MC_S_C(0, 0, 0, oz0, oy0, ox0);
+        float c001 = MC_S_C(0, 0, 1, oz0, oy0, ox1);
+        float c010 = MC_S_C(0, 1, 0, oz0, oy1, ox0);
+        float c011 = MC_S_C(0, 1, 1, oz0, oy1, ox1);
+        float c100 = MC_S_C(1, 0, 0, oz1, oy0, ox0);
+        float c101 = MC_S_C(1, 0, 1, oz1, oy0, ox1);
+        float c110 = MC_S_C(1, 1, 0, oz1, oy1, ox0);
+        float c111 = MC_S_C(1, 1, 1, oz1, oy1, ox1);
+        #undef MC_S_C
+        float c00 = c000 + (c001 - c000) * dx;
+        float c01 = c010 + (c011 - c010) * dx;
+        float c10 = c100 + (c101 - c100) * dx;
+        float c11 = c110 + (c111 - c110) * dx;
+        float c0 = c00 + (c01 - c00) * dy;
+        float c1 = c10 + (c11 - c10) * dy;
+        return c0 + (c1 - c0) * dz;
+    }
+    // slow path (volume edge / dense edge): block/bounds handled per corner
     float c000 = mc_s_voxel(s, z0, y0, x0);
     float c001 = mc_s_voxel(s, z0, y0, x0 + 1);
     float c010 = mc_s_voxel(s, z0, y0 + 1, x0);
@@ -3634,9 +3685,16 @@ static inline float mc_s_trilinear(mc_sampler *s, float z, float y, float x) {
     return c0 + (c1 - c0) * dz;
 }
 
+// NaN test that survives -ffast-math (where compilers delete x!=x and isnan):
+// sign-cleared bits above the +inf pattern <=> exponent all-ones, mantissa != 0.
+static inline int mc_s_isnan(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    return (u & 0x7FFFFFFFu) > 0x7F800000u;
+}
+
 static inline float mc_s_sample(mc_sampler *s, float z, float y, float x,
                                 mc_filter f) {
-    if (!(z == z) || !(y == y) || !(x == x)) return 0.0f;   // NaN
+    if (mc_s_isnan(z) || mc_s_isnan(y) || mc_s_isnan(x)) return 0.0f;
     return f == MC_FILTER_NEAREST ? mc_s_nearest(s, z, y, x)
                                   : mc_s_trilinear(s, z, y, x);
 }
@@ -4096,7 +4154,7 @@ void mc_lod_sampler_reset(mc_lod_sampler *s) {
 float mc_lod_sample(mc_lod_sampler *s, int lod, int lod_fallback,
                     float z, float y, float x, mc_filter f) {
     if (!s) return 0.0f;
-    if (!(z == z) || !(y == y) || !(x == x)) return 0.0f;   // NaN
+    if (mc_s_isnan(z) || mc_s_isnan(y) || mc_s_isnan(x)) return 0.0f;
     if (lod < 0) lod = 0;
     // L0 -> requested level: c_L = (c_0 + 0.5) * 2^-lod - 0.5
     if (lod > 0) {
@@ -6269,6 +6327,7 @@ struct mc_volume {
     //    term swings 0..thousands per frame, so it must NOT leak into the status bar.
     uint64_t net_inflight;
     uint64_t work_pending;
+    uint64_t change_gen;       // bumped at THAW when the fill changed cache content
     // Per-stage breakdown of net_inflight (same THAW-collated snapshot pattern):
     // download stack / on-the-wire / decode-queue wait / active decode->encode->
     // append (+ the staging RAM the decode queue holds). Append itself is a
@@ -7627,6 +7686,7 @@ void mc_volume_thaw(mc_volume *v) {
     // overhead per call) is NOT worth it at this size -- it made fills slower.
     // (A persistent fill pool would beat both; that's the next step.)
     if (keep) filled = mc_cache_update(v->cache, miss, keep, 1);
+    if (filled) v->change_gen++;                       // pixels can differ now
     double el = mcv_now() - t0;
     if (el > 2.0) MCVLOG("thaw fill  drained=%zu present=%zu decoded=%zu in %.1fms (%.3fms/blk)",
                          n, keep, filled, el, filled ? el/filled : 0.0);
@@ -7641,6 +7701,17 @@ size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes) {
     size_t installed = v->dq_byte_budget;
     pthread_mutex_unlock(&v->mu);
     return installed;
+}
+
+// Monotonic render generation: changes whenever a frozen render could produce
+// different pixels -- a THAW cache fill (change_gen) or a coverage publish
+// (archive gen, bumped on every chunk/air append). Equal gens across two frames
+// with an unchanged camera => provably identical frame; the caller may skip it.
+uint64_t mc_volume_render_gen(const mc_volume *v) {
+    if (!v) return 0;
+    uint64_t g = 1 + v->change_gen;
+    if (v->arc) g += atomic_load_explicit(&v->arc->gen, memory_order_acquire);
+    return g;
 }
 
 void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud) {

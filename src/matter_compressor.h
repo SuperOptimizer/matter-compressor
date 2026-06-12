@@ -1082,6 +1082,11 @@ typedef struct {
 } mc_volume_stats;
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
 
+// Monotonic render generation: changes whenever a frozen render could produce
+// different pixels (a THAW cache fill, or a chunk/air publish to the archive).
+// Same gen + same camera across two ticks => provably identical frame (skip it).
+uint64_t mc_volume_render_gen(const mc_volume *v);
+
 // Live-resize the decoded-block RAM cache (bytes). Discards resident blocks;
 // they re-decode on demand. Returns the installed budget, or 0 on failure.
 size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes);
