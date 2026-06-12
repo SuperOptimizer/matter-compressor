@@ -6281,6 +6281,8 @@ static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int
 static int  inflight_has(mc_volume *v, uint64_t key);   // single-flight (v->mu held)
 static void inflight_add(mc_volume *v, uint64_t key);
 static void inflight_del(mc_volume *v, uint64_t key);
+static void vol_mark_region(mc_volume *v, int lod, int cz, int cy, int cx);
+#define MC_RGEN_SLOTS (1u << 16)   // per-region change-gen table (512KB)
 
 // portable thread naming: macOS names the calling thread (1 arg), glibc
 // takes (thread, name)
@@ -6398,6 +6400,12 @@ struct mc_volume {
     uint64_t net_inflight;
     uint64_t work_pending;
     uint64_t change_gen;       // bumped at THAW when the fill changed cache content
+    // Per-REGION change gens (direct-map, no stored keys): slot = hash(region).
+    // Writers (decode pool / dl thread / THAW) store the current render gen;
+    // collisions only make an unrelated region look changed (a harmless extra
+    // render, never a missed one). Lets a viewer skip the streaming re-render
+    // when nothing in ITS viewport changed -- the gate was volume-global before.
+    _Atomic uint64_t *rgen;
     // Per-stage breakdown of net_inflight (same THAW-collated snapshot pattern):
     // download stack / on-the-wire / decode-queue wait / active decode->encode->
     // append (+ the staging RAM the decode queue holds). Append itself is a
@@ -6537,6 +6545,7 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
     }
     if (it->nsub == 0) {                               // all air -> ZERO
         mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, zero256());
+        vol_mark_region(v, it->lod, it->rz, it->ry, it->rx);
         pthread_mutex_lock(&v->mu); inflight_del(v, key); pthread_mutex_unlock(&v->mu);
         return;
     }
@@ -6558,6 +6567,7 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
     }
     double t_enc0 = mcv_now();
     mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, dense);
+    vol_mark_region(v, it->lod, it->rz, it->ry, it->rx);
     double t_end = mcv_now();
     MCVLOG("decoded   lod%d region(%d,%d,%d) codec=%s decode=%.0fms encode=%.0fms",
            it->lod, it->rz, it->ry, it->rx, codec,
@@ -6716,6 +6726,7 @@ static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx
     if (rerr) return;                                  // transient: leave ABSENT, retry
     if (off == 0) {                                    // CONFIRMED air -> local ZERO region
         mc_archive_append_chunk_raw(v->arc, lod, rz, ry, rx, zero256());
+        vol_mark_region(v, lod, rz, ry, rx);
         return;
     }
     uint64_t blen = mc_reader_chunk_blob_len(v->rd, off);
@@ -6725,6 +6736,7 @@ static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx
     if (mc_reader_read_blob(v->rd, off, (size_t)blen, blob) != 0) { free(blob); return; }
     atomic_fetch_add_explicit(&v->net_bytes, blen, memory_order_relaxed);
     mc_archive_append_chunk_compressed(v->arc, lod, rz, ry, rx, blob, (size_t)blen);
+    vol_mark_region(v, lod, rz, ry, rx);
     free(blob);
 }
 
@@ -6770,6 +6782,7 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
         if (rerr) continue;                                    // transient: leave ABSENT, retry
         if (o == 0) {                                          // CONFIRMED air -> ZERO region
             mc_archive_append_chunk_raw(v->arc, lods[i], rz[i], ry[i], rx[i], zero256());
+            vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);
             continue;
         }
         off[i] = o; act[na++] = i;
@@ -6844,6 +6857,7 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
             if (bl <= avail) {                                 // whole blob in the run
                 mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
                                                    runr[r].body + rel, (size_t)bl);
+                vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);
             } else {                                           // run-edge tail: one follow-up GET
                 s3_response tail = {0};
                 if (s3_get_range(v->s3mca->cl, v->s3mca->url, off[i] + avail, bl - avail,
@@ -6856,6 +6870,7 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
                         memcpy(blob + avail, tail.body, (size_t)(bl - avail));
                         mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
                                                            blob, (size_t)bl);
+                        vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);
                         free(blob);
                     }
                 }
@@ -7102,6 +7117,7 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     int sc = 1; while (sc < v->rs_cap * 2) sc <<= 1;
     v->rs_set_mask = sc - 1;
     v->rs_set = calloc((size_t)sc, sizeof *v->rs_set);
+    v->rgen = calloc(MC_RGEN_SLOTS, sizeof *v->rgen);
 
     // Decoders default to nproc/2: the c3d/wavelet decode is memory-bandwidth-
     // bound (a 256^3 decode streams ~16MB), so threads past ~half the cores
@@ -7240,6 +7256,7 @@ mc_volume *mc_volume_open_streaming(const char *url, const char *cache_dir,
     int sc = 1; while (sc < v->rs_cap * 2) sc <<= 1;
     v->rs_set_mask = sc - 1;
     v->rs_set = calloc((size_t)sc, sizeof *v->rs_set);
+    v->rgen = calloc(MC_RGEN_SLOTS, sizeof *v->rgen);
     // ONE download thread: the source reader (cbuf + node-table cache + codec ctx)
     // is non-reentrant, so a single owner avoids any sharing. Chunks are large and
     // partial-fetch is efficient; this runs off the UI thread, which is the point.
@@ -7267,6 +7284,7 @@ void mc_volume_free(mc_volume *v) {
         else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
         free(v->reqstk);
         free(v->rs_set);
+        free((void *)v->rgen);
         free(v->inflight);
         pthread_mutex_destroy(&v->mu);
         pthread_cond_destroy(&v->cv);
@@ -7297,6 +7315,7 @@ void mc_volume_free(mc_volume *v) {
     free(v->dq);
     free(v->reqstk);
     free(v->rs_set);
+    free((void *)v->rgen);
     free(v->inflight);
     pthread_mutex_destroy(&v->mu);
     pthread_cond_destroy(&v->cv);
@@ -7756,7 +7775,15 @@ void mc_volume_thaw(mc_volume *v) {
     // overhead per call) is NOT worth it at this size -- it made fills slower.
     // (A persistent fill pool would beat both; that's the next step.)
     if (keep) filled = mc_cache_update(v->cache, miss, keep, 1);
-    if (filled) v->change_gen++;                       // pixels can differ now
+    if (filled) {
+        v->change_gen++;                               // pixels can differ now
+        uint64_t last_mk = ~0ull;                      // mark filled regions (dedup'd
+        for (size_t i = 0; i < keep; ++i) {            // superset: errs toward render)
+            int cz = miss[i].bz / PER, cy = miss[i].by / PER, cx = miss[i].bx / PER;
+            uint64_t rk = rkey(miss[i].lod, cz, cy, cx);
+            if (rk != last_mk) { vol_mark_region(v, miss[i].lod, cz, cy, cx); last_mk = rk; }
+        }
+    }
     double el = mcv_now() - t0;
     if (el > 2.0) MCVLOG("thaw fill  drained=%zu present=%zu decoded=%zu in %.1fms (%.3fms/blk)",
                          n, keep, filled, el, filled ? el/filled : 0.0);
@@ -7782,6 +7809,26 @@ uint64_t mc_volume_render_gen(const mc_volume *v) {
     uint64_t g = 1 + v->change_gen;
     if (v->arc) g += atomic_load_explicit(&v->arc->gen, memory_order_acquire);
     return g;
+}
+
+static inline uint32_t rgen_slot(int lod, int cz, int cy, int cx) {
+    uint64_t key = mc_covkey(lod, cz, cy, cx);
+    return (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 48) & (MC_RGEN_SLOTS - 1);
+}
+// Mark a region changed at the CURRENT render gen (call AFTER the publish/fill
+// bumped it). Racing writers both store >= the prior value; last-writer-wins.
+static void vol_mark_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    if (!v->rgen) return;
+    atomic_store_explicit(&v->rgen[rgen_slot(lod, cz, cy, cx)],
+                          mc_volume_render_gen(v), memory_order_release);
+}
+// Last change gen of ONE region (0 = never changed). A viewer takes the max
+// over its predicted working set; if that's <= the gen of its last frame and
+// the camera is unchanged, the frame is provably identical for THAT viewport.
+uint64_t mc_volume_region_gen(const mc_volume *v, int lod, int cz, int cy, int cx) {
+    if (!v || !v->rgen) return 0;
+    return atomic_load_explicit(&v->rgen[rgen_slot(lod, cz, cy, cx)],
+                                memory_order_acquire);
 }
 
 void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud) {

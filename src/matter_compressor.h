@@ -1087,6 +1087,14 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
 // Same gen + same camera across two ticks => provably identical frame (skip it).
 uint64_t mc_volume_render_gen(const mc_volume *v);
 
+// Last change gen of ONE 256^3 region (0 = never changed). Direct-map table
+// without stored keys: a hash collision only makes an unrelated region look
+// changed (harmless extra render, never a missed one). A viewer takes the max
+// over its predicted working set -- if that's unchanged and the camera is too,
+// the frame is provably identical for THAT viewport (the volume-global gen
+// forces all viewers to re-render when a batch lands anywhere).
+uint64_t mc_volume_region_gen(const mc_volume *v, int lod, int cz, int cy, int cx);
+
 // Live-resize the decoded-block RAM cache (bytes). Discards resident blocks;
 // they re-decode on demand. Returns the installed budget, or 0 on failure.
 size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes);
