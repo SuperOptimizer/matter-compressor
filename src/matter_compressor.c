@@ -6268,6 +6268,9 @@ struct mc_volume {
     //    term swings 0..thousands per frame, so it must NOT leak into the status bar.
     uint64_t net_inflight;
     uint64_t work_pending;
+    // Per-stage breakdown of net_inflight (same THAW-collated snapshot pattern):
+    // stack-queued / on-the-wire / decode+re-encode+append backlog (+ its RAM).
+    uint64_t snap_queued, snap_downloading, snap_encoding, snap_staging_bytes;
 };
 
 // One unit of decode work: the sub^3 cube of source chunks covering one 256^3
@@ -7575,6 +7578,12 @@ void mc_volume_thaw(mc_volume *v) {
     int dqn = v->dq_cap ? (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap : 0;   // 0 in streaming
     v->net_inflight = (uint64_t)(v->rs_n + v->inflight_n + dqn);
     v->work_pending = v->net_inflight + (uint64_t)n;
+    // Per-stage split. inflight covers claim -> append, so regions sitting in the
+    // decode queue are still inflight; "downloading" = the claimed-minus-queued rest.
+    v->snap_queued = (uint64_t)v->rs_n;
+    v->snap_encoding = (uint64_t)dqn;
+    v->snap_downloading = v->inflight_n > dqn ? (uint64_t)(v->inflight_n - dqn) : 0;
+    v->snap_staging_bytes = v->dq_bytes;
 
     if (!n) return;
 
@@ -7647,4 +7656,8 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     // depth (status bar); work_pending = + undrained misses (render gate).
     out->regions_inflight = v->net_inflight;
     out->work_pending = v->work_pending;
+    out->regions_queued = v->snap_queued;
+    out->regions_downloading = v->snap_downloading;
+    out->regions_encoding = v->snap_encoding;
+    out->staging_bytes = v->snap_staging_bytes;
 }

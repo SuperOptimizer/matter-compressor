@@ -1068,6 +1068,15 @@ typedef struct {
     uint64_t work_pending;               // regions_inflight + this frame's undrained
                                          // cache-fill misses; the render gate keys
                                          // off this. Swings per frame -- NOT for UI.
+    // Per-stage pipeline depths (frozen snapshots, collated at THAW like
+    // regions_inflight; their sum equals it). All in 256^3 regions.
+    uint64_t regions_queued;             // waiting in the LIFO download stack
+    uint64_t regions_downloading;        // claimed by a download thread (on the wire)
+    uint64_t regions_encoding;           // downloaded; waiting for / in decode ->
+                                         // re-encode -> archive append (0 streaming:
+                                         // verbatim copy appends on the dl thread)
+    uint64_t staging_bytes;              // compressed bytes parked in the decode
+                                         // queue (the RAM the encode backlog holds)
 } mc_volume_stats;
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
 
