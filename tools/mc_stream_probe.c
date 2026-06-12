@@ -48,6 +48,33 @@ int main(int argc, char **argv) {
     printf("stats: used_blocks=%llu net_bytes=%llu\n",
            (unsigned long long)st.cache_used_blocks,
            (unsigned long long)st.net_bytes);
+
+    // throughput: flood-request a NxNxN box of L0 regions around the center and
+    // time until all are covered (the batched verbatim-copy path under load).
+    {
+        const int N = 5, half = N / 2;                  // 125 regions
+        int rz0 = (z0 / 2) / 256, ry0 = (y0 / 2) / 256, rx0 = (x0 / 2) / 256;
+        uint64_t bytes0 = st.net_bytes;
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int dz = -half; dz <= half; ++dz)
+        for (int dy = -half; dy <= half; ++dy)
+        for (int dx = -half; dx <= half; ++dx)
+            mc_volume_request_region(v, 0, rz0 + dz, ry0 + dy, rx0 + dx);
+        int done = 0;
+        for (int it = 0; it < 2400 && !done; ++it) {    // up to 2 min
+            mc_volume_freeze(v); mc_volume_thaw(v);     // keep the pipeline ticking
+            mc_volume_get_stats(v, &st);
+            done = (st.regions_inflight == 0);
+            struct timespec ts = {0, 50 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+        }
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        mc_volume_get_stats(v, &st);
+        double mb = (st.net_bytes - bytes0) / 1048576.0;
+        printf("flood: %d regions, %.1fMB in %.1fs = %.1f MB/s (inflight=%llu)\n",
+               N * N * N, mb, sec, mb / sec, (unsigned long long)st.regions_inflight);
+    }
     mc_volume_free(v);
     printf("DONE\n");
     return 0;
