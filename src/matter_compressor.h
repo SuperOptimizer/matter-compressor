@@ -1069,14 +1069,16 @@ typedef struct {
                                          // cache-fill misses; the render gate keys
                                          // off this. Swings per frame -- NOT for UI.
     // Per-stage pipeline depths (frozen snapshots, collated at THAW like
-    // regions_inflight; their sum equals it). All in 256^3 regions.
+    // regions_inflight; their sum equals it). All in 256^3 regions. The archive
+    // append is a synchronous memcpy into the mmap -- there is no archive queue.
     uint64_t regions_queued;             // waiting in the LIFO download stack
     uint64_t regions_downloading;        // claimed by a download thread (on the wire)
-    uint64_t regions_encoding;           // downloaded; waiting for / in decode ->
-                                         // re-encode -> archive append (0 streaming:
-                                         // verbatim copy appends on the dl thread)
+    uint64_t regions_decode_queued;      // downloaded; waiting for a decode worker
+    uint64_t regions_encoding;           // actively inside decode -> re-encode ->
+                                         // append on a worker (0 streaming: verbatim
+                                         // copy appends on the dl thread)
     uint64_t staging_bytes;              // compressed bytes parked in the decode
-                                         // queue (the RAM the encode backlog holds)
+                                         // queue (the RAM that backlog holds)
 } mc_volume_stats;
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
 

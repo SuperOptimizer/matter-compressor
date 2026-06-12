@@ -6232,6 +6232,7 @@ struct mc_volume {
     pthread_cond_t dq_ne;      // not-empty (wake a decoder)
     pthread_cond_t dq_nf;      // not-full  (wake a blocked producer)
     int stop;
+    _Atomic int dec_active;    // items currently inside decode->re-encode->append
 
     // Interactive download-request stack (LIFO): a render miss / prefetch pushes
     // "fetch region R". Download threads pop the NEWEST (current view) first; when
@@ -6269,8 +6270,10 @@ struct mc_volume {
     uint64_t net_inflight;
     uint64_t work_pending;
     // Per-stage breakdown of net_inflight (same THAW-collated snapshot pattern):
-    // stack-queued / on-the-wire / decode+re-encode+append backlog (+ its RAM).
-    uint64_t snap_queued, snap_downloading, snap_encoding, snap_staging_bytes;
+    // download stack / on-the-wire / decode-queue wait / active decode->encode->
+    // append (+ the staging RAM the decode queue holds). Append itself is a
+    // synchronous memcpy into the mmap -- there is no archive queue.
+    uint64_t snap_queued, snap_downloading, snap_decq, snap_encoding, snap_staging_bytes;
 };
 
 // One unit of decode work: the sub^3 cube of source chunks covering one 256^3
@@ -6458,7 +6461,9 @@ static void *decoder_main(void *ud) {
         v->dq_bytes -= decode_item_bytes(&it);         // free staging budget
         pthread_cond_signal(&v->dq_nf);                // wake a blocked producer
         pthread_mutex_unlock(&v->mu);
+        atomic_fetch_add_explicit(&v->dec_active, 1, memory_order_relaxed);
         decode_one(v, dec, &it);
+        atomic_fetch_sub_explicit(&v->dec_active, 1, memory_order_relaxed);
         if (v->ready_cb) v->ready_cb(v->ready_ud);     // region became serveable
     }
     if (dec) c3d_decoder_free(dec);
@@ -7578,11 +7583,14 @@ void mc_volume_thaw(mc_volume *v) {
     int dqn = v->dq_cap ? (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap : 0;   // 0 in streaming
     v->net_inflight = (uint64_t)(v->rs_n + v->inflight_n + dqn);
     v->work_pending = v->net_inflight + (uint64_t)n;
-    // Per-stage split. inflight covers claim -> append, so regions sitting in the
-    // decode queue are still inflight; "downloading" = the claimed-minus-queued rest.
+    // Per-stage split. inflight covers claim -> append: on the wire + waiting in
+    // the decode queue + actively inside decode->re-encode->append on a worker.
+    int act = (int)atomic_load_explicit(&v->dec_active, memory_order_relaxed);
     v->snap_queued = (uint64_t)v->rs_n;
-    v->snap_encoding = (uint64_t)dqn;
-    v->snap_downloading = v->inflight_n > dqn ? (uint64_t)(v->inflight_n - dqn) : 0;
+    v->snap_decq = (uint64_t)dqn;
+    v->snap_encoding = (uint64_t)act;
+    int dl = v->inflight_n - dqn - act;
+    v->snap_downloading = dl > 0 ? (uint64_t)dl : 0;
     v->snap_staging_bytes = v->dq_bytes;
 
     if (!n) return;
@@ -7658,6 +7666,7 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     out->work_pending = v->work_pending;
     out->regions_queued = v->snap_queued;
     out->regions_downloading = v->snap_downloading;
+    out->regions_decode_queued = v->snap_decq;
     out->regions_encoding = v->snap_encoding;
     out->staging_bytes = v->snap_staging_bytes;
 }
