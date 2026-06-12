@@ -3708,6 +3708,11 @@ static inline float mc_s_sample(mc_sampler *s, float z, float y, float x,
                                   : mc_s_trilinear(s, z, y, x);
 }
 
+// All-zero block for masked SIMD lanes: a straddling lane points here during
+// the group gather (its lerp result is overwritten scalar after), and an
+// absent-block lane's lerp over zeros IS its correct value (samples as 0).
+__attribute__((unused)) static const uint8_t mc_s_zero4k[4096];   // unused in no-SIMD builds
+
 // ---------------------------------------------------------------------------
 // 4-wide trilinear (ray-step batching for the compositors)
 // ---------------------------------------------------------------------------
@@ -3883,40 +3888,36 @@ static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
                 sy, sx, dz, dy, dx));
             return;
         }
-        // blocked: every lane's 8 corners must sit inside one block
-        uint32x4_t in15 = vmvnq_u32(vorrq_u32(vorrq_u32(
-            vceqq_s32(vandq_s32(zi, vdupq_n_s32(15)), vdupq_n_s32(15)),
-            vceqq_s32(vandq_s32(yi, vdupq_n_s32(15)), vdupq_n_s32(15))),
-            vceqq_s32(vandq_s32(xi, vdupq_n_s32(15)), vdupq_n_s32(15))));
-        if (vminvq_u32(in15) != 0) {
-            int32_t z0[4], y0[4], x0[4];
-            vst1q_s32(z0, zi); vst1q_s32(y0, yi); vst1q_s32(x0, xi);
-            const uint8_t *b[4];
-            int allb = 1;
-            for (int k = 0; k < 4; k++) {
-                const uint8_t *bk =
-                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
-                if (!bk) { allb = 0; break; }
-                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
-                             (x0[k] & 15));
-            }
-            if (allb) {
-                vst1q_f32(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
-                                            256, 16, dz, dy, dx));
-                return;
-            }
-        }
-        // Per-lane with the state already in hand (no refloor / rebounds):
-        // interior lanes one block fetch + scalar lerp, straddlers the
-        // dedup'd-block path (see the SSE comment).
+        // Masked group (see mc_s_tri8): one SIMD lerp for everyone; absent ->
+        // zero block (correct as-is), straddlers -> zero block + scalar fixup.
         {
             int32_t z0[4], y0[4], x0[4];
             vst1q_s32(z0, zi); vst1q_s32(y0, yi); vst1q_s32(x0, xi);
-            float dzs[4], dys[4], dxs[4];
-            vst1q_f32(dzs, dz); vst1q_f32(dys, dy); vst1q_f32(dxs, dx);
-            for (int k = 0; k < 4; k++)
-                out[k] = mc_s_cell(s, z0[k], y0[k], x0[k],
-                                   dzs[k], dys[k], dxs[k]);
+            const uint8_t *b[4];
+            unsigned strad = 0;
+            for (int k = 0; k < 4; k++) {
+                if ((z0[k] & 15) == 15 || (y0[k] & 15) == 15 ||
+                    (x0[k] & 15) == 15) {
+                    strad |= 1u << k;
+                    b[k] = mc_s_zero4k;
+                    continue;
+                }
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                b[k] = bk ? bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                                  (x0[k] & 15))
+                          : mc_s_zero4k;
+            }
+            vst1q_f32(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
+                                        256, 16, dz, dy, dx));
+            if (strad) {
+                float dzs[4], dys[4], dxs[4];
+                vst1q_f32(dzs, dz); vst1q_f32(dys, dy); vst1q_f32(dxs, dx);
+                for (int k = 0; k < 4; k++)
+                    if (strad & (1u << k))
+                        out[k] = mc_s_cell_straddle(s, z0[k], y0[k], x0[k],
+                                                    dzs[k], dys[k], dxs[k]);
+            }
         }
         return;
     }
@@ -3954,36 +3955,34 @@ static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
                 sy, sx, dz, dy, dx));
             return;
         }
-        int in15 = 1;
-        for (int k = 0; k < 4; k++)
-            in15 &= (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
-                    (x0[k] & 15) != 15;
-        if (in15) {
-            const uint8_t *b[4];
-            int allb = 1;
-            for (int k = 0; k < 4; k++) {
-                const uint8_t *bk =
-                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
-                if (!bk) { allb = 0; break; }
-                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
-                             (x0[k] & 15));
+        // Masked group (see mc_s_tri8): one SIMD lerp for everyone; absent ->
+        // zero block (correct as-is), straddlers -> zero block + scalar fixup.
+        const uint8_t *b[4];
+        unsigned strad = 0;
+        for (int k = 0; k < 4; k++) {
+            if ((z0[k] & 15) == 15 || (y0[k] & 15) == 15 || (x0[k] & 15) == 15) {
+                strad |= 1u << k;
+                b[k] = mc_s_zero4k;
+                continue;
             }
-            if (allb) {
-                _mm_storeu_ps(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
-                                                256, 16, dz, dy, dx));
-                return;
-            }
+            const uint8_t *bk =
+                mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+            b[k] = bk ? bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                              (x0[k] & 15))
+                      : mc_s_zero4k;
         }
-        // Per-lane with the state already in hand (no refloor / rebounds):
-        // interior lanes one block fetch + scalar lerp, straddlers the
-        // dedup'd-block path. The old fallback re-ran the FULL scalar sampler
-        // for all 4 lanes when one lane straddled.
-        float dzs[4], dys[4], dxs[4];
-        _mm_storeu_ps(dzs, dz);
-        _mm_storeu_ps(dys, dy);
-        _mm_storeu_ps(dxs, dx);
-        for (int k = 0; k < 4; k++)
-            out[k] = mc_s_cell(s, z0[k], y0[k], x0[k], dzs[k], dys[k], dxs[k]);
+        _mm_storeu_ps(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
+                                        256, 16, dz, dy, dx));
+        if (strad) {
+            float dzs[4], dys[4], dxs[4];
+            _mm_storeu_ps(dzs, dz);
+            _mm_storeu_ps(dys, dy);
+            _mm_storeu_ps(dxs, dx);
+            for (int k = 0; k < 4; k++)
+                if (strad & (1u << k))
+                    out[k] = mc_s_cell_straddle(s, z0[k], y0[k], x0[k],
+                                                dzs[k], dys[k], dxs[k]);
+        }
         return;
     }
 #endif
@@ -4028,33 +4027,36 @@ static inline void mc_s_tri8(mc_sampler *s, const float *pz, const float *py,
             _mm256_storeu_ps(out, mc_s_lerp8x8(b, sy, sx, dz, dy, dx));
             return;
         }
-        int fast = 1;
-        for (int k = 0; k < 8 && fast; k++)
-            fast = (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
-                   (x0[k] & 15) != 15;
-        if (fast) {
-            for (int k = 0; k < 8 && fast; k++) {
-                const uint8_t *bk =
-                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
-                if (!bk) { fast = 0; break; }
-                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
-                             (x0[k] & 15));
+        // Masked group: every lane goes through ONE SIMD gather+lerp. Interior
+        // lanes use their real block pointer (absent block -> the zero block,
+        // whose lerp IS the correct 0). Straddling lanes also point at the zero
+        // block for the gather and are overwritten scalar after -- so a group
+        // with one straddler costs one SIMD lerp + one scalar cell, not 8
+        // scalar cells (the old all-or-nothing fallback).
+        unsigned strad = 0;
+        for (int k = 0; k < 8; k++) {
+            if ((z0[k] & 15) == 15 || (y0[k] & 15) == 15 || (x0[k] & 15) == 15) {
+                strad |= 1u << k;
+                b[k] = mc_s_zero4k;
+                continue;
             }
-            if (fast) {
-                _mm256_storeu_ps(out, mc_s_lerp8x8(b, 256, 16, dz, dy, dx));
-                return;
-            }
+            const uint8_t *bk =
+                mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+            b[k] = bk ? bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                              (x0[k] & 15))
+                      : mc_s_zero4k;
         }
-        // Per-lane with the state already in hand (no refloor / rebounds /
-        // requalify): interior lanes do one block fetch + scalar lerp;
-        // straddlers take the dedup'd-block path. The old fallback re-ran the
-        // FULL scalar sampler for all 8 lanes when one lane straddled.
-        float dzs[8], dys[8], dxs[8];
-        _mm256_storeu_ps(dzs, dz);
-        _mm256_storeu_ps(dys, dy);
-        _mm256_storeu_ps(dxs, dx);
-        for (int k = 0; k < 8; k++)
-            out[k] = mc_s_cell(s, z0[k], y0[k], x0[k], dzs[k], dys[k], dxs[k]);
+        _mm256_storeu_ps(out, mc_s_lerp8x8(b, 256, 16, dz, dy, dx));
+        if (strad) {
+            float dzs[8], dys[8], dxs[8];
+            _mm256_storeu_ps(dzs, dz);
+            _mm256_storeu_ps(dys, dy);
+            _mm256_storeu_ps(dxs, dx);
+            for (int k = 0; k < 8; k++)
+                if (strad & (1u << k))
+                    out[k] = mc_s_cell_straddle(s, z0[k], y0[k], x0[k],
+                                                dzs[k], dys[k], dxs[k]);
+        }
         return;
     }
     mc_s_tri4(s, pz, py, px, out);
