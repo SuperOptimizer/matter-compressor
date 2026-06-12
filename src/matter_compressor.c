@@ -3602,6 +3602,30 @@ static inline float mc_s_cell_straddle(mc_sampler *s, int z0, int y0, int x0,
                                        float dz, float dy, float dx) {
     const int sz = (z0 & 15) == 15, sy = (y0 & 15) == 15, sx = (x0 & 15) == 15;
     const int bz = z0 >> 4, by = y0 >> 4, bx = x0 >> 4;
+    // Single-axis x straddle: the dominant case on scanlines (consecutive lanes
+    // walk x). Two block fetches, column x=15 of B and column x=0 of B+1 --
+    // no 8-pointer dedup table.
+    if (sx && !sy && !sz) {
+        const uint8_t *b0 = mc_s_block(s, bz, by, bx);
+        const uint8_t *b1 = mc_s_block(s, bz, by, bx + 1);
+        const int o00 = ((z0 & 15) << 8) | ((y0 & 15) << 4);
+        const int o01 = o00 + 16, o10 = o00 + 256, o11 = o00 + 272;
+        float c000 = b0 ? (float)b0[o00 | 15] : 0.0f;
+        float c001 = b1 ? (float)b1[o00]      : 0.0f;
+        float c010 = b0 ? (float)b0[o01 | 15] : 0.0f;
+        float c011 = b1 ? (float)b1[o01]      : 0.0f;
+        float c100 = b0 ? (float)b0[o10 | 15] : 0.0f;
+        float c101 = b1 ? (float)b1[o10]      : 0.0f;
+        float c110 = b0 ? (float)b0[o11 | 15] : 0.0f;
+        float c111 = b1 ? (float)b1[o11]      : 0.0f;
+        float c00 = c000 + (c001 - c000) * dx;
+        float c01 = c010 + (c011 - c010) * dx;
+        float c10 = c100 + (c101 - c100) * dx;
+        float c11 = c110 + (c111 - c110) * dx;
+        float c0 = c00 + (c01 - c00) * dy;
+        float c1 = c10 + (c11 - c10) * dy;
+        return c0 + (c1 - c0) * dz;
+    }
     // B[a][b][c] = block holding corner (z0+a, y0+b, x0+c); reuse pointers
     // along non-straddling axes so each distinct block is fetched once.
     const uint8_t *B[2][2][2];
