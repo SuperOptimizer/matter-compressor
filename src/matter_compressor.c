@@ -3579,6 +3579,78 @@ static inline float mc_s_nearest(mc_sampler *s, float z, float y, float x) {
                       (int)floorf(x + 0.5f));
 }
 
+// Interior cell: all 8 corners inside ONE block; caller verified bounds and
+// no-straddle. Ints + fractions precomputed (no refloor / rebounds).
+static inline float mc_s_cell_in(mc_sampler *s, int z0, int y0, int x0,
+                                 float dz, float dy, float dx) {
+    const uint8_t *b = mc_s_block(s, z0 >> 4, y0 >> 4, x0 >> 4);
+    if (!b) return 0.0f;
+    const uint8_t *p = b + (((z0 & 15) << 8) | ((y0 & 15) << 4) | (x0 & 15));
+    float c00 = (float)p[0]   + ((float)p[1]   - (float)p[0])   * dx;
+    float c01 = (float)p[16]  + ((float)p[17]  - (float)p[16])  * dx;
+    float c10 = (float)p[256] + ((float)p[257] - (float)p[256]) * dx;
+    float c11 = (float)p[272] + ((float)p[273] - (float)p[272]) * dx;
+    float c0 = c00 + (c01 - c00) * dy;
+    float c1 = c10 + (c11 - c10) * dy;
+    return c0 + (c1 - c0) * dz;
+}
+
+// Straddling cell: crosses >=1 block face (caller verified bounds). Fetch each
+// DISTINCT block once -- 2 for a face straddle (the common case), 4 edge, 8
+// corner -- instead of 8 per-corner lookups.
+static inline float mc_s_cell_straddle(mc_sampler *s, int z0, int y0, int x0,
+                                       float dz, float dy, float dx) {
+    const int sz = (z0 & 15) == 15, sy = (y0 & 15) == 15, sx = (x0 & 15) == 15;
+    const int bz = z0 >> 4, by = y0 >> 4, bx = x0 >> 4;
+    // B[a][b][c] = block holding corner (z0+a, y0+b, x0+c); reuse pointers
+    // along non-straddling axes so each distinct block is fetched once.
+    const uint8_t *B[2][2][2];
+    B[0][0][0] = mc_s_block(s, bz, by, bx);
+    B[0][0][1] = sx ? mc_s_block(s, bz, by, bx + 1) : B[0][0][0];
+    B[0][1][0] = sy ? mc_s_block(s, bz, by + 1, bx) : B[0][0][0];
+    B[0][1][1] = sy ? (sx ? mc_s_block(s, bz, by + 1, bx + 1) : B[0][1][0])
+                    : B[0][0][1];
+    if (sz) {
+        B[1][0][0] = mc_s_block(s, bz + 1, by, bx);
+        B[1][0][1] = sx ? mc_s_block(s, bz + 1, by, bx + 1) : B[1][0][0];
+        B[1][1][0] = sy ? mc_s_block(s, bz + 1, by + 1, bx) : B[1][0][0];
+        B[1][1][1] = sy ? (sx ? mc_s_block(s, bz + 1, by + 1, bx + 1) : B[1][1][0])
+                        : B[1][0][1];
+    } else {
+        B[1][0][0] = B[0][0][0]; B[1][0][1] = B[0][0][1];
+        B[1][1][0] = B[0][1][0]; B[1][1][1] = B[0][1][1];
+    }
+    const int oz0 = (z0 & 15) << 8, oz1 = ((z0 + 1) & 15) << 8;
+    const int oy0 = (y0 & 15) << 4, oy1 = ((y0 + 1) & 15) << 4;
+    const int ox0 = x0 & 15,        ox1 = (x0 + 1) & 15;
+    #define MC_S_C(a, b, c, oz, oy, ox) \
+        (B[a][b][c] ? (float)B[a][b][c][(oz) | (oy) | (ox)] : 0.0f)
+    float c000 = MC_S_C(0, 0, 0, oz0, oy0, ox0);
+    float c001 = MC_S_C(0, 0, 1, oz0, oy0, ox1);
+    float c010 = MC_S_C(0, 1, 0, oz0, oy1, ox0);
+    float c011 = MC_S_C(0, 1, 1, oz0, oy1, ox1);
+    float c100 = MC_S_C(1, 0, 0, oz1, oy0, ox0);
+    float c101 = MC_S_C(1, 0, 1, oz1, oy0, ox1);
+    float c110 = MC_S_C(1, 1, 0, oz1, oy1, ox0);
+    float c111 = MC_S_C(1, 1, 1, oz1, oy1, ox1);
+    #undef MC_S_C
+    float c00 = c000 + (c001 - c000) * dx;
+    float c01 = c010 + (c011 - c010) * dx;
+    float c10 = c100 + (c101 - c100) * dx;
+    float c11 = c110 + (c111 - c110) * dx;
+    float c0 = c00 + (c01 - c00) * dy;
+    float c1 = c10 + (c11 - c10) * dy;
+    return c0 + (c1 - c0) * dz;
+}
+
+// In-bounds blocked cell, ints + fracs precomputed: dispatch straddle/interior.
+static inline float mc_s_cell(mc_sampler *s, int z0, int y0, int x0,
+                              float dz, float dy, float dx) {
+    return ((z0 & 15) == 15 || (y0 & 15) == 15 || (x0 & 15) == 15)
+        ? mc_s_cell_straddle(s, z0, y0, x0, dz, dy, dx)
+        : mc_s_cell_in(s, z0, y0, x0, dz, dy, dx);
+}
+
 static inline float mc_s_trilinear(mc_sampler *s, float z, float y, float x) {
     float zf = floorf(z), yf = floorf(y), xf = floorf(x);
     int z0 = (int)zf, y0 = (int)yf, x0 = (int)xf;
@@ -3598,75 +3670,12 @@ static inline float mc_s_trilinear(mc_sampler *s, float z, float y, float x) {
         float c1 = c10 + (c11 - c10) * dy;
         return c0 + (c1 - c0) * dz;
     }
-    // blocked fast path: all 8 corners inside one block and in bounds (~82%
-    // of uniformly distributed samples; far more for coherent rays)
+    // blocked in-bounds cell: interior (one block) or straddle (dedup'd blocks)
     if (!s->src.dense &&
         (unsigned)z0 < (unsigned)(s->src.nz - 1) &&
         (unsigned)y0 < (unsigned)(s->src.ny - 1) &&
-        (unsigned)x0 < (unsigned)(s->src.nx - 1) &&
-        (z0 & 15) != 15 && (y0 & 15) != 15 && (x0 & 15) != 15) {
-        const uint8_t *b = mc_s_block(s, z0 >> 4, y0 >> 4, x0 >> 4);
-        if (!b) return 0.0f;
-        const uint8_t *p = b + (((z0 & 15) << 8) | ((y0 & 15) << 4) | (x0 & 15));
-        float c00 = (float)p[0]   + ((float)p[1]   - (float)p[0])   * dx;
-        float c01 = (float)p[16]  + ((float)p[17]  - (float)p[16])  * dx;
-        float c10 = (float)p[256] + ((float)p[257] - (float)p[256]) * dx;
-        float c11 = (float)p[272] + ((float)p[273] - (float)p[272]) * dx;
-        float c0 = c00 + (c01 - c00) * dy;
-        float c1 = c10 + (c11 - c10) * dy;
-        return c0 + (c1 - c0) * dz;
-    }
-    // in-bounds cell that straddles a block face (the hot fallback: ~18% of
-    // uniform samples, every 16th step along an axis): fetch each DISTINCT
-    // block once -- 2 for a face straddle (the common case), 4 edge, 8 corner
-    // -- instead of 8 per-corner mc_s_block lookups (whose 1-entry last-block
-    // cache thrashes between the two blocks).
-    if (!s->src.dense &&
-        (unsigned)z0 < (unsigned)(s->src.nz - 1) &&
-        (unsigned)y0 < (unsigned)(s->src.ny - 1) &&
-        (unsigned)x0 < (unsigned)(s->src.nx - 1)) {
-        const int sz = (z0 & 15) == 15, sy = (y0 & 15) == 15, sx = (x0 & 15) == 15;
-        const int bz = z0 >> 4, by = y0 >> 4, bx = x0 >> 4;
-        // B[a][b][c] = block holding corner (z0+a, y0+b, x0+c); reuse pointers
-        // along non-straddling axes so each distinct block is fetched once.
-        const uint8_t *B[2][2][2];
-        B[0][0][0] = mc_s_block(s, bz, by, bx);
-        B[0][0][1] = sx ? mc_s_block(s, bz, by, bx + 1) : B[0][0][0];
-        B[0][1][0] = sy ? mc_s_block(s, bz, by + 1, bx) : B[0][0][0];
-        B[0][1][1] = sy ? (sx ? mc_s_block(s, bz, by + 1, bx + 1) : B[0][1][0])
-                        : B[0][0][1];
-        if (sz) {
-            B[1][0][0] = mc_s_block(s, bz + 1, by, bx);
-            B[1][0][1] = sx ? mc_s_block(s, bz + 1, by, bx + 1) : B[1][0][0];
-            B[1][1][0] = sy ? mc_s_block(s, bz + 1, by + 1, bx) : B[1][0][0];
-            B[1][1][1] = sy ? (sx ? mc_s_block(s, bz + 1, by + 1, bx + 1) : B[1][1][0])
-                            : B[1][0][1];
-        } else {
-            B[1][0][0] = B[0][0][0]; B[1][0][1] = B[0][0][1];
-            B[1][1][0] = B[0][1][0]; B[1][1][1] = B[0][1][1];
-        }
-        const int oz0 = (z0 & 15) << 8, oz1 = ((z0 + 1) & 15) << 8;
-        const int oy0 = (y0 & 15) << 4, oy1 = ((y0 + 1) & 15) << 4;
-        const int ox0 = x0 & 15,        ox1 = (x0 + 1) & 15;
-        #define MC_S_C(a, b, c, oz, oy, ox) \
-            (B[a][b][c] ? (float)B[a][b][c][(oz) | (oy) | (ox)] : 0.0f)
-        float c000 = MC_S_C(0, 0, 0, oz0, oy0, ox0);
-        float c001 = MC_S_C(0, 0, 1, oz0, oy0, ox1);
-        float c010 = MC_S_C(0, 1, 0, oz0, oy1, ox0);
-        float c011 = MC_S_C(0, 1, 1, oz0, oy1, ox1);
-        float c100 = MC_S_C(1, 0, 0, oz1, oy0, ox0);
-        float c101 = MC_S_C(1, 0, 1, oz1, oy0, ox1);
-        float c110 = MC_S_C(1, 1, 0, oz1, oy1, ox0);
-        float c111 = MC_S_C(1, 1, 1, oz1, oy1, ox1);
-        #undef MC_S_C
-        float c00 = c000 + (c001 - c000) * dx;
-        float c01 = c010 + (c011 - c010) * dx;
-        float c10 = c100 + (c101 - c100) * dx;
-        float c11 = c110 + (c111 - c110) * dx;
-        float c0 = c00 + (c01 - c00) * dy;
-        float c1 = c10 + (c11 - c10) * dy;
-        return c0 + (c1 - c0) * dz;
-    }
+        (unsigned)x0 < (unsigned)(s->src.nx - 1))
+        return mc_s_cell(s, z0, y0, x0, dz, dy, dx);
     // slow path (volume edge / dense edge): block/bounds handled per corner
     float c000 = mc_s_voxel(s, z0, y0, x0);
     float c001 = mc_s_voxel(s, z0, y0, x0 + 1);
@@ -3897,6 +3906,19 @@ static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
                 return;
             }
         }
+        // Per-lane with the state already in hand (no refloor / rebounds):
+        // interior lanes one block fetch + scalar lerp, straddlers the
+        // dedup'd-block path (see the SSE comment).
+        {
+            int32_t z0[4], y0[4], x0[4];
+            vst1q_s32(z0, zi); vst1q_s32(y0, yi); vst1q_s32(x0, xi);
+            float dzs[4], dys[4], dxs[4];
+            vst1q_f32(dzs, dz); vst1q_f32(dys, dy); vst1q_f32(dxs, dx);
+            for (int k = 0; k < 4; k++)
+                out[k] = mc_s_cell(s, z0[k], y0[k], x0[k],
+                                   dzs[k], dys[k], dxs[k]);
+        }
+        return;
     }
 #endif
 #if defined(__SSE4_1__) && !defined(__aarch64__)
@@ -3952,6 +3974,17 @@ static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
                 return;
             }
         }
+        // Per-lane with the state already in hand (no refloor / rebounds):
+        // interior lanes one block fetch + scalar lerp, straddlers the
+        // dedup'd-block path. The old fallback re-ran the FULL scalar sampler
+        // for all 4 lanes when one lane straddled.
+        float dzs[4], dys[4], dxs[4];
+        _mm_storeu_ps(dzs, dz);
+        _mm_storeu_ps(dys, dy);
+        _mm_storeu_ps(dxs, dx);
+        for (int k = 0; k < 4; k++)
+            out[k] = mc_s_cell(s, z0[k], y0[k], x0[k], dzs[k], dys[k], dxs[k]);
+        return;
     }
 #endif
     out[0] = mc_s_trilinear(s, pz[0], py[0], px[0]);
@@ -4012,6 +4045,17 @@ static inline void mc_s_tri8(mc_sampler *s, const float *pz, const float *py,
                 return;
             }
         }
+        // Per-lane with the state already in hand (no refloor / rebounds /
+        // requalify): interior lanes do one block fetch + scalar lerp;
+        // straddlers take the dedup'd-block path. The old fallback re-ran the
+        // FULL scalar sampler for all 8 lanes when one lane straddled.
+        float dzs[8], dys[8], dxs[8];
+        _mm256_storeu_ps(dzs, dz);
+        _mm256_storeu_ps(dys, dy);
+        _mm256_storeu_ps(dxs, dx);
+        for (int k = 0; k < 8; k++)
+            out[k] = mc_s_cell(s, z0[k], y0[k], x0[k], dzs[k], dys[k], dxs[k]);
+        return;
     }
     mc_s_tri4(s, pz, py, px, out);
     mc_s_tri4(s, pz + 4, py + 4, px + 4, out + 4);
