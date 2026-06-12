@@ -227,6 +227,14 @@ mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx)
 // archive is being filled.
 uint64_t mc_archive_data_len(mc_archive *a);
 
+// User metadata: every archive reserves a region between the 256B header and the
+// 128KB data start. Set overwrites the whole region's contents (call any time on a
+// live handle; the write is crash-safe like any append — length published last).
+// Returns -1 if `len` exceeds the region capacity (nothing written). Read back via
+// mc_archive_metadata() on a handle, or mc_metadata() on flat archive bytes.
+int mc_archive_set_metadata(mc_archive *a, const void *data, size_t len);
+const char *mc_archive_metadata(mc_archive *a, size_t *out_len);
+
 // Resolve a chunk to its blob offset (0 = absent). Pass to mc_archive_decode_block to
 // decode its 16^3 blocks (resolve once per chunk, decode 4096 blocks).
 uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx);

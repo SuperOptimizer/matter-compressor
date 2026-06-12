@@ -2125,6 +2125,22 @@ uint64_t mc_archive_data_len(mc_archive *a){
     return a ? atomic_load_explicit(&a->cursor, memory_order_relaxed) : 0;
 }
 
+int mc_archive_set_metadata(mc_archive *a, const void *data, size_t len){
+    if(!a || (len && !data)) return -1;
+    if(len > MC_META_CAP) return -1;
+    if(len) memcpy(a->base + MC_HDR, data, len);
+    // publish the length AFTER the bytes so a concurrent flat read never sees
+    // a length covering unwritten content (same commit-word discipline as blobs).
+    atomic_thread_fence(memory_order_release);
+    uint64_t l = len; memcpy(a->base + MCH_METALEN, &l, 8);
+    return 0;
+}
+
+const char *mc_archive_metadata(mc_archive *a, size_t *out_len){
+    if(!a){ if(out_len) *out_len = 0; return NULL; }
+    return mc_metadata(a->base, out_len);
+}
+
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx){
     if(!a||lod<0||lod>7) return MC_ABSENT;
     // Fast path: the coverage memo. A hit is O(1) and never touches the node tree

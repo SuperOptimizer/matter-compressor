@@ -68,6 +68,9 @@ int main(void){
     if(!w){ fprintf(stderr,"writer_open failed\n"); return 1; }
     fill_chunk(chunk,0,0,0,0); if(mc_archive_append_chunk_raw(w,0,0,0,0,chunk)){ fprintf(stderr,"append l0 failed\n"); return 1; }
     fill_chunk(chunk,1,0,0,0); if(mc_archive_append_chunk_raw(w,1,0,0,0,chunk)){ fprintf(stderr,"append l1 failed\n"); return 1; }
+    const char *META = "{\"profile\":\"test\",\"quality\":8.0}";
+    if(mc_archive_set_metadata(w, META, strlen(META))){ fprintf(stderr,"set_metadata failed\n"); return 1; }
+    if(mc_archive_set_metadata(w, META, (size_t)1<<20)==0){ fprintf(stderr,"set_metadata accepted len > cap\n"); return 1; }
     if(mc_archive_chunk_coverage(w,0,0,0,0)!=MC_PRESENT){ fprintf(stderr,"coverage l0 wrong\n"); return 1; }
     mc_archive_close(w);
     printf("phase 1: appended LOD0(0,0,0) + LOD1(0,0,0), closed\n");
@@ -76,6 +79,10 @@ int main(void){
     w = mc_archive_open(path, DIM, Q);
     if(!w){ fprintf(stderr,"reopen failed\n"); return 1; }
     if(mc_archive_chunk_coverage(w,0,0,0,0)!=MC_PRESENT){ fprintf(stderr,"reopen lost LOD0(0,0,0)\n"); return 1; }
+    { size_t ml=0; const char *m=mc_archive_metadata(w,&ml);
+      if(!m || ml!=strlen("{\"profile\":\"test\",\"quality\":8.0}") || memcmp(m,"{\"profile\":\"test\"",17)){
+          fprintf(stderr,"reopen lost metadata (len %zu)\n",ml); return 1; }
+      printf("  metadata persisted across reopen: %.*s\n",(int)ml,m); }
     fill_chunk(chunk,0,1,1,1); if(mc_archive_append_chunk_raw(w,0,1,1,1,chunk)){ fprintf(stderr,"append l0(1,1,1) failed\n"); return 1; }
 
     // SAME-HANDLE read-back: decode a freshly-appended chunk directly via the archive
@@ -103,6 +110,9 @@ int main(void){
     FILE *f=fopen(path,"rb"); fseek(f,0,SEEK_END); long flen=ftell(f); fseek(f,0,SEEK_SET);
     uint8_t *buf=malloc(flen); if(fread(buf,1,flen,f)!=(size_t)flen){ fprintf(stderr,"read file\n"); return 1; } fclose(f);
     mc_reader *r=mc_open(buf,flen); mc_reader_set_quality(r,Q);
+    { size_t ml=0; const char *m=mc_metadata(buf,&ml);
+      if(!m || !ml || memcmp(m,"{\"profile\":\"test\"",17)){ fprintf(stderr,"flat mc_metadata read failed\n"); return 1; }
+      printf("  flat metadata: %.*s\n",(int)ml,m); }
     int fail=0; double rmse; long leak;
     struct { int lod,cz,cy,cx; } chunks[]={ {0,0,0,0},{1,0,0,0},{0,1,1,1} };
     for(int i=0;i<3;++i){
