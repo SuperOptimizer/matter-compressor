@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #define NX 600
 #define NY 300
@@ -28,7 +29,7 @@ int main(void) {
         fprintf(stderr, "build failed\n"); return 1;
     }
 
-    mc_volume *v = mc_volume_open_streaming(path, (size_t)256 << 20);
+    mc_volume *v = mc_volume_open_streaming(path, "/tmp", (size_t)256 << 20);
     if (!v) { fprintf(stderr, "open_streaming failed\n"); return 1; }
 
     int nl = mc_volume_nlods(v);
@@ -45,11 +46,13 @@ int main(void) {
     int cz = (NZ / 2) / 16, cy = (NY / 2) / 16, cx = (NX / 2) / 16;
     uint8_t blk[16 * 16 * 16];
     int got = 0;
-    for (int it = 0; it < 6; ++it) {
+    for (int it = 0; it < 200; ++it) {
         mc_volume_freeze(v);
         int r = mc_volume_try_block(v, 0, cz, cy, cx, blk);   // frozen read records miss
-        mc_volume_thaw(v);                                    // fills from the reader
+        mc_volume_thaw(v);                                    // req_push ABSENT, fill PRESENT
         if (r == 1) { got = 1; break; }                       // resident now
+        struct timespec ts = {0, 5 * 1000 * 1000};            // 5ms: let the dl thread land
+        nanosleep(&ts, NULL);
     }
     // One more frozen read after fill.
     mc_volume_freeze(v);

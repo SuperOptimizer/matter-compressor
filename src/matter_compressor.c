@@ -2512,7 +2512,9 @@ const char *mc_metadata(const uint8_t *arc, size_t *out_len){
     return (const char*)(arc+off);
 }
 
-#define MC_RD_NODE_CACHE 64    // cached node tables per streaming reader (64*32KB = 2MB)
+#define MC_RD_NODE_CACHE 512   // cached node tables per streaming reader (512*32KB = 16MB):
+                               // a pan across a large volume touches many subtrees; a
+                               // churned-out table costs a serial ranged GET to re-fetch
 struct mc_reader {
     const uint8_t *arc;        // flat mode: archive buffer; streaming: NULL
     size_t len;
@@ -2617,6 +2619,23 @@ uint64_t mc_reader_chunk_blob_len(mc_reader *r, uint64_t chunk_off){
     uint64_t pay=0; for(int i=0;i<np;++i){ uint16_t l; memcpy(&l,lens+(size_t)i*2,2); pay+=l; }
     free(lens);
     return bm_off + MC_BITMAP_BYTES + (uint64_t)np*2 + pay - chunk_off;
+}
+
+// Copy `len` bytes of the chunk blob at `chunk_off` into `dst` (flat or streaming
+// reader). For .mca -> .mca verbatim copy: mc_reader_chunk_blob_len then this then
+// mc_archive_append_chunk_compressed. NOT thread-safe on a streaming reader (single
+// cbuf/codec ctx) -- caller serializes. Returns 0 on success.
+int mc_reader_read_blob(mc_reader *r, uint64_t chunk_off, size_t len, uint8_t *dst){
+    if(!r||!chunk_off||!len||!dst) return -1;
+    if(r->arc){ memcpy(dst, r->arc + chunk_off, len); return 0; }
+    // streaming: range-read in <=2^31 chunks (sread takes a uint32 len).
+    size_t done=0;
+    while(done<len){
+        uint32_t n = (len-done > 0x40000000u) ? 0x40000000u : (uint32_t)(len-done);
+        if(sread(r, chunk_off+done, n, dst+done)!=0) return -1;
+        done += n;
+    }
+    return 0;
 }
 
 void mc_reader_dims(mc_reader *r, int *nx, int *ny, int *nz){
@@ -6152,22 +6171,21 @@ struct mc_volume {
     mc_cache *cache;
     float quality;
 
-    // Streaming mode: the source is an ALREADY-BUILT remote .mca read in place via
-    // ranged GETs (no zarr transcode pipeline). v->streaming=1; v->rd is the reader
-    // (single decode ctx -> reader fill is single-owner, done only in THAW); v->s3mca
-    // owns the s3 client + reader. arc/lv/download+decode threads are all unused.
-    // Coverage is read directly from the reader (mc_chunk_offset!=0 => present).
-    int streaming;
-    mc_s3 *s3mca;
-    struct mc_reader *rd;
-    uint8_t *s_buf;            // owned buffer for a local-file streaming reader
+    // Streaming mode: the source is an ALREADY-BUILT .mca. The download thread
+    // resolves a region's offset in the source reader and copies its compressed blob
+    // VERBATIM onto the LOCAL archive (v->arc) -- no decode, no re-encode. Everything
+    // else is the normal local-archive path: coverage, THAW decode-from-local, cache,
+    // the LIFO request stack. lv[] / decode pool are unused; one dl thread owns the
+    // (non-reentrant) source reader.
+    int streaming;             // 1 => source is a pre-built .mca, copied verbatim
+    mc_s3 *s3mca;              // remote source reader handle (s3/https), or NULL
+    struct mc_reader *rd;      // source reader: chunk offsets + verbatim blob bytes
+    uint8_t *s_map;            // local-file source: whole .mca mmap'd read-only
+    size_t s_map_len;
+    size_t s_blob_ema;         // EMA of blob sizes -> adaptive round-A GET length
+                               // (dl thread only; fixed over-read either wastes
+                               // bandwidth on small blobs or two-trips big ones)
     int s_nz[MAXLOD], s_ny[MAXLOD], s_nx[MAXLOD];   // per-LOD voxel dims (n0>>lod)
-    // Streaming coverage memo: a region's PRESENT/ZERO state, resolved (with reader
-    // I/O) only in THAW, read lock-free during frozen renders. An UNKNOWN region
-    // (never resolved) reads as a miss -> render falls coarser, THAW resolves it.
-    // Open-addressing, same scheme as the archive's: slot = covkey | state<<62.
-    _Atomic uint64_t *s_cov;
-    uint32_t s_cov_cap;        // power of two
 
     atomic_uint_fast64_t net_bytes;
 
@@ -6523,13 +6541,145 @@ static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
     pthread_mutex_unlock(&v->mu);
 }
 
+enum { DL_BATCH = 32 };
+
+// Streaming fetch of ONE 256^3 region via the reader (serial; the local-file
+// source path and the fallback for a header window too small to parse).
+static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx) {
+    if (mc_archive_chunk_coverage(v->arc, lod, rz, ry, rx) != MC_ABSENT) return;  // already have it
+    uint64_t off = mc_chunk_offset(v->rd, lod, rz, ry, rx);
+    if (off == 0) {                                    // remote air -> local ZERO region
+        mc_archive_append_chunk_raw(v->arc, lod, rz, ry, rx, zero256());
+        return;
+    }
+    uint64_t blen = mc_reader_chunk_blob_len(v->rd, off);
+    if (blen == 0) return;                             // transient: leave ABSENT, retry
+    uint8_t *blob = malloc((size_t)blen);
+    if (!blob) return;
+    if (mc_reader_read_blob(v->rd, off, (size_t)blen, blob) != 0) { free(blob); return; }
+    atomic_fetch_add_explicit(&v->net_bytes, blen, memory_order_relaxed);
+    mc_archive_append_chunk_compressed(v->arc, lod, rz, ry, rx, blob, (size_t)blen);
+    free(blob);
+}
+
+// Blob total length parsed from its LEADING bytes (header + fmap + bitmap + len
+// table must all be inside `buf`). 0 = window too short (caller falls back to the
+// exact serial path). Mirrors mc_reader_chunk_blob_len, but over one buffer.
+static uint64_t mc_blob_len_parse(const uint8_t *buf, size_t len) {
+    if (len < MC_BLOB_HDR) return 0;
+    uint16_t fml; memcpy(&fml, buf + MC_BLOB_HDR - 2, 2);
+    uint64_t bm_off = (uint64_t)MC_BLOB_HDR + fml;
+    if (len < bm_off + MC_BITMAP_BYTES) return 0;
+    int np = 0;
+    for (int i = 0; i < MC_BITMAP_BYTES; ++i) np += __builtin_popcount(buf[bm_off + i]);
+    if (!np) return bm_off + MC_BITMAP_BYTES;
+    if (len < bm_off + MC_BITMAP_BYTES + (size_t)np * 2) return 0;
+    uint64_t pay = 0;
+    for (int i = 0; i < np; ++i) {
+        uint16_t l; memcpy(&l, buf + bm_off + MC_BITMAP_BYTES + (size_t)i * 2, 2);
+        pay += l;
+    }
+    return bm_off + MC_BITMAP_BYTES + (uint64_t)np * 2 + pay;
+}
+
+// Streaming fetch of a BATCH of regions -- the throughput path. The serial
+// per-chunk flow (resolve, header probe, length probe, blob read) is 3-4 S3
+// round-trips each; one thread doing that tops out ~2MB/s. Instead: resolve all
+// offsets via the reader (node tables memoized, cheap), then TWO rounds of
+// s3_get_batch (32-way concurrent ranged GETs, like the zarr path): round A pulls
+// each blob's leading bytes -- sized at ~2x the running average blob size, so most
+// blobs complete in this single GET (exact length parsed from the leading bytes)
+// without over-reading small ones; round B pulls the occasional tail.
+#define MC_STREAM_HDR_MIN (64u << 10)
+#define MC_STREAM_HDR_MAX (2u << 20)
+static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
+                                  const int *rz, const int *ry, const int *rx) {
+    uint64_t off[DL_BATCH];
+    int act[DL_BATCH], na = 0;                 // regions that still need bytes
+    for (int i = 0; i < m; ++i) {
+        if (mc_archive_chunk_coverage(v->arc, lods[i], rz[i], ry[i], rx[i]) != MC_ABSENT)
+            continue;                                          // already resident
+        uint64_t o = mc_chunk_offset(v->rd, lods[i], rz[i], ry[i], rx[i]);
+        if (o == 0) {                                          // air -> ZERO region
+            mc_archive_append_chunk_raw(v->arc, lods[i], rz[i], ry[i], rx[i], zero256());
+            continue;
+        }
+        off[i] = o; act[na++] = i;
+    }
+    if (!na) return;
+
+    if (v->local || !v->s3mca) {               // local-file source: disk is fast, go serial
+        for (int k = 0; k < na; ++k)
+            mc_stream_fetch_region(v, lods[act[k]], rz[act[k]], ry[act[k]], rx[act[k]]);
+        return;
+    }
+
+    // round A: each blob's leading bytes, concurrently. ~2x the EMA blob size:
+    // big enough that most blobs land whole, small enough not to over-read.
+    if (!v->s_blob_ema) v->s_blob_ema = 256u << 10;          // first batch: 256KB guess
+    uint64_t hdr_want = v->s_blob_ema * 2;
+    if (hdr_want < MC_STREAM_HDR_MIN) hdr_want = MC_STREAM_HDR_MIN;
+    if (hdr_want > MC_STREAM_HDR_MAX) hdr_want = MC_STREAM_HDR_MAX;
+    s3_range_req reqA[DL_BATCH]; s3_response respA[DL_BATCH];
+    for (int k = 0; k < na; ++k)
+        reqA[k] = (s3_range_req){v->s3mca->url, off[act[k]], hdr_want};
+    memset(respA, 0, sizeof(s3_response) * (size_t)na);
+    s3_get_batch(v->s3mca->cl, reqA, (size_t)na, 32, respA);
+
+    // parse lengths; append blobs that fit in the window; queue tails for round B.
+    uint64_t blen[DL_BATCH] = {0};
+    s3_range_req reqB[DL_BATCH]; s3_response respB[DL_BATCH];
+    int bk[DL_BATCH], nb = 0;                  // bk[j] -> round-A index
+    for (int k = 0; k < na; ++k) {
+        int i = act[k];
+        if (!s3_response_ok(&respA[k]) || !respA[k].body_len) continue;   // transient: retry later
+        atomic_fetch_add_explicit(&v->net_bytes, respA[k].body_len, memory_order_relaxed);
+        blen[k] = mc_blob_len_parse(respA[k].body, respA[k].body_len);
+        if (!blen[k]) {                        // header bigger than the window (rare)
+            mc_stream_fetch_region(v, lods[i], rz[i], ry[i], rx[i]);
+            continue;
+        }
+        v->s_blob_ema = (v->s_blob_ema * 7 + (size_t)blen[k]) / 8;   // dl thread only
+        if (blen[k] <= respA[k].body_len) {    // whole blob already in hand
+            mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
+                                               respA[k].body, (size_t)blen[k]);
+        } else {                               // need the tail
+            reqB[nb] = (s3_range_req){v->s3mca->url, off[i] + respA[k].body_len,
+                                      blen[k] - respA[k].body_len};
+            bk[nb++] = k;
+        }
+    }
+
+    // round B: all tails, concurrently; stitch head+tail and append.
+    if (nb) {
+        memset(respB, 0, sizeof(s3_response) * (size_t)nb);
+        s3_get_batch(v->s3mca->cl, reqB, (size_t)nb, 32, respB);
+        for (int j = 0; j < nb; ++j) {
+            int k = bk[j], i = act[k];
+            if (s3_response_ok(&respB[j]) && respB[j].body_len >= reqB[j].length) {
+                atomic_fetch_add_explicit(&v->net_bytes, respB[j].body_len, memory_order_relaxed);
+                uint8_t *blob = malloc((size_t)blen[k]);
+                if (blob) {
+                    memcpy(blob, respA[k].body, respA[k].body_len);
+                    memcpy(blob + respA[k].body_len, respB[j].body, (size_t)reqB[j].length);
+                    mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
+                                                       blob, (size_t)blen[k]);
+                    free(blob);
+                }
+            }
+            s3_response_free(&respB[j]);
+        }
+    }
+    for (int k = 0; k < na; ++k) s3_response_free(&respA[k]);
+}
+
 // Download thread: pop the newest request, download its shard (-> decode queue).
 // Drain up to DL_BATCH region requests from the LIFO stack (newest first) and
 // fetch their source chunks in ONE s3_get_batch — per-region precision (no
 // whole-shard pull) AND high concurrency (32 GETs over the pooled connections),
 // which is what saturates the link. c3d (sub=1) = one chunk per region; v2
-// regions fall back to the per-chunk cube path.
-enum { DL_BATCH = 32 };
+// regions fall back to the per-chunk cube path. STREAMING: one thread drives
+// batched concurrent GETs (mc_stream_fetch_batch) -- verbatim copy, no decode pool.
 static void *dl_main(void *ud) {
     mc_volume *v = ud;
     mc_thread_setname("mc-download");      // distinguish in profilers
@@ -6550,6 +6700,17 @@ static void *dl_main(void *ud) {
         }
         if (popped) rs_set_rebuild(v);                  // popped keys leave the set
         pthread_mutex_unlock(&v->mu);
+
+        if (v->streaming) {
+            // Verbatim .mca -> .mca copy, batched (two rounds of 32-way GETs).
+            mc_stream_fetch_batch(v, m, lods, rz, ry, rx);
+            pthread_mutex_lock(&v->mu);
+            for (int i = 0; i < m; ++i)
+                inflight_del(v, rkey(lods[i], rz[i], ry[i], rx[i]));
+            pthread_mutex_unlock(&v->mu);
+            if (m && v->ready_cb) v->ready_cb(v->ready_ud);
+            continue;
+        }
 
         // Locate each region's c3d source chunk via the cached footer; build one
         // batched ranged-GET. v2 (sub>1) and local both use the per-region path.
@@ -6617,9 +6778,13 @@ static void *dl_main(void *ud) {
 static mc_cover ensure_region(mc_volume *v, int lod, int cz, int cy, int cx) {
     mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
     if (cov != MC_ABSENT) return cov;
-    const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
-    mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // just this region
-    // wait for the decoders to drain enough that this region is covered.
+    if (v->streaming) {
+        req_push(v, lod, cz, cy, cx);          // dl thread copies the blob verbatim
+    } else {
+        const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
+        mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // just this region
+    }
+    // wait for the downloaders/decoders to drain enough that this region is covered.
     for (int spin = 0; spin < 100000; ++spin) {
         cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
         if (cov != MC_ABSENT) return cov;
@@ -6767,60 +6932,58 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     return v;
 }
 
-// Streaming coverage memo (same open-addressing scheme as the archive's). The
-// reader resolve (mc_chunk_offset) does S3 node-table I/O + mutates reader state,
-// so it must NOT run on the frozen render thread. Split into two:
-//  - mc_stream_cov_probe : memo-only, lock-free, non-blocking. UNKNOWN -> ABSENT
-//    (the render treats it as a miss: record + fall coarser).
-//  - mc_stream_resolve   : reader I/O + memo fill. Single-owner: THAW only.
-// A pre-built .mca has no true ABSENT -- a region is PRESENT or air (ZERO) -- so
-// once resolved a region is one or the other; "ABSENT" here means only "not yet
-// resolved", which THAW clears.
-static mc_cover mc_stream_cov_probe(mc_volume *v, int lod, int cz, int cy, int cx) {
-    if (!v->s_cov || lod < 0 || lod >= v->nlods) return MC_ABSENT;
-    uint64_t key = mc_covkey(lod, cz, cy, cx);
-    uint32_t mask = v->s_cov_cap - 1;
-    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 44);
-    for (int p = 0; p < 32; ++p) {
-        uint32_t i = (h + (uint32_t)p) & mask;
-        uint64_t cur = atomic_load_explicit(&v->s_cov[i], memory_order_acquire);
-        if (cur == 0) return MC_ABSENT;                  // empty -> not resolved yet
-        if ((cur & MC_COV_KEYMASK) == key) {
-            uint64_t st = cur >> MC_COV_STATE_SHIFT;
-            return st == MC_COV_PRESENT ? MC_PRESENT : st == MC_COV_ZERO ? MC_ZERO : MC_ABSENT;
-        }
-    }
-    return MC_ABSENT;                                    // probe exhausted
-}
-// THAW-only: resolve coverage via the reader and memoize it. Returns the resolved
-// state. (cz,cy,cx) is the 256^3 region. Single-owner -- reader I/O happens here.
-static mc_cover mc_stream_resolve(mc_volume *v, int lod, int cz, int cy, int cx) {
-    if (lod < 0 || lod >= v->nlods) return MC_ABSENT;
-    mc_cover got = mc_chunk_offset(v->rd, lod, cz, cy, cx) ? MC_PRESENT : MC_ZERO;
-    if (v->s_cov) {
-        uint64_t key = mc_covkey(lod, cz, cy, cx);
-        uint64_t val = key | ((got == MC_PRESENT ? MC_COV_PRESENT : MC_COV_ZERO) << MC_COV_STATE_SHIFT);
-        uint32_t mask = v->s_cov_cap - 1;
-        uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 44);
-        for (int p = 0; p < 32; ++p) {
-            uint32_t i = (h + (uint32_t)p) & mask;
-            uint64_t cur = atomic_load_explicit(&v->s_cov[i], memory_order_relaxed);
-            if (cur == 0 || (cur & MC_COV_KEYMASK) == key) {
-                atomic_store_explicit(&v->s_cov[i], val, memory_order_release);
-                break;
-            }
-        }
-    }
-    return got;
+// mmap a local .mca read-only: the flat reader (mc_open) then treats it as one
+// big array -- chunk resolves and blob reads are plain pointer reads, the kernel
+// pages in on demand (nothing is slurped into RAM).
+static uint8_t *mc_map_file_ro(const char *path, size_t *out_len) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return NULL; }
+    uint8_t *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);                                   // the mapping keeps the file alive
+    if (base == MAP_FAILED) return NULL;
+    *out_len = (size_t)st.st_size;
+    return base;
 }
 
-// Open an already-built remote (or local-file) .mca and stream blocks from it on
-// demand: no zarr discovery, no transcode pipeline, no download/decode threads.
-// The reader pulls just the bytes a decode needs (partial-fetch over S3); the
-// mc_cache (reader-backed) holds decoded 16^3 blocks. cache_bytes is the resident
-// RAM budget. Returns NULL on failure (unreachable / not an mc archive).
-mc_volume *mc_volume_open_streaming(const char *url, size_t cache_bytes) {
-    if (!url) return NULL;
+// Probe a built .mca's header WITHOUT opening a volume (no local archive, no
+// threads): LOD0 dims, lod count, quality. url = s3://, https://, or a local
+// path. Returns 0 on success.
+int mc_mca_probe(const char *url, int *nx, int *ny, int *nz, int *nlods, float *quality) {
+    if (!url) return -1;
+    mc_s3 *s = NULL; mc_reader *r = NULL;
+    uint8_t *map = NULL; size_t maplen = 0;
+    if (strstr(url, "://")) {
+        s = mc_s3_open(url);
+        if (!s) return -1;
+        r = mc_s3_reader(s);
+    } else {
+        map = mc_map_file_ro(url, &maplen);
+        if (!map) return -1;
+        r = mc_open(map, maplen);
+        if (!r) { munmap(map, maplen); return -1; }
+    }
+    mc_reader_dims(r, nx, ny, nz);
+    if (nlods) *nlods = mc_reader_nlods(r);
+    if (quality) *quality = mc_reader_quality(r);
+    if (s) mc_s3_close(s); else { mc_close(r); munmap(map, maplen); }
+    return 0;
+}
+
+// Open an already-built remote (or local-file) .mca and stream it into a LOCAL
+// .mca on demand. Same machinery as the zarr transcode path -- local archive,
+// download threads, decode-from-local THAW -- but the download step COPIES the
+// remote chunk's compressed blob verbatim onto the local archive (no decode, no
+// re-encode): a 256^3 .mca chunk is already in the exact local format. We never
+// mirror the whole remote; only the chunks the view touches get pulled+appended.
+//   url        : the remote (s3://.../https://...) or local-file source .mca
+//   cache_dir  : holds the local <name>.mca that fetched chunks append into
+//   cache_bytes: resident RAM decoded-block budget
+// Returns NULL on failure.
+mc_volume *mc_volume_open_streaming(const char *url, const char *cache_dir,
+                                    size_t cache_bytes) {
+    if (!url || !cache_dir) return NULL;
     mc_volume *v = calloc(1, sizeof *v);
     if (!v) return NULL;
     v->streaming = 1;
@@ -6830,19 +6993,14 @@ mc_volume *mc_volume_open_streaming(const char *url, size_t cache_bytes) {
     snprintf(v->root, sizeof v->root, "%s", url);
     rstrip_slash(v->root);
 
+    // Open the SOURCE reader (remote ranged GETs, or a local file mmap'd read-only
+    // and read like one big array) for chunk-offset resolves + verbatim blob reads.
     v->local = (strstr(url, "://") == NULL);
     if (v->local) {
-        // local file: a flat read of the whole .mca (mmap-style buffer reader).
-        FILE *f = fopen(v->root, "rb");
-        if (!f) { free(v); return NULL; }
-        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        if (sz <= 0) { fclose(f); free(v); return NULL; }
-        uint8_t *buf = malloc((size_t)sz);
-        if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); free(v); return NULL; }
-        fclose(f);
-        v->rd = mc_open(buf, (size_t)sz);   // buf is leaked-on-free below via s_buf
-        v->s_buf = buf;
-        if (!v->rd) { free(buf); free(v); return NULL; }
+        v->s_map = mc_map_file_ro(v->root, &v->s_map_len);
+        if (!v->s_map) { free(v); return NULL; }
+        v->rd = mc_open(v->s_map, v->s_map_len);
+        if (!v->rd) { munmap(v->s_map, v->s_map_len); free(v); return NULL; }
     } else {
         v->s3mca = mc_s3_open(url);
         if (!v->s3mca) { free(v); return NULL; }
@@ -6854,36 +7012,69 @@ mc_volume *mc_volume_open_streaming(const char *url, size_t cache_bytes) {
     v->nlods = mc_reader_nlods(v->rd);
     if (v->nlods > MAXLOD) v->nlods = MAXLOD;
     if (v->nlods <= 0) {
-        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); free(v->s_buf); }
+        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
         free(v); return NULL;
     }
     v->quality = mc_reader_quality(v->rd);
     for (int l = 0; l < v->nlods; ++l) {
-        v->s_nz[l] = n0z >> l; v->s_ny[l] = n0y >> l; v->s_nx[l] = n0x >> l;
-        if (v->s_nz[l] < 1) v->s_nz[l] = 1;
-        if (v->s_ny[l] < 1) v->s_ny[l] = 1;
-        if (v->s_nx[l] < 1) v->s_nx[l] = 1;
+        v->s_nz[l] = n0z >> l < 1 ? 1 : n0z >> l;
+        v->s_ny[l] = n0y >> l < 1 ? 1 : n0y >> l;
+        v->s_nx[l] = n0x >> l < 1 ? 1 : n0x >> l;
     }
 
-    v->cache = mc_cache_new_reader(cache_bytes, v->rd);
-    if (!v->cache) {
-        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); free(v->s_buf); }
+    // Local archive: fetched chunks append here verbatim. Same dims/quality as the
+    // source so chunk coords + blob format line up exactly.
+    char path[2048];
+    const char *base = strrchr(v->root, '/');
+    base = base ? base + 1 : v->root;
+    snprintf(path, sizeof path, "%s/%s.local.mca", cache_dir, base);
+    v->arc = mc_archive_open_dims(path, n0x, n0y, n0z, v->quality);
+    if (!v->arc) {
+        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
         free(v); return NULL;
     }
-    v->s_cov_cap = MC_COV_CAP;                       // 1M slots, same as the archive memo
-    v->s_cov = calloc(v->s_cov_cap, sizeof *v->s_cov);
-    MCVLOG("open(stream) %s  nlods=%d dims=%dx%dx%d q=%.1f", url, v->nlods, n0x, n0y, n0z, v->quality);
+    v->cache = mc_cache_new_archive(cache_bytes, v->arc);
+    if (!v->cache) {
+        mc_archive_close(v->arc);
+        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
+        free(v); return NULL;
+    }
+
+    // Download threads only (no decode pool -- streaming appends compressed blobs
+    // verbatim, there's nothing to decode off-thread). Reuse the LIFO request stack.
+    v->rs_cap = 65536;
+    v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
+    int sc = 1; while (sc < v->rs_cap * 2) sc <<= 1;
+    v->rs_set_mask = sc - 1;
+    v->rs_set = calloc((size_t)sc, sizeof *v->rs_set);
+    // ONE download thread: the source reader (cbuf + node-table cache + codec ctx)
+    // is non-reentrant, so a single owner avoids any sharing. Chunks are large and
+    // partial-fetch is efficient; this runs off the UI thread, which is the point.
+    v->ndl = 1;
+    for (int i = 0; i < v->ndl; ++i)
+        pthread_create(&v->dlthreads[i], NULL, dl_main, v);
+    MCVLOG("open(stream) %s -> %s  nlods=%d dims=%dx%dx%d q=%.1f dl=%d",
+           url, path, v->nlods, n0x, n0y, n0z, v->quality, v->ndl);
     return v;
 }
 
 void mc_volume_free(mc_volume *v) {
     if (!v) return;
     if (v->streaming) {
-        // No threads, no archive/zarr: just the cache + reader (s3 or local buf).
+        // Stop the download threads, then tear down cache + local archive + source
+        // reader. No decode pool / zarr levels exist in streaming.
+        pthread_mutex_lock(&v->mu);
+        v->stop = 1;
+        pthread_cond_broadcast(&v->cv);
+        pthread_mutex_unlock(&v->mu);
+        for (int i = 0; i < v->ndl; ++i) pthread_join(v->dlthreads[i], NULL);
         if (v->cache) mc_cache_free(v->cache);
-        if (v->s3mca) mc_s3_close(v->s3mca);   // owns the reader
-        else { mc_close(v->rd); free(v->s_buf); }
-        free(v->s_cov);
+        if (v->arc) mc_archive_close(v->arc);
+        if (v->s3mca) mc_s3_close(v->s3mca);   // owns the remote reader
+        else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
+        free(v->reqstk);
+        free(v->rs_set);
+        free(v->inflight);
         pthread_mutex_destroy(&v->mu);
         pthread_cond_destroy(&v->cv);
         free(v);
@@ -6955,12 +7146,11 @@ int mc_volume_get_level_meta(const mc_volume *v, int lod, mc_volume_level_meta *
 // ---------------------------------------------------------------------------
 // block serving
 // ---------------------------------------------------------------------------
-// Region coverage, source-agnostic: the local transcode archive (build path) or
-// the remote reader (streaming path). Streaming has no ABSENT state -- a chunk is
-// PRESENT or air (ZERO) -- so the absent/download machinery below is never hit.
+// Both paths (zarr transcode AND remote-.mca streaming) serve from the LOCAL
+// archive, so coverage is just the local archive's: ABSENT -> the download stack
+// pulls the chunk (re-encode for zarr / verbatim copy for streaming).
 static inline mc_cover vol_coverage(mc_volume *v, int lod, int cz, int cy, int cx) {
-    return v->streaming ? mc_stream_cov_probe(v, lod, cz, cy, cx)
-                        : mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    return mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
 }
 
 int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
@@ -7016,18 +7206,14 @@ const uint8_t *mc_volume_block_ptr(mc_volume *v, int lod, int bz, int by, int bx
 // in ahead of the render instead of being discovered as misses a cycle late.
 void mc_volume_request_region(mc_volume *v, int lod, int cz, int cy, int cx) {
     if (!v || lod < 0 || lod >= v->nlods) return;
-    if (v->streaming) return;   // streaming: no download stack; THAW fills on miss
     if (mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx) != MC_ABSENT) return;
-    req_push(v, lod, cz, cy, cx);
+    req_push(v, lod, cz, cy, cx);   // download thread fetches+appends (zarr or stream)
 }
 
 int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
     if (lod < 0 || lod >= v->nlods) { memset(dst, 0, BLK * BLK * BLK); return -1; }
     int cz = bz / PER, cy = by / PER, cx = bx / PER;
-    // streaming: no transcode pipeline -- resolve coverage from the reader; air ->
-    // zeros, present -> read-through decode (single-owner caller, e.g. CLI/blocking).
-    mc_cover cov = v->streaming ? mc_stream_resolve(v, lod, cz, cy, cx)
-                                : ensure_region(v, lod, cz, cy, cx);
+    mc_cover cov = ensure_region(v, lod, cz, cy, cx);   // pulls the region if ABSENT
     if (cov == MC_ZERO || cov == MC_ABSENT) { memset(dst, 0, BLK * BLK * BLK); return cov == MC_ZERO ? 0 : -1; }
     mc_cache_get_copy(v->cache, lod, bz, by, bx, dst);
     return 1;
@@ -7330,19 +7516,16 @@ void mc_volume_thaw(mc_volume *v) {
     // Collate (thaw = the collator), BEFORE any early-out. net_inflight is the
     // real pipeline depth (status bar); work_pending adds this frame's undrained
     // misses so the render gate keeps ticking until everything's resident.
-    // Streaming has no download/decode pipeline -- the fill IS the read -- so
-    // net_inflight is 0 and only the undrained miss term drives the gate.
-    int dqn = v->streaming ? 0 : (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap;
+    int dqn = v->dq_cap ? (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap : 0;   // 0 in streaming
     v->net_inflight = (uint64_t)(v->rs_n + v->inflight_n + dqn);
     v->work_pending = v->net_inflight + (uint64_t)n;
 
     if (!n) return;
 
-    // Split the drained misses by coverage:
-    //  PRESENT -> keep for the cache fill below.
-    //  ABSENT  -> (build path only) issue ONE download request per region. Streaming
-    //             never yields ABSENT, so every kept miss is filled by a reader
-    //             read-through in mc_cache_update below.
+    // Split the drained misses by local-archive coverage:
+    //  PRESENT -> keep for the cache fill below (decode from local disk -- fast).
+    //  ABSENT  -> issue ONE download request per region (zarr re-encode OR remote-
+    //             .mca verbatim copy, on the download thread -- never here).
     // The miss set is per-block; many blocks map to one 256^3 region, so collapse
     // consecutive same-region absent blocks (misses drain roughly in scan order).
     size_t keep = 0;
@@ -7350,17 +7533,9 @@ void mc_volume_thaw(mc_volume *v) {
     for (size_t i = 0; i < n; ++i) {
         const mc_block_id *b = &miss[i];
         int cz = b->bz / PER, cy = b->by / PER, cx = b->bx / PER;
-        mc_cover cov;
-        if (v->streaming) {
-            // Resolve coverage from the reader (I/O OK here -- single-owner). The
-            // memo probe covers a same-region run after the first resolve memoizes.
-            cov = mc_stream_cov_probe(v, b->lod, cz, cy, cx);
-            if (cov == MC_ABSENT) cov = mc_stream_resolve(v, b->lod, cz, cy, cx);
-        } else {
-            cov = mc_archive_chunk_coverage(v->arc, b->lod, cz, cy, cx);
-        }
+        mc_cover cov = mc_archive_chunk_coverage(v->arc, b->lod, cz, cy, cx);
         if (cov == MC_PRESENT) { miss[keep++] = *b; }
-        else if (cov == MC_ABSENT) {   // build path only
+        else if (cov == MC_ABSENT) {
             uint64_t rq = rkey(b->lod, cz, cy, cx);
             if (rq != last_rq) { req_push(v, b->lod, cz, cy, cx); last_rq = rq; }
         }
@@ -7407,9 +7582,11 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     out->cache_misses = cs.misses;
     out->cache_used_blocks = cs.used;
     out->cache_cap_blocks = cs.slots;
-    out->disk_bytes = v->streaming ? 0 : (v->arc ? mc_archive_data_len(v->arc) : 0);
-    out->net_bytes = (v->streaming && v->s3mca) ? mc_s3_net_bytes(v->s3mca)
-                     : atomic_load_explicit(&v->net_bytes, memory_order_relaxed);
+    out->disk_bytes = v->arc ? mc_archive_data_len(v->arc) : 0;
+    // Streaming pulls bytes two ways: reader callbacks (node tables / serial-path
+    // blobs) counted by mc_s3, plus the batched GETs counted in v->net_bytes.
+    out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed)
+                   + (v->s3mca ? mc_s3_net_bytes(v->s3mca) : 0);
     // Frozen snapshots collated at the last thaw. regions_inflight = real pipeline
     // depth (status bar); work_pending = + undrained misses (render gate).
     out->regions_inflight = v->net_inflight;

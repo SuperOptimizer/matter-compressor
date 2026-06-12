@@ -318,6 +318,12 @@ void mc_reader_set_partial_fetch(mc_reader *r, int on);
 // into another archive via mc_archive_append_chunk_compressed.
 uint64_t mc_reader_chunk_blob_len(mc_reader *r, uint64_t chunk_off);
 
+// Copy `len` bytes of the chunk blob at `chunk_off` into `dst` (flat or streaming
+// reader). The .mca -> .mca verbatim path: mc_chunk_offset -> mc_reader_chunk_blob_len
+// -> this -> mc_archive_append_chunk_compressed. NOT thread-safe on a streaming
+// reader (single decode scratch) -- the caller serializes. Returns 0 on success.
+int mc_reader_read_blob(mc_reader *r, uint64_t chunk_off, size_t len, uint8_t *dst);
+
 // Raw per-volume prior arrays (plo/phi as u16[8][32]); returns 0 if the archive
 // stores none. Feed into mc_archive_set_priors so a local mirror decodes identically.
 int mc_reader_priors(mc_reader *r, const uint16_t **plo, const uint16_t **phi);
@@ -966,12 +972,20 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
                              const mc_volume_config *cfg);
 
 // Open an ALREADY-BUILT .mca (remote s3://... / https://..., or a local file path)
-// and stream blocks from it on demand -- no zarr discovery, no transcode pipeline,
-// no download/decode threads. The reader fetches only the bytes a decode needs
-// (partial-fetch over S3); the resident mc_cache (cache_bytes) holds decoded 16^3
-// blocks. All LODs already live in the archive. Returns NULL on failure. Use this
-// (not mc_volume_open) when the URL is a built .mca rather than an NGFF zarr root.
-mc_volume *mc_volume_open_streaming(const char *url, size_t cache_bytes);
+// and stream it into a LOCAL .mca on demand. Same machinery as mc_volume_open's
+// transcode path -- local archive in `cache_dir`, download threads, decode-from-
+// local THAW -- except the download step copies each fetched 256^3 chunk's
+// compressed blob VERBATIM (no decode/re-encode: a built .mca chunk is already in
+// the local format). Only the chunks the view touches are pulled. `cache_bytes` is
+// the resident RAM budget. Returns NULL on failure. Use this (not mc_volume_open)
+// when the URL is a built .mca rather than an NGFF zarr root.
+mc_volume *mc_volume_open_streaming(const char *url, const char *cache_dir,
+                                    size_t cache_bytes);
+
+// Probe a built .mca's header WITHOUT opening a volume (no local archive, no
+// threads): LOD0 dims (x,y,z), lod count, build quality. `url` = s3://, https://,
+// or a local file path. Any out-param may be NULL. Returns 0 on success.
+int mc_mca_probe(const char *url, int *nx, int *ny, int *nz, int *nlods, float *quality);
 void       mc_volume_free(mc_volume *v);
 
 int  mc_volume_nlods(const mc_volume *v);

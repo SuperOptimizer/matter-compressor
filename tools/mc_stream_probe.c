@@ -7,11 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <url.mca>\n", argv[0]); return 2; }
     const char *url = argv[1];
-    mc_volume *v = mc_volume_open_streaming(url, (size_t)512 << 20);
+    mc_volume *v = mc_volume_open_streaming(url, "/tmp", (size_t)512 << 20);
     if (!v) { fprintf(stderr, "open_streaming FAILED for %s\n", url); return 1; }
 
     int nl = mc_volume_nlods(v);
@@ -27,12 +28,14 @@ int main(int argc, char **argv) {
     int cz = (z0 / 2) / 16, cy = (y0 / 2) / 16, cx = (x0 / 2) / 16;
     uint8_t blk[16 * 16 * 16];
     int r = 0;
-    for (int it = 0; it < 8; ++it) {
+    for (int it = 0; it < 600; ++it) {
         mc_volume_freeze(v);
         r = mc_volume_try_block(v, 0, cz, cy, cx, blk);
         mc_volume_thaw(v);
-        printf("cycle %d: try_block(center)=%d\n", it, r);
+        if (r == 1 || it % 20 == 0) printf("cycle %d: try_block(center)=%d\n", it, r);
         if (r == 1) break;
+        struct timespec ts = {0, 50 * 1000 * 1000};   // 50ms tick, like the GUI
+        nanosleep(&ts, NULL);
     }
     if (r == 1) {
         long sum = 0, nz = 0;
