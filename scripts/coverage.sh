@@ -31,12 +31,12 @@ INC=(-Isrc -Itools/vendor/libs3)
 LIBS=(-lm -lpthread -lzstd -lcurl)
 CFLAGS=(-O1 -g -fprofile-instr-generate -fcoverage-mapping -w "${INC[@]}")
 
-# Offline tests only. mc_zarr_test / mc_volume_test need a fixture root; we
-# build the fixture below and feed it via env so their paths are exercised.
+# Offline tests only. The zarr/volume tests take the fixture root as argv[1]
+# (see RUN_ARGS below); mc_volume_test (the real-network probe) is excluded.
 OFFLINE_TESTS=(
   mc_roundtrip mc_append_roundtrip mc_stream_partial mc_v6_test
   mc_cache_test mc_render_test mc_stream_volume_test mc_archive_concurrent_test
-  mc_volume_test mc_zarr_test
+  mc_volume_offline_test mc_zarr_test mc_api_test
 )
 
 rm -rf "$OUT"; mkdir -p "$OUT/prof" "$OUT/bin"
@@ -60,11 +60,21 @@ for t in "${OFFLINE_TESTS[@]}"; do
   fi
 done
 
+# Per-test argv: the zarr/volume tests take the fixture path; others take none.
+run_args() {
+  case "$1" in
+    mc_zarr_test)          echo "$FIXTURE/zarr/0";;
+    mc_volume_offline_test) echo "$FIXTURE/zarr $OUT";;
+    *) echo "";;
+  esac
+}
+
 # Run each; a nonzero exit (e.g. a test needing real network) is tolerated —
 # we still keep whatever profile it produced for coverage accounting.
 objs=()
 for t in "${built[@]}"; do
-  LLVM_PROFILE_FILE="$OUT/prof/$t.profraw" "$OUT/bin/$t" >/dev/null 2>&1 || \
+  # shellcheck disable=SC2046
+  LLVM_PROFILE_FILE="$OUT/prof/$t.profraw" "$OUT/bin/$t" $(run_args "$t") >/dev/null 2>&1 || \
     echo "note: $t exited nonzero (profile still collected)"
   objs+=(-object "$OUT/bin/$t")
 done

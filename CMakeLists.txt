@@ -118,6 +118,12 @@ if(MC_STANDALONE)
   target_link_libraries(mc_render_test matter_compressor)
   add_test(NAME render COMMAND mc_render_test)
 
+  # public-API surface coverage: introspection getters, codec/quality extras,
+  # colormap + image filters, plane/quad/LOD samplers + parallel renderers.
+  add_executable(mc_api_test tests/mc_api_test.c)
+  target_link_libraries(mc_api_test matter_compressor)
+  add_test(NAME api COMMAND mc_api_test)
+
   add_executable(mc_stream_volume_test tests/mc_stream_volume_test.c)
   target_link_libraries(mc_stream_volume_test matter_compressor)
   add_test(NAME stream_volume COMMAND mc_stream_volume_test)

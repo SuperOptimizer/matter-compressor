@@ -57,3 +57,6 @@ dkms.conf
 # build dir
 /build/
 /build_native/
+
+# coverage output (generated)
+/build_cov/
