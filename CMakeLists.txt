@@ -152,6 +152,13 @@ if(MC_STANDALONE)
   add_executable(mc_bench tools/mc_bench.c)
   target_link_libraries(mc_bench matter_compressor)
 
+  # latency/bandwidth/throughput micro-metrics as JSON (CI logs these; no gate).
+  # block-decode latency, chunk-decode + region-read bandwidth, cache gets/s,
+  # and decode latency over a throttled mock byte-source (deterministic
+  # streaming perf, no network). Complements mc_bench's quality basket.
+  add_executable(mc_microbench tools/mc_microbench.c)
+  target_link_libraries(mc_microbench matter_compressor)
+
   # fysics-style aggressive air masking preprocessor (no deps)
   add_executable(mc_mask tools/mc_mask.c)
 
