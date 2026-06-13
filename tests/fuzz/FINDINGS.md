@@ -1,5 +1,11 @@
 # Fuzzing findings — matter-compressor decode path
 
+> **STATUS: FIXED.** All sites below are hardened (see the `mc:` commit "harden
+> decode path against malformed/untrusted archives"). `tests/mc_decode_robust_test`
+> guards them (hard ctest gate + ASan/UBSan lane); a 240s AFL++ run from valid
+> seeds now finds no crashes. This file is kept as the record of what was found.
+
+
 Harness: `tests/fuzz/mc_fuzz_decode.c` (libFuzzer entrypoint, driven by AFL++ —
 `scripts/fuzz.sh`). Built with ASan+UBSan. A ~45 s AFL++ run from valid-archive
 seeds found crashes within ~1600 execs.
