@@ -1,0 +1,64 @@
+name: s3-bench
+# Opt-in lane: real Vesuvius S3 data + AFL++ fuzzing + benchmark logging.
+# NOT run per-PR (network-dependent, slow). Trigger manually or on a schedule.
+# The Vesuvius open-data buckets are anonymous (no credentials needed).
+on:
+  workflow_dispatch:
+    inputs:
+      zarr:
+        description: "s3:// zarr level URL to fetch a crop from"
+        default: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20231027191953.zarr/0"
+      origin:
+        description: "z0 y0 x0 crop origin"
+        default: "2048 2048 2048"
+      dim:
+        description: "crop edge (voxels)"
+        default: "512"
+  schedule:
+    - cron: "0 6 * * 1"   # weekly Monday 06:00 UTC
+
+jobs:
+  s3-data-bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libzstd-dev
+      - name: build
+        run: cmake -B build -S . -DMC_NO_NATIVE=ON && cmake --build build -j
+      - name: fetch a real Vesuvius crop (anonymous S3) + mask
+        run: |
+          set -x
+          build/mc_fetch "${{ inputs.zarr || 's3://vesuvius-challenge-open-data/PHercParis4/volumes/20231027191953.zarr/0' }}" \
+            ${{ inputs.origin || '2048 2048 2048' }} ${{ inputs.dim || '512' }} /tmp/vol.bin
+          build/mc_mask /tmp/vol.bin ${{ inputs.dim || '512' }} /tmp/masked.bin 1.0
+      - name: benchmarks on real data (log-only)
+        run: |
+          MC_BENCH_VOL=/tmp/masked.bin MC_BENCH_VOLDIM=${{ inputs.dim || '512' }} \
+            CC=clang bash scripts/bench.sh build_bench
+          cat build_bench/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s3-benchmarks
+          path: |
+            build_bench/micro.json
+            build_bench/quality.txt
+
+  afl-fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps + AFL++
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libzstd-dev afl++
+      - name: AFL++ decode fuzz (10 min)
+        run: |
+          export AFL_DIR=/usr/bin AFL_SKIP_CPUFREQ=1
+          # the apt afl++ ships afl-clang-fast; point the script at it.
+          AFL_DIR=$(dirname "$(command -v afl-fuzz)") bash scripts/fuzz.sh 600 build_fuzz || {
+            echo "AFL++ found a crash:"; ls -la build_fuzz/findings/*/crashes/ || true; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: afl-findings
+          path: build_fuzz/findings
