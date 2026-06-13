@@ -544,9 +544,11 @@ static void scanS_build(int S){
     if(atomic_load_explicit(&g_scanS_ready[l],memory_order_acquire)) return;
     pthread_mutex_lock(&g_scanS_mu);
     if(!atomic_load_explicit(&g_scanS_ready[l],memory_order_relaxed)){
-        int n=S*S*S; rc_u32 *ord=malloc(n*sizeof(rc_u32)); for(int i=0;i<n;++i)ord[i]=i;
+        int n=S*S*S; rc_u32 *ord=malloc(n*sizeof(rc_u32));
+        uint16_t *tab=ord?malloc(n*sizeof(uint16_t)):NULL;
+        if(!ord||!tab){ free(ord); free(tab); pthread_mutex_unlock(&g_scanS_mu); return; }
+        for(int i=0;i<n;++i)ord[i]=i;
         scanS_cmp_S=S; qsort(ord,n,sizeof(rc_u32),scanS_cmp);
-        uint16_t *tab=malloc(n*sizeof(uint16_t));
         for(int i=0;i<n;++i)tab[i]=(uint16_t)ord[i];
         free(ord);
         g_scanS[l]=tab;
@@ -796,7 +798,8 @@ void  mc_codec_init(void){ mc_dct_init(); }
 void  mc_codec_set_priors(const uint16_t *plo, const uint16_t *phi){ rc_set_priors(plo,phi); }
 
 void mc_buf_put(mc_buf *b, const void *s, size_t n){
-    if(b->len+n > b->cap){ size_t nc=b->cap?b->cap*2:1<<16; while(nc<b->len+n)nc*=2; b->p=realloc(b->p,nc); b->cap=nc; }
+    if(b->len+n > b->cap){ size_t nc=b->cap?b->cap*2:1<<16; while(nc<b->len+n)nc*=2;
+        void *tmp=realloc(b->p,nc); if(!tmp) return; b->p=tmp; b->cap=nc; }
     memcpy(b->p+b->len,s,n); b->len+=n;
 }
 
@@ -1626,7 +1629,7 @@ uint64_t mc_chunk_compute_hash(const uint8_t *blob, uint64_t blob_len){
 
 // ---------------------------------------------------------------- one-shot build (abuf)
 typedef struct { u8 *p; size_t len, cap; } abuf;
-static void a_reserve(abuf*b,size_t n){ if(b->len+n<=b->cap)return; size_t nc=b->cap?b->cap*2:1<<20; while(nc<b->len+n)nc*=2; b->p=realloc(b->p,nc); b->cap=nc; }
+static void a_reserve(abuf*b,size_t n){ if(b->len+n<=b->cap)return; size_t nc=b->cap?b->cap*2:1<<20; while(nc<b->len+n)nc*=2; void*tmp=realloc(b->p,nc); if(!tmp)return; b->p=tmp; b->cap=nc; }
 static size_t a_put_at(abuf*b,const void*s,size_t n){ a_reserve(b,n); size_t at=b->len; memcpy(b->p+at,s,n); b->len+=n; return at; }
 static size_t a_zero(abuf*b,size_t n){ a_reserve(b,n); size_t at=b->len; memset(b->p+at,0,n); b->len+=n; return at; }
 static void a_u32(abuf*b,size_t at,uint32_t v){ memcpy(b->p+at,&v,4); }
@@ -1669,6 +1672,7 @@ static uint64_t build_lod_dense(mc_codec_ctx *C, abuf*b, const vol_t *V, int ncz
     table_t ***shard = calloc(MC_GRID3,sizeof *shard);
 
     u8 *chunkbuf=malloc((size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK);
+    if(!chunkbuf){ free(root); free(inner); free(shard); return 0; }
 
     for(int cz=0;cz<ncz;++cz)for(int cy=0;cy<ncy;++cy)for(int cx=0;cx<ncx;++cx){
         if(!gather_chunk256(V,cz,cy,cx,chunkbuf)) continue;
@@ -1884,6 +1888,17 @@ static uint64_t w_alloc(mc_archive *w, uint64_t n){
 }
 static void w_write_u64(mc_archive *w, uint64_t at, uint64_t v){ memcpy(w->base+at,&v,8); }
 static uint64_t w_read_u64(mc_archive *w, uint64_t at){ uint64_t v; memcpy(&v,w->base+at,8); return v; }
+// Atomically publish a node offset into a tree slot iff still empty (0). Index nodes
+// are 32KB-aligned (w_alloc bumps by MC_NODE_BYTES) so every u64 slot is 8-aligned ->
+// safe to treat as _Atomic. Returns the offset now in the slot: `want` if we won the
+// CAS, else the offset another thread published first (caller abandons its node).
+static uint64_t w_publish_child(mc_archive *w, uint64_t at, uint64_t want){
+    _Atomic uint64_t *slot = (_Atomic uint64_t*)(void*)(w->base+at);
+    uint64_t exp = 0;
+    if(atomic_compare_exchange_strong_explicit(slot,&exp,want,
+           memory_order_release,memory_order_acquire)) return want;
+    return exp;   // lost the race: someone else's node is live; abandon ours
+}
 
 // growable sink wrapping a writer EOF append (used by encode_chunk_blob via a staging
 // buffer; we encode to RAM first then memcpy the whole blob into one EOF range so the
@@ -1891,7 +1906,8 @@ static uint64_t w_read_u64(mc_archive *w, uint64_t at){ uint64_t v; memcpy(&v,w-
 typedef struct { u8 *p; size_t len, cap; } stage_t;
 static void stage_put(void *out, const void *s, size_t n){
     stage_t *st=(stage_t*)out;
-    if(st->len+n>st->cap){ size_t nc=st->cap?st->cap*2:1<<16; while(nc<st->len+n)nc*=2; st->p=realloc(st->p,nc); st->cap=nc; }
+    if(st->len+n>st->cap){ size_t nc=st->cap?st->cap*2:1<<16; while(nc<st->len+n)nc*=2;
+        void *tmp=realloc(st->p,nc); if(!tmp) return; st->p=tmp; st->cap=nc; }
     memcpy(st->p+st->len,s,n); st->len+=n;
 }
 
@@ -1899,26 +1915,29 @@ static void stage_put(void *out, const void *s, size_t n){
 // offset of the SHARD-table slot that will hold the chunk offset. Creates dense node
 // tables in place as needed (allocated zeroed at EOF, parent slot published last).
 static uint64_t w_ensure_shard_slot(mc_archive *w, int lod, int cz,int cy,int cx){
+    // Decoder/dl threads append concurrently; node creation must be race-free. We
+    // allocate a zeroed node then CAS-publish it into the parent slot. If we lose the
+    // CAS another thread's node is live and we abandon ours (a bounded 32KB bump-alloc
+    // leak, only on genuine concurrent first-touch of the same parent). No lock.
     uint64_t root = w_read_u64(w, MCH_ROOTOFF + (uint64_t)lod*8);
     if(!root){
         uint64_t no = w_alloc(w, MC_NODE_BYTES); if(no==~0ull) return ~0ull;
         memset(w->base+no, 0, MC_NODE_BYTES);
-        // publish root in the header (single writer per (lod) path here; appends to the
-        // same lod are serialized by the caller's per-writer use, but be safe: only set
-        // if still empty).
-        w_write_u64(w, MCH_ROOTOFF+(uint64_t)lod*8, no);
-        root = no;
+        root = w_publish_child(w, MCH_ROOTOFF+(uint64_t)lod*8, no);
     }
     // walk nibble 2 (root) -> nibble 1 (inner) -> nibble 0 (shard slot).
     uint64_t node = root;
     for(int nib=MC_TREE_LEVELS-1; nib>=1; --nib){
         int idx=(mc_nib(cz,nib)*16+mc_nib(cy,nib))*16+mc_nib(cx,nib);
-        uint64_t child = w_read_u64(w, node + (uint64_t)idx*8);
+        // acquire-load to pair with w_publish_child's release: a child offset becomes
+        // visible only after its node's zero-fill, so we never walk into stale bytes.
+        uint64_t child = atomic_load_explicit(
+            (_Atomic uint64_t*)(void*)(w->base + node + (uint64_t)idx*8),
+            memory_order_acquire);
         if(!child){
             uint64_t no = w_alloc(w, MC_NODE_BYTES); if(no==~0ull) return ~0ull;
             memset(w->base+no, 0, MC_NODE_BYTES);
-            w_write_u64(w, node + (uint64_t)idx*8, no);   // publish child slot
-            child = no;
+            child = w_publish_child(w, node + (uint64_t)idx*8, no);
         }
         node = child;
     }
@@ -2730,11 +2749,12 @@ static const u8 *sfetch_chunk(mc_reader *r, uint64_t chunk_off){
     if(sread(r,bm_off,MC_BITMAP_BYTES,bm)!=0) return NULL;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
     u8 *lens=malloc((size_t)npresent*2);
+    if(npresent && !lens) return NULL;
     if(npresent && sread(r,bm_off+MC_BITMAP_BYTES,(uint32_t)(npresent*2),lens)!=0){ free(lens); return NULL; }
     uint64_t paybytes=0; for(int s=0;s<npresent;++s){ uint16_t l; memcpy(&l,lens+(size_t)s*2,2); paybytes+=l; }
     free(lens);
     uint64_t total = (bm_off+MC_BITMAP_BYTES+(uint64_t)npresent*2+paybytes) - chunk_off;
-    r->cbuf = realloc(r->cbuf, total);
+    { void *tmp=realloc(r->cbuf,total); if(!tmp) return NULL; r->cbuf=tmp; }
     if(sread(r,chunk_off,(uint32_t)total,r->cbuf)!=0) return NULL;
     r->cbuf_off=chunk_off; r->cbuf_len=total;
     return r->cbuf;
@@ -2760,7 +2780,7 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
     uint64_t cum=0; for(int s2=0;s2<slot;++s2){ uint16_t l; memcpy(&l,lens+(size_t)s2*2,2); cum+=l; }
     uint16_t mylen; memcpy(&mylen,lens+(size_t)slot*2,2);
     uint64_t pay=chunk_off+MC_BLOB_HDR+r->hdr_fml+MC_BITMAP_BYTES+(uint64_t)r->hdr_np*2+cum;
-    if(r->pbuf_cap<mylen){ r->pbuf=realloc(r->pbuf,mylen); r->pbuf_cap=mylen; }
+    if(r->pbuf_cap<mylen){ void *tmp=realloc(r->pbuf,mylen); if(!tmp) return -1; r->pbuf=tmp; r->pbuf_cap=mylen; }
     if(sread(r,pay,mylen,r->pbuf)!=0) return -1;
     mc_dec_block(r->codec,r->pbuf,mylen,dst);
     return 0;
@@ -2894,8 +2914,12 @@ static void miss_record(mc_cache *c, uint64_t key){
     }
 }
 
+static void shard_free_tables(shard_t *sh);
+static int  shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per);
+
 mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
     mc_cache *c=calloc(1,sizeof *c);
+    if(!c) return NULL;
     c->src=src; c->src_ud=src_ud;
     size_t nslot_total = bytes/BLK_BYTES; if(nslot_total<NSHARD) nslot_total=NSHARD;
     uint32_t per = (uint32_t)(nslot_total/NSHARD); if(per<1)per=1;
@@ -2909,21 +2933,15 @@ mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
     if(!c->arena_base){ free(c); return NULL; }
 #endif
     for(int s=0;s<NSHARD;++s){
-        shard_t *sh=&c->sh[s];
-        sh->nslot=per; sh->hand=0; sh->used=0;
-        sh->arena=(mc_u8*)c->arena_base + (size_t)s*per*BLK_BYTES;
-        sh->map_cap=pow2_at_least(per*2);
-        sh->map_key=calloc(sh->map_cap,8);
-        sh->map_slot=calloc(sh->map_cap,4);
-        sh->slot_key=calloc(per,8);
-        sh->slot_ref=calloc(per,1);
-        sh->fs_cap=per+1; sh->fm_cap=per+1;
-        sh->fs=malloc(4u*sh->fs_cap); sh->fm=malloc(4u*sh->fm_cap);
-        sh->g_cap=per; sh->gfp=calloc(sh->g_cap,4);
-        sh->gset_cap=pow2_at_least(per*2); sh->gset=malloc(4u*sh->gset_cap);
-        memset(sh->gset,0xFF,4u*sh->gset_cap);
-        sh->slot_inmain=calloc(per,1);
-        sh->slot_epoch=calloc(per,4);
+        if(!shard_init_tables(&c->sh[s], (mc_u8*)c->arena_base + (size_t)s*per*BLK_BYTES, per)){
+            for(int j=0;j<s;++j) shard_free_tables(&c->sh[j]);
+#if MC_CACHE_MMAP
+            munmap(c->arena_base,c->arena_bytes);
+#else
+            free(c->arena_base);
+#endif
+            free(c); return NULL;
+        }
     }
     atomic_store(&c->epoch,1);
     return c;
@@ -2939,7 +2957,8 @@ static void shard_free_tables(shard_t *sh){
 
 // (re)allocate a shard's tables for `per` slots pointing at `arena_slice`.
 // Resets the shard to empty. Mutex assumed already init'd + held during resize.
-static void shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per){
+// Returns 0 on allocation failure (shard left freeable: every table is NULL or owned).
+static int shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per){
     sh->nslot=per; sh->hand=0; sh->used=0;
     sh->arena=arena_slice;
     sh->map_cap=pow2_at_least(per*2);
@@ -2952,9 +2971,12 @@ static void shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per){
     sh->fs_head=sh->fs_tail=sh->fm_head=sh->fm_tail=0;
     sh->g_cap=per; sh->gfp=calloc(sh->g_cap,4);
     sh->gset_cap=pow2_at_least(per*2); sh->gset=malloc(4u*sh->gset_cap);
-    memset(sh->gset,0xFF,4u*sh->gset_cap);
     sh->slot_inmain=calloc(per,1);
     sh->slot_epoch=calloc(per,4);
+    if(!sh->map_key||!sh->map_slot||!sh->slot_key||!sh->slot_ref||!sh->fs||!sh->fm||
+       !sh->gfp||!sh->gset||!sh->slot_inmain||!sh->slot_epoch) return 0;
+    memset(sh->gset,0xFF,4u*sh->gset_cap);
+    return 1;
 }
 
 void mc_cache_free(mc_cache *c){
@@ -2986,10 +3008,22 @@ size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
     void *na = malloc(new_arena);
     if(!na) return 0;
 #endif
-    for(int s=0;s<NSHARD;++s){
-        shard_free_tables(&c->sh[s]);
-        shard_init_tables(&c->sh[s], (mc_u8*)na + (size_t)s*per*BLK_BYTES, per);
+    // Build the new shard tables into temporaries first; only commit (free old +
+    // swap) if every shard succeeds, so an OOM leaves the old cache fully intact.
+    shard_t ns[NSHARD]; memset(ns,0,sizeof ns);
+    int ok=1;
+    for(int s=0;s<NSHARD && ok;++s)
+        ok = shard_init_tables(&ns[s], (mc_u8*)na + (size_t)s*per*BLK_BYTES, per);
+    if(!ok){
+        for(int s=0;s<NSHARD;++s) shard_free_tables(&ns[s]);
+#if MC_CACHE_MMAP
+        munmap(na,new_arena);
+#else
+        free(na);
+#endif
+        return 0;
     }
+    for(int s=0;s<NSHARD;++s){ shard_free_tables(&c->sh[s]); c->sh[s]=ns[s]; }
     void *old = c->arena_base; size_t old_bytes = c->arena_bytes;
     c->arena_base = na; c->arena_bytes = new_arena;
     atomic_fetch_add(&c->epoch,1);   // invalidate outstanding pins
@@ -4314,6 +4348,16 @@ typedef struct {
     float sh_dt;                // secondary-march step, voxels
     float curv;                 // ridge/valley shading weight
     float pct;                  // percentile rank (0,1]
+    int ink;                    // MC_COMP_INK: transmission + cone SSS
+    float trans;                // backlight weight [0,1]
+    int lrel;                   // light[] is in the per-pixel surface frame
+    int lock_steps;             // INK sheet-lock: composite this many steps from
+                                // the sheet entry (0 = whole slab). The [t0,t1]
+                                // slab becomes a SEARCH range; the dense run
+                                // nearest t=0 is the sheet.
+    float lock_thr;             // density (post alpha_min scale) that counts as
+                                // sheet material during the search
+    float alut[256];            // per-step opacity 1-exp(-sigma*d*dt), d=i/255
 } rcfg_t;
 
 static rcfg_t make_cfg(const mc_render_params *p) {
@@ -4353,6 +4397,19 @@ static rcfg_t make_cfg(const mc_render_params *p) {
     c.curv = p->curvature;
     c.pct = (p->percentile > 0.0f && p->percentile <= 1.0f) ? p->percentile
                                                             : 0.9f;
+    c.ink = p->comp == MC_COMP_INK;
+    c.trans = p->transmission > 0.0f ? (p->transmission > 1.0f ? 1.0f : p->transmission)
+                                     : (c.ink ? 0.35f : 0.0f);
+    if (c.ink && p->sss <= 0.0f) c.sss = 0.5f;     // ink default: SSS on
+    c.lock_steps = 0;
+    if (c.ink && p->ink_lock > 0.0f) {
+        c.lock_steps = (int)(p->ink_lock / c.dt + 0.5f);
+        if (c.lock_steps < 1) c.lock_steps = 1;
+    }
+    c.lock_thr = 0.35f;        // "solidly sheet" density for the search
+    c.lrel = p->light_surface_rel != 0;
+    for (int i = 0; i < 256; i++)
+        c.alut[i] = 1.0f - expf(-c.sigma * ((float)i * (1.0f / 255.0f)) * c.dt);
     return c;
 }
 
@@ -4412,18 +4469,39 @@ static uint8_t depth_ray(mc_sampler *s, const float *P, float nz, float ny,
     return 0;
 }
 
-// MC_COMP_SHADED: front-to-back emission-absorption along P + t*N with
-// gradient-normal lighting. Headlight default lights from the camera side
-// (-N); an explicit light dir enables raking. Per contributing sample:
-// 6-tap central-difference gradient -> two-sided diffuse + Blinn-Phong
-// specular, weighted by surface-ness so smooth interiors emit unshaded;
-// optional coarse march toward the light for shadows / translucency.
+// Batched point sampling: SIMD tri8/tri4 chunks + scalar tail. The shaded /
+// ink march samples rays, gradient taps and cone taps through this instead of
+// per-point scalar trilinear (which was 50% of the ink profile).
+static inline void mc_s_batchN(mc_sampler *s, const float *bz, const float *by,
+                               const float *bx, float *out, int n, mc_filter f) {
+    int k = 0;
+    if (f == MC_FILTER_TRILINEAR) {
+#ifdef MC_S_HAVE_TRI8
+        for (; k + 8 <= n; k += 8) mc_s_tri8(s, bz + k, by + k, bx + k, out + k);
+#endif
+#if defined(__aarch64__) || defined(__SSE4_1__)
+        for (; k + 4 <= n; k += 4) mc_s_tri4(s, bz + k, by + k, bx + k, out + k);
+#endif
+    }
+    for (; k < n; k++) out[k] = mc_s_sample(s, bz[k], by[k], bx[k], f);
+}
+
+// MC_COMP_SHADED / MC_COMP_INK: front-to-back emission-absorption along
+// P + t*N with gradient-normal lighting (see the header docs). All volume
+// taps run through mc_s_batchN: the slab walk in 64-step chunks, the 6
+// gradient taps as one 8-wide batch, and the (INK) 3-tap cone march as one
+// 36-position batch. Per-step opacity 1-exp(-sigma*d*dt) comes from a 256-
+// entry LUT built per image (sigma*dt is constant); the cone march drops the
+// tau early-break (bounded extra samples, batching wins more).
+#define MC_SH_CHUNK 256
 static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
-                         float nx, const rcfg_t *cfg) {
+                         float nx, const rcfg_t *cfg, const float *Lp) {
     const mc_filter f = cfg->filter;
     const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
-    float Lz = cfg->Lz, Ly = cfg->Ly, Lx = cfg->Lx;
-    if (cfg->headlight) { Lz = -nz; Ly = -ny; Lx = -nx; }
+    float Lz, Ly, Lx;
+    if (Lp) { Lz = Lp[0]; Ly = Lp[1]; Lx = Lp[2]; }          // surface-relative
+    else if (cfg->headlight) { Lz = -nz; Ly = -ny; Lx = -nx; }
+    else { Lz = cfg->Lz; Ly = cfg->Ly; Lx = cfg->Lx; }
     // view = toward the camera = -ray dir; half vector for Blinn-Phong
     float hz = Lz - nz, hy = Ly - ny, hx = Lx - nx;
     float hl = hz * hz + hy * hy + hx * hx;
@@ -4431,72 +4509,173 @@ static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
         hl = 1.0f / sqrtf(hl);
         hz *= hl; hy *= hl; hx *= hl;
     }
+    // cone basis for the INK subsurface taps (two perpendiculars to L)
+    const int ntap = cfg->ink ? 3 : 1;
+    float e1z = 0, e1y = 0, e1x = 0, e2z = 0, e2y = 0, e2x = 0;
+    float dirz[3], diry[3], dirx[3];
+    dirz[0] = Lz; diry[0] = Ly; dirx[0] = Lx;
+    if (ntap > 1) {
+        float az = fabsf(Lz), ay = fabsf(Ly);
+        float bz_ = 0, by_ = 0, bx_ = 0;
+        if (az < 0.9f) bz_ = 1; else if (ay < 0.9f) by_ = 1; else bx_ = 1;
+        e1z = Ly * bx_ - Lx * by_; e1y = Lx * bz_ - Lz * bx_; e1x = Lz * by_ - Ly * bz_;
+        float il = 1.0f / sqrtf(e1z * e1z + e1y * e1y + e1x * e1x + 1e-12f);
+        e1z *= il; e1y *= il; e1x *= il;
+        e2z = Ly * e1x - Lx * e1y; e2y = Lx * e1z - Lz * e1x; e2x = Lz * e1y - Ly * e1z;
+        const float k = 0.35f;
+        for (int t = 1; t < 3; t++) {
+            float dz_ = Lz + (t == 1 ? k * e1z : -k * e2z);
+            float dy_ = Ly + (t == 1 ? k * e1y : -k * e2y);
+            float dx_ = Lx + (t == 1 ? k * e1x : -k * e2x);
+            float il2 = 1.0f / sqrtf(dz_ * dz_ + dy_ * dy_ + dx_ * dx_);
+            dirz[t] = dz_ * il2; diry[t] = dy_ * il2; dirx[t] = dx_ * il2;
+        }
+    }
     const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
-    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
-          px = P[2] + cfg->t0 * nx;
     float acc = 0.0f, T = 1.0f;
     const int want_tau = cfg->shadow > 0.0f || cfg->sss > 0.0f;
-    for (int it = 0; it < cfg->nsteps; it++, pz += sz_, py += sy_, px += sx_) {
-        float v = mc_s_sample(s, pz, py, px, f);
-        float d = (v * (1.0f / 255.0f) - a_th) * a_sc;
-        if (d <= 0.0f) continue;                    // air: free skip
-        if (d > 1.0f) d = 1.0f;
-        float a = 1.0f - expf(-cfg->sigma * d * cfg->dt);
-        // gradient (u8 units / voxel), central differences at 1 voxel
-        float vzp = mc_s_sample(s, pz + 1, py, px, f),
-              vzm = mc_s_sample(s, pz - 1, py, px, f),
-              vyp = mc_s_sample(s, pz, py + 1, px, f),
-              vym = mc_s_sample(s, pz, py - 1, px, f),
-              vxp = mc_s_sample(s, pz, py, px + 1, f),
-              vxm = mc_s_sample(s, pz, py, px - 1, f);
-        float gz = vzp - vzm, gy = vyp - vym, gx = vxp - vxm;
-        float g2 = 0.25f * (gz * gz + gy * gy + gx * gx);
-        float w = g2 / (g2 + cfg->g0sq);            // surface-ness
-        float diff = 0.0f, spec = 0.0f;
-        if (g2 > 1e-8f) {
-            float gi = 1.0f / sqrtf(gz * gz + gy * gy + gx * gx);
-            float uz = gz * gi, uy = gy * gi, ux = gx * gi;
-            diff = fabsf(uz * Lz + uy * Ly + ux * Lx);   // two-sided
-            float ndh = fabsf(uz * hz + uy * hy + ux * hx);
-            spec = powf(ndh, cfg->shin);
-        }
-        float lit = cfg->ka + (1.0f - w) * cfg->kd;     // interior: emissive
-        float Tl = 1.0f;
-        if (want_tau && w > 0.05f) {
-            float tau = 0.0f;
-            float qz = pz + cfg->sh_dt * Lz, qy = py + cfg->sh_dt * Ly,
-                  qx = px + cfg->sh_dt * Lx;
-            for (int j = 0; j < cfg->sh_steps && tau < 6.0f; j++) {
-                float sv = mc_s_sample(s, qz, qy, qx, f);
-                float sd = (sv * (1.0f / 255.0f) - a_th) * a_sc;
-                if (sd > 0.0f) {
-                    if (sd > 1.0f) sd = 1.0f;
-                    tau += cfg->sigma * sd * cfg->sh_dt;
-                }
-                qz += cfg->sh_dt * Lz; qy += cfg->sh_dt * Ly;
-                qx += cfg->sh_dt * Lx;
+
+    float vz[MC_SH_CHUNK], vy[MC_SH_CHUNK], vx[MC_SH_CHUNK], vals[MC_SH_CHUNK];
+    float tb_z[64], tb_y[64], tb_x[64], tb_v[64];   // taps: 8 grad + <=36 cone
+
+    const int total = cfg->lock_steps > 0 && cfg->nsteps > MC_SH_CHUNK
+                          ? MC_SH_CHUNK : cfg->nsteps;   // lock searches chunk 0 only
+    for (int base = 0; base < total && T >= 0.02f; base += MC_SH_CHUNK) {
+        const int m = cfg->nsteps - base < MC_SH_CHUNK ? cfg->nsteps - base
+                                                       : MC_SH_CHUNK;
+        // batch-sample this chunk of the slab walk
+        {
+            float pz = P[0] + (cfg->t0 + (float)base * cfg->dt) * nz;
+            float py = P[1] + (cfg->t0 + (float)base * cfg->dt) * ny;
+            float px = P[2] + (cfg->t0 + (float)base * cfg->dt) * nx;
+            for (int k = 0; k < m; k++) {
+                vz[k] = pz; vy[k] = py; vx[k] = px;
+                pz += sz_; py += sy_; px += sx_;
             }
-            Tl = expf(-tau);
-            lit += cfg->sss * w * expf(-0.3f * tau);    // translucent glow
+            mc_s_batchN(s, vz, vy, vx, vals, m, f);
         }
-        float shfac = 1.0f - cfg->shadow + cfg->shadow * Tl;
-        lit += w * cfg->kd * diff * shfac;
-        if (cfg->curv != 0.0f) {
-            // density Laplacian, free from the gradient taps: negative at
-            // ridges/crests (brighten), positive in cracks/pits (darken)
-            float lap = vzp + vzm + vyp + vym + vxp + vxm - 6.0f * v;
-            float cc = -lap * (1.0f / 510.0f);
-            if (cc > 1.0f) cc = 1.0f; else if (cc < -1.0f) cc = -1.0f;
-            lit += cfg->curv * cc * w;
-            if (lit < 0.0f) lit = 0.0f;
+        int k0 = 0, k1 = m;
+        if (cfg->lock_steps > 0 && base == 0) {
+            // SHEET LOCK: the slab is a SEARCH range. Surfaces wander -- the
+            // sheet may sit in front of, behind, or across t=0 -- so find the
+            // dense run (>=2 consecutive samples above lock_thr) whose center
+            // is nearest the segmentation surface, then composite only
+            // lock_steps from its entry face (the ink-bearing crust). Material
+            // beyond that -- sheet interior, gaps, the neighboring wrap -- is
+            // excluded instead of overlaying papyrus texture on the ink.
+            const int i_surf = cfg->t0 < 0.0f ? (int)(-cfg->t0 / cfg->dt + 0.5f) : 0;
+            int best_s = -1, best_d = 1 << 30;
+            int run_s = -1;
+            for (int k = 0; k <= m; k++) {
+                float d = k < m ? (vals[k] * (1.0f / 255.0f) - cfg->a_min) *
+                                      (cfg->a_op / (1.0f - cfg->a_min))
+                                : 0.0f;
+                if (k < m && d >= cfg->lock_thr) {
+                    if (run_s < 0) run_s = k;
+                } else if (run_s >= 0) {
+                    if (k - run_s >= 2) {                 // a real run, not a fleck
+                        const int center = (run_s + k - 1) >> 1;
+                        const int dist = center > i_surf ? center - i_surf
+                                                         : i_surf - center;
+                        if (dist < best_d) { best_d = dist; best_s = run_s; }
+                    }
+                    run_s = -1;
+                }
+            }
+            if (best_s < 0)
+                return 0;                                 // no sheet in the search slab
+            k0 = best_s > 0 ? best_s - 1 : 0;             // include the entry gradient
+            k1 = best_s + cfg->lock_steps;
+            if (k1 > m) k1 = m;
         }
-        float shade = v * lit + 255.0f * cfg->ks * spec * shfac * w;
-        acc += T * a * shade;
-        T *= 1.0f - a;
-        if (T < 0.02f) break;
+        for (int k = k0; k < k1; k++) {
+            float v = vals[k];
+            float d = (v * (1.0f / 255.0f) - a_th) * a_sc;
+            if (d <= 0.0f) continue;                // air: free skip
+            if (d > 1.0f) d = 1.0f;
+            float a = cfg->alut[(int)(d * 255.0f + 0.5f)];
+            const float pz = vz[k], py = vy[k], px = vx[k];
+            // 6 gradient taps in ONE 8-wide batch (2 dummy lanes)
+            tb_z[0] = pz + 1; tb_y[0] = py;     tb_x[0] = px;
+            tb_z[1] = pz - 1; tb_y[1] = py;     tb_x[1] = px;
+            tb_z[2] = pz;     tb_y[2] = py + 1; tb_x[2] = px;
+            tb_z[3] = pz;     tb_y[3] = py - 1; tb_x[3] = px;
+            tb_z[4] = pz;     tb_y[4] = py;     tb_x[4] = px + 1;
+            tb_z[5] = pz;     tb_y[5] = py;     tb_x[5] = px - 1;
+            tb_z[6] = tb_z[7] = -1; tb_y[6] = tb_y[7] = -1; tb_x[6] = tb_x[7] = -1;
+            mc_s_batchN(s, tb_z, tb_y, tb_x, tb_v, 8, f);
+            const float vzp = tb_v[0], vzm = tb_v[1], vyp = tb_v[2],
+                        vym = tb_v[3], vxp = tb_v[4], vxm = tb_v[5];
+            float gz = vzp - vzm, gy = vyp - vym, gx = vxp - vxm;
+            float g2 = 0.25f * (gz * gz + gy * gy + gx * gx);
+            float w = g2 / (g2 + cfg->g0sq);        // surface-ness
+            float diff = 0.0f, spec = 0.0f;
+            if (g2 > 1e-8f) {
+                float gi = 1.0f / sqrtf(gz * gz + gy * gy + gx * gx);
+                float uz = gz * gi, uy = gy * gi, ux = gx * gi;
+                diff = fabsf(uz * Lz + uy * Ly + ux * Lx);   // two-sided
+                float ndh = fabsf(uz * hz + uy * hy + ux * hx);
+                spec = powf(ndh, cfg->shin);
+            }
+            float lit = cfg->ka + (1.0f - w) * cfg->kd;     // interior: emissive
+            float Tl = 1.0f;
+            if (want_tau && w > 0.05f) {
+                // cone subsurface march: all taps' positions in ONE batch
+                int n = 0;
+                for (int t = 0; t < ntap; t++) {
+                    float qz = pz, qy = py, qx = px;
+                    for (int j = 0; j < cfg->sh_steps; j++) {
+                        qz += cfg->sh_dt * dirz[t];
+                        qy += cfg->sh_dt * diry[t];
+                        qx += cfg->sh_dt * dirx[t];
+                        tb_z[n] = qz; tb_y[n] = qy; tb_x[n] = qx; n++;
+                    }
+                }
+                mc_s_batchN(s, tb_z, tb_y, tb_x, tb_v, n, f);
+                float tl_sum = 0.0f, glow_sum = 0.0f;
+                for (int t = 0; t < ntap; t++) {
+                    float tau = 0.0f;
+                    const float *tv = tb_v + t * cfg->sh_steps;
+                    for (int j = 0; j < cfg->sh_steps; j++) {
+                        float sd = (tv[j] * (1.0f / 255.0f) - a_th) * a_sc;
+                        if (sd > 0.0f) {
+                            if (sd > 1.0f) sd = 1.0f;
+                            tau += cfg->sigma * sd * cfg->sh_dt;
+                        }
+                    }
+                    if (tau > 6.0f) tau = 6.0f;
+                    tl_sum += expf(-tau);
+                    glow_sum += expf(-0.3f * tau);
+                }
+                const float inv_n = 1.0f / (float)ntap;
+                Tl = tl_sum * inv_n;
+                lit += cfg->sss * w * glow_sum * inv_n;     // translucent glow
+            }
+            float shfac = 1.0f - cfg->shadow + cfg->shadow * Tl;
+            lit += w * cfg->kd * diff * shfac;
+            if (cfg->curv != 0.0f) {
+                // density Laplacian, free from the gradient taps: negative at
+                // ridges/crests (brighten), positive in cracks/pits (darken)
+                float lap = vzp + vzm + vyp + vym + vxp + vxm - 6.0f * v;
+                float cc = -lap * (1.0f / 510.0f);
+                if (cc > 1.0f) cc = 1.0f; else if (cc < -1.0f) cc = -1.0f;
+                lit += cfg->curv * cc * w;
+                if (lit < 0.0f) lit = 0.0f;
+            }
+            float shade = v * lit + 255.0f * cfg->ks * spec * shfac * w;
+            acc += T * a * shade;
+            T *= 1.0f - a;
+            if (T < 0.02f) break;
+        }
     }
+    // INK: backlit transmission -- the light that survives the whole slab.
+    // Papyrus is translucent, carbon ink is denser: ink reads locally dark in
+    // transmission while the sheet's thickness/texture modulates around it.
+    if (cfg->trans > 0.0f)
+        acc += T * cfg->trans * 255.0f;
     return to_u8(acc);
 }
+
 
 // Composite one ray. Trilinear rays are consumed in chunks of 4 steps via
 // mc_s_tri4 (NEON gather+lerp on aarch64, ~1.4x the scalar core); the
@@ -4504,7 +4683,7 @@ static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
 // front-to-back order and early-out exact. Positions are P + t*N with t
 // advanced additively, as before.
 static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
-                            const rcfg_t *cfg) {
+                            const rcfg_t *cfg, const float *Tx) {
     if (!pt_valid(P)) return 0;
     if (cfg->comp == MC_COMP_NONE || !N)
         return to_u8(mc_s_sample(s, P[0], P[1], P[2], cfg->filter));
@@ -4516,8 +4695,34 @@ static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
         float nl = 1.0f / sqrtf(n2);
         nz *= nl; ny *= nl; nx *= nl;
     }
-    if (cfg->comp == MC_COMP_SHADED)
-        return shade_ray(s, P, nz, ny, nx, cfg);
+    if (cfg->comp == MC_COMP_SHADED || cfg->comp == MC_COMP_INK) {
+        // Surface-relative raking: build the per-pixel frame from the surface
+        // normal + the screen-x tangent and express light[] in it. light[0] =
+        // elevation component (along -N, toward the camera side), light[2] =
+        // along screen-x (t1), light[1] = along N x t1 (t2). Falls back to the
+        // volume frame when the tangent degenerates.
+        float L[3];
+        const float *Lp = NULL;
+        if (cfg->lrel && !cfg->headlight && Tx) {
+            float tz = Tx[0], ty = Tx[1], tx = Tx[2];
+            const float dn = tz * nz + ty * ny + tx * nx;
+            tz -= dn * nz; ty -= dn * ny; tx -= dn * nx;     // project off N
+            float tl = tz * tz + ty * ty + tx * tx;
+            if (tl > 1e-12f) {
+                tl = 1.0f / sqrtf(tl);
+                tz *= tl; ty *= tl; tx *= tl;
+                // t2 = N x t1, computed in (x,y,z) then stored (z,y,x)
+                const float ux = ny * tz - nz * ty;   // n_y t_z - n_z t_y
+                const float uy = nz * tx - nx * tz;   // n_z t_x - n_x t_z
+                const float uz = nx * ty - ny * tx;   // n_x t_y - n_y t_x
+                L[0] = cfg->Lz * -nz + cfg->Ly * uz + cfg->Lx * tz;
+                L[1] = cfg->Lz * -ny + cfg->Ly * uy + cfg->Lx * ty;
+                L[2] = cfg->Lz * -nx + cfg->Ly * ux + cfg->Lx * tx;
+                Lp = L;
+            }
+        }
+        return shade_ray(s, P, nz, ny, nx, cfg, Lp);
+    }
     if (cfg->comp == MC_COMP_PERCENTILE)
         return pct_ray(s, P, nz, ny, nx, cfg);
     if (cfg->comp == MC_COMP_DEPTH)
@@ -4678,8 +4883,24 @@ void mc_render_points(mc_sampler *s,
         }
         return;
     }
-    for (size_t k = 0; k < n; k++)
-        out[k] = render_pixel(s, pts + k * 3, normals + k * 3, &cfg);
+    const int needT = cfg.lrel && !cfg.headlight &&
+                      (cfg.comp == MC_COMP_SHADED || cfg.comp == MC_COMP_INK);
+    for (size_t k = 0; k < n; k++) {
+        float T[3];
+        const float *Tx = NULL;
+        if (needT && w > 1) {
+            // screen-x tangent from the neighboring pixel's position
+            const size_t col = k % (size_t)w;
+            const float *Pc = pts + k * 3;
+            const float *Pn = pts + (col + 1 < (size_t)w ? k + 1 : k - 1) * 3;
+            if (pt_valid(Pc) && pt_valid(Pn)) {
+                T[0] = Pn[0] - Pc[0]; T[1] = Pn[1] - Pc[1]; T[2] = Pn[2] - Pc[2];
+                if (col + 1 >= (size_t)w) { T[0] = -T[0]; T[1] = -T[1]; T[2] = -T[2]; }
+                Tx = T;
+            }
+        }
+        out[k] = render_pixel(s, pts + k * 3, normals + k * 3, &cfg, Tx);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5432,6 +5653,64 @@ int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
 // occluded by neighbors that sit nearer the camera (smaller depth) by more
 // than a small bias, with a range falloff so a distant other sheet doesn't
 // read as an occluder.
+// Stroke-scale local-contrast band-pass: img += gain * (img - blur(img)).
+// 3-pass separable box blur of width ~sigma approximates a Gaussian; zero
+// pixels (invalid/no-data) are excluded from the blur so holes don't bleed
+// darkness into their surroundings.
+void mc_image_dog(uint8_t *img, int w, int h, float sigma_px, float gain) {
+    if (!img || w <= 0 || h <= 0 || sigma_px < 1.0f || gain == 0.0f) return;
+    const size_t n = (size_t)w * h;
+    // box radius for 3 passes ~= gaussian sigma: r = sigma * sqrt(12/3)/2
+    int r = (int)(sigma_px + 0.5f);
+    if (r < 1) r = 1;
+    if (r > (w < h ? w : h) / 2) r = (w < h ? w : h) / 2;
+    float *a = malloc(n * sizeof *a), *b = malloc(n * sizeof *b);
+    float *wa = malloc(n * sizeof *wa), *wb = malloc(n * sizeof *wb);
+    if (!a || !b || !wa || !wb) { free(a); free(b); free(wa); free(wb); return; }
+    for (size_t i = 0; i < n; i++) { a[i] = (float)img[i]; wa[i] = img[i] ? 1.0f : 0.0f; }
+    for (size_t i = 0; i < n; i++) a[i] *= wa[i];
+    for (int pass = 0; pass < 3; pass++) {
+        // horizontal box
+        for (int y = 0; y < h; y++) {
+            const float *src = a + (size_t)y * w, *sw = wa + (size_t)y * w;
+            float *dst = b + (size_t)y * w, *dw = wb + (size_t)y * w;
+            float sum = 0, wsum = 0;
+            for (int x = 0; x < r && x < w; x++) { sum += src[x]; wsum += sw[x]; }
+            for (int x = 0; x < w; x++) {
+                if (x + r < w) { sum += src[x + r]; wsum += sw[x + r]; }
+                if (x - r - 1 >= 0) { sum -= src[x - r - 1]; wsum -= sw[x - r - 1]; }
+                dst[x] = sum; dw[x] = wsum;
+            }
+        }
+        // vertical box (b -> a)
+        for (int x = 0; x < w; x++) {
+            float sum = 0, wsum = 0;
+            for (int y = 0; y < r && y < h; y++) { sum += b[(size_t)y * w + x]; wsum += wb[(size_t)y * w + x]; }
+            for (int y = 0; y < h; y++) {
+                if (y + r < h) { sum += b[(size_t)(y + r) * w + x]; wsum += wb[(size_t)(y + r) * w + x]; }
+                if (y - r - 1 >= 0) { sum -= b[(size_t)(y - r - 1) * w + x]; wsum -= wb[(size_t)(y - r - 1) * w + x]; }
+                a[(size_t)y * w + x] = sum;
+                wa[(size_t)y * w + x] = wsum;
+            }
+        }
+        // normalize between passes so weights stay box-counts
+        if (pass < 2) {
+            for (size_t i = 0; i < n; i++) {
+                float ww = wa[i];
+                a[i] = ww > 0.0f ? a[i] / ww * (img[i] ? 1.0f : 0.0f) : 0.0f;
+                wa[i] = img[i] ? 1.0f : 0.0f;
+            }
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!img[i]) continue;                  // keep holes black
+        float blur = wa[i] > 0.0f ? a[i] / wa[i] : (float)img[i];
+        float v = (float)img[i] + gain * ((float)img[i] - blur);
+        img[i] = (uint8_t)(v < 1.0f ? 1.0f : v > 255.0f ? 255.0f : v);
+    }
+    free(a); free(b); free(wa); free(wb);
+}
+
 void mc_image_ssao(const uint8_t *depth, int w, int h,
                    float radius_px, float strength, uint8_t *img) {
     if (!depth || !img || w <= 0 || h <= 0) return;
@@ -6544,8 +6823,8 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
         return;
     }
     if (it->nsub == 0) {                               // all air -> ZERO
-        mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, zero256());
-        vol_mark_region(v, it->lod, it->rz, it->ry, it->rx);
+        if (mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, zero256()) == 0)
+            vol_mark_region(v, it->lod, it->rz, it->ry, it->rx);   // else leave absent -> refetch
         pthread_mutex_lock(&v->mu); inflight_del(v, key); pthread_mutex_unlock(&v->mu);
         return;
     }
@@ -6566,8 +6845,8 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
         }
     }
     double t_enc0 = mcv_now();
-    mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, dense);
-    vol_mark_region(v, it->lod, it->rz, it->ry, it->rx);
+    if (mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, dense) == 0)
+        vol_mark_region(v, it->lod, it->rz, it->ry, it->rx);       // else leave absent -> refetch
     double t_end = mcv_now();
     MCVLOG("decoded   lod%d region(%d,%d,%d) codec=%s decode=%.0fms encode=%.0fms",
            it->lod, it->rz, it->ry, it->rx, codec,
@@ -6725,8 +7004,8 @@ static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx
     uint64_t off = mc_chunk_offset_chk(v->rd, lod, rz, ry, rx, &rerr);
     if (rerr) return;                                  // transient: leave ABSENT, retry
     if (off == 0) {                                    // CONFIRMED air -> local ZERO region
-        mc_archive_append_chunk_raw(v->arc, lod, rz, ry, rx, zero256());
-        vol_mark_region(v, lod, rz, ry, rx);
+        if (mc_archive_append_chunk_raw(v->arc, lod, rz, ry, rx, zero256()) == 0)
+            vol_mark_region(v, lod, rz, ry, rx);
         return;
     }
     uint64_t blen = mc_reader_chunk_blob_len(v->rd, off);
@@ -6735,8 +7014,8 @@ static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx
     if (!blob) return;
     if (mc_reader_read_blob(v->rd, off, (size_t)blen, blob) != 0) { free(blob); return; }
     atomic_fetch_add_explicit(&v->net_bytes, blen, memory_order_relaxed);
-    mc_archive_append_chunk_compressed(v->arc, lod, rz, ry, rx, blob, (size_t)blen);
-    vol_mark_region(v, lod, rz, ry, rx);
+    if (mc_archive_append_chunk_compressed(v->arc, lod, rz, ry, rx, blob, (size_t)blen) == 0)
+        vol_mark_region(v, lod, rz, ry, rx);           // else leave absent -> refetch
     free(blob);
 }
 
@@ -6781,8 +7060,8 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
         uint64_t o = mc_chunk_offset_chk(v->rd, lods[i], rz[i], ry[i], rx[i], &rerr);
         if (rerr) continue;                                    // transient: leave ABSENT, retry
         if (o == 0) {                                          // CONFIRMED air -> ZERO region
-            mc_archive_append_chunk_raw(v->arc, lods[i], rz[i], ry[i], rx[i], zero256());
-            vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);
+            if (mc_archive_append_chunk_raw(v->arc, lods[i], rz[i], ry[i], rx[i], zero256()) == 0)
+                vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);  // else leave absent -> refetch
             continue;
         }
         off[i] = o; act[na++] = i;
@@ -6855,9 +7134,9 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
             }
             v->s_blob_ema = (v->s_blob_ema * 7 + (size_t)bl) / 8;   // dl thread only
             if (bl <= avail) {                                 // whole blob in the run
-                mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
-                                                   runr[r].body + rel, (size_t)bl);
-                vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);
+                if (mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
+                                                       runr[r].body + rel, (size_t)bl) == 0)
+                    vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);   // else leave absent -> refetch
             } else {                                           // run-edge tail: one follow-up GET
                 s3_response tail = {0};
                 if (s3_get_range(v->s3mca->cl, v->s3mca->url, off[i] + avail, bl - avail,
@@ -6868,9 +7147,9 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
                     if (blob) {
                         memcpy(blob, runr[r].body + rel, avail);
                         memcpy(blob + avail, tail.body, (size_t)(bl - avail));
-                        mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
-                                                           blob, (size_t)bl);
-                        vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);
+                        if (mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
+                                                               blob, (size_t)bl) == 0)
+                            vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);
                         free(blob);
                     }
                 }

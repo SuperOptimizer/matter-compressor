@@ -122,6 +122,12 @@ if(MC_STANDALONE)
   target_link_libraries(mc_stream_volume_test matter_compressor)
   add_test(NAME stream_volume COMMAND mc_stream_volume_test)
 
+  # concurrent archive append: stresses w_ensure_shard_slot node creation under N
+  # threads (regression guard for the index-corruption publish race).
+  add_executable(mc_archive_concurrent_test tests/mc_archive_concurrent_test.c)
+  target_link_libraries(mc_archive_concurrent_test matter_compressor)
+  add_test(NAME archive_concurrent COMMAND mc_archive_concurrent_test)
+
   # archive repacker: Morton order + clustered index for streaming + offline
   add_executable(mc_export tools/mc_export.c)
   target_include_directories(mc_export PRIVATE src tools/vendor/libs3 ${ZSTD_INC})

@@ -616,6 +616,15 @@ typedef enum {
                             // crosses alpha_min, mapped 1..255 over [t0,t1]
                             // (0 = no hit). A heightfield of the surface --
                             // feed mc_image_ssao, or relight externally.
+    MC_COMP_INK    = 9,     // ink-emphasis physically-based composite: the
+                            // SHADED march plus (a) a backlit TRANSMISSION
+                            // term -- papyrus is translucent, carbon ink is
+                            // denser, so ink reads locally dark-in-
+                            // transmission while sheet texture modulates --
+                            // and (b) a 3-tap cone subsurface march around
+                            // the light for soft morphological light-bleed.
+                            // Pair with mc_image_dog for the stroke-scale
+                            // "locally brighter" band-pass.
 } mc_comp;
 
 typedef struct {
@@ -657,6 +666,24 @@ typedef struct {
                             // valleys) from the density Laplacian -- reads
                             // relief without a favorable light angle.
     float percentile;       // MC_COMP_PERCENTILE rank in (0,1] (0 -> 0.9)
+    float transmission;     // MC_COMP_INK: backlight weight [0,1] -- adds
+                            // T_exit * transmission * 255 (the light left
+                            // after the slab). 0 -> 0.35 in INK mode.
+    int light_surface_rel;  // SHADED/INK: interpret light[] in the PER-PIXEL
+                            // surface frame instead of volume axes: light[0]
+                            // along -normal (elevation), light[2] along the
+                            // screen-x tangent, light[1] along normal x
+                            // tangent. Raking then means "N degrees above the
+                            // local sheet plane" everywhere, instead of one
+                            // volume direction that grazes one wrap and hits
+                            // another head-on.
+    float ink_lock;         // MC_COMP_INK sheet lock, in voxels (0 = off).
+                            // [t0,t1] becomes a SEARCH range: the dense run
+                            // nearest t=0 is taken as the sheet and only
+                            // ink_lock voxels from its entry face composite --
+                            // surfaces wander (sheet in front/behind/across
+                            // the segmentation), and a fixed window overlays
+                            // off-sheet papyrus texture on the ink.
 } mc_render_params;
 
 // ---------------------------------------------------------------------------
@@ -742,6 +769,12 @@ int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
                    const mc_render_params *p, uint8_t *out, int nthreads);
 
 // ---------------------------------------------------------------------------
+// Stroke-scale local-contrast band-pass (ink emphasis): img += gain * (img -
+// gaussian_blur(img, sigma_px)), clamped. Carbon ink at ~stroke scale reads as
+// a local brightness anomaly; pick sigma ~ the stroke width in PIXELS (physical
+// scale / voxel size / vox-per-pixel). Separable 3-pass box blur ~= Gaussian.
+void mc_image_dog(uint8_t *img, int w, int h, float sigma_px, float gain);
+
 // screen-space ambient occlusion (post-process over MC_COMP_DEPTH)
 // ---------------------------------------------------------------------------
 // Darkens pixels whose neighborhood sits nearer the camera in the depth
