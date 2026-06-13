@@ -6560,6 +6560,10 @@ void mc_s3_close(mc_s3 *s){
 
 static void *decoder_main(void *ud);
 static void *dl_main(void *ud);
+static void fill_pool_init(mc_volume *v, int n);
+static void fill_pool_stop(mc_volume *v);
+static void fill_pool_start(mc_volume *v);
+static void fill_pool_wait(mc_volume *v);
 static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int cx);
 static int  inflight_has(mc_volume *v, uint64_t key);   // single-flight (v->mu held)
 static void inflight_add(mc_volume *v, uint64_t key);
@@ -6638,6 +6642,27 @@ struct mc_volume {
     // (decoders run in parallel), instead of serializing download+decode.
     pthread_t decoders[32];
     int ndecoders;
+    // Persistent archive->cache fill pool. thaw() hands it the frame's PRESENT
+    // block set (shard-partitioned, lock-free single-owner writes) and returns;
+    // the workers decode while the frame renders. freeze() waits for them (the
+    // barrier) before flipping frozen, preserving no-mutation-while-frozen.
+    pthread_t fillers[32];
+    int nfillers;
+    mc_block_id *fill_ids;           // OWNED copy of this fill's block set (NOT the
+                                     // thaw thread-local: multiple caches thaw on the
+                                     // same thread and would clobber a shared borrow)
+    size_t fill_ids_cap;             // capacity of fill_ids
+    uint32_t *fill_bucket;           // bucket[s] = head block index for shard s
+    uint32_t *fill_link;             // link[i] = next block index in same shard
+    size_t fill_link_cap;            // capacity of fill_link
+    size_t fill_n;                   // blocks in the current fill set
+    _Atomic uint64_t fill_decoded;   // blocks actually decoded this fill (summed)
+    _Atomic uint64_t fill_epoch;     // bumped by thaw to start a fill
+    _Atomic uint64_t fill_done;      // workers bump after finishing an epoch
+    pthread_mutex_t fill_mu;
+    pthread_cond_t fill_start;       // thaw signals; workers wait
+    pthread_cond_t fill_fin;         // workers signal; freeze waits
+    int fill_stop;
     struct decode_item *dq;    // ring of pending decode items (slot bound is high;
     int dq_cap, dq_head, dq_tail;        // the real backpressure is dq_bytes below)
     size_t dq_bytes;           // compressed bytes currently queued (staging size)
@@ -7007,7 +7032,11 @@ static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx
     int rerr = 0;
     uint64_t off = mc_chunk_offset_chk(v->rd, lod, rz, ry, rx, &rerr);
     if (rerr) return;                                  // transient: leave ABSENT, retry
-    if (off == 0) {                                    // CONFIRMED air -> local ZERO region
+    if (off <= MC_SLOT_ZERO) {                          // CONFIRMED air (absent OR remote
+        // ZERO slot) -> record a local ZERO region. Without this, a remote MC_SLOT_ZERO
+        // (==1) chunk -- the masked margin at mid LODs -- stayed ABSENT locally, so the
+        // render's LOD fallback walked PAST it to a coarser PRESENT level and sampled
+        // the neighbor data bled in by unmasked pyramid downsampling (junk in the void).
         if (mc_archive_append_chunk_raw(v->arc, lod, rz, ry, rx, zero256()) == 0)
             vol_mark_region(v, lod, rz, ry, rx);
         return;
@@ -7063,7 +7092,10 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
         int rerr = 0;
         uint64_t o = mc_chunk_offset_chk(v->rd, lods[i], rz[i], ry[i], rx[i], &rerr);
         if (rerr) continue;                                    // transient: leave ABSENT, retry
-        if (o == 0) {                                          // CONFIRMED air -> ZERO region
+        if (o <= MC_SLOT_ZERO) {                               // CONFIRMED air (absent OR remote
+            // ZERO slot) -> local ZERO region. A remote MC_SLOT_ZERO must record locally
+            // as ZERO, else the masked margin stays ABSENT and the LOD fallback bleeds
+            // coarser PRESENT data into the void.
             if (mc_archive_append_chunk_raw(v->arc, lods[i], rz[i], ry[i], rx[i], zero256()) == 0)
                 vol_mark_region(v, lods[i], rz[i], ry[i], rx[i]);  // else leave absent -> refetch
             continue;
@@ -7414,6 +7446,7 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     v->ndecoders = nd;
     for (int i = 0; i < v->ndecoders; ++i)
         pthread_create(&v->decoders[i], NULL, decoder_main, v);
+    fill_pool_init(v, nd);                              // archive->cache fill, off the GUI thread
     int ndl = (cfg && cfg->dl_threads > 0) ? cfg->dl_threads : 8;
     if (ndl < 1) ndl = 1; if (ndl > 16) ndl = 16;      // dlthreads[16]
     v->ndl = ndl;
@@ -7546,8 +7579,12 @@ mc_volume *mc_volume_open_streaming(const char *url, const char *cache_dir,
     v->ndl = 1;
     for (int i = 0; i < v->ndl; ++i)
         pthread_create(&v->dlthreads[i], NULL, dl_main, v);
-    MCVLOG("open(stream) %s -> %s  nlods=%d dims=%dx%dx%d q=%.1f dl=%d",
-           url, path, v->nlods, n0x, n0y, n0z, v->quality, v->ndl);
+    // Archive->cache fill pool (decode local blobs off the GUI thread). Streaming has
+    // no decode pool, so size from nproc/2.
+    { long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+      fill_pool_init(v, nproc > 2 ? (int)(nproc / 2) : 2); }
+    MCVLOG("open(stream) %s -> %s  nlods=%d dims=%dx%dx%d q=%.1f dl=%d fillers=%d",
+           url, path, v->nlods, n0x, n0y, n0z, v->quality, v->ndl, v->nfillers);
     return v;
 }
 
@@ -7561,6 +7598,9 @@ void mc_volume_free(mc_volume *v) {
         pthread_cond_broadcast(&v->cv);
         pthread_mutex_unlock(&v->mu);
         for (int i = 0; i < v->ndl; ++i) pthread_join(v->dlthreads[i], NULL);
+        fill_pool_stop(v);                     // stop fillers before freeing the cache
+        pthread_mutex_destroy(&v->fill_mu);
+        pthread_cond_destroy(&v->fill_start); pthread_cond_destroy(&v->fill_fin);
         if (v->cache) mc_cache_free(v->cache);
         if (v->arc) mc_archive_close(v->arc);
         if (v->s3mca) mc_s3_close(v->s3mca);   // owns the remote reader
@@ -7591,6 +7631,9 @@ void mc_volume_free(mc_volume *v) {
     }
     pthread_cond_destroy(&v->dq_ne);
     pthread_cond_destroy(&v->dq_nf);
+    fill_pool_stop(v);                         // stop fillers before freeing the cache
+    pthread_mutex_destroy(&v->fill_mu);
+    pthread_cond_destroy(&v->fill_start); pthread_cond_destroy(&v->fill_fin);
     if (v->cache) mc_cache_free(v->cache);
     if (v->arc) mc_archive_close(v->arc);
     for (int i = 0; i < v->nlods; ++i) if (v->lv[i].z) mc_zarr_free(v->lv[i].z);
@@ -7976,7 +8019,27 @@ size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes) {
 // (volume-cartographer's global render tick) can freeze the cache for the
 // duration of a frame's lock-free reads, then thaw between frames to let newly
 // transcoded regions land and to bump the pin epoch.
-void mc_volume_freeze(mc_volume *v) { if (v && v->cache) mc_cache_freeze(v->cache); }
+void mc_volume_freeze(mc_volume *v) {
+    if (!v || !v->cache) return;
+    // Barrier: wait for the fill pool to finish thaw's PRESENT set before freezing,
+    // so no fill write races a frozen read. Then do the render-gen bookkeeping for
+    // what was filled (deferred from thaw -- we only know decoded count after join).
+    if (v->nfillers > 0 && v->fill_n) {
+        fill_pool_wait(v);
+        if (atomic_load_explicit(&v->fill_decoded, memory_order_acquire)) {
+            v->change_gen++;                           // pixels can differ now
+            uint64_t last_mk = ~0ull;                  // mark filled regions (dedup'd)
+            for (size_t i = 0; i < v->fill_n; ++i) {
+                const mc_block_id *b = &v->fill_ids[i];
+                int cz = b->bz / PER, cy = b->by / PER, cx = b->bx / PER;
+                uint64_t rk = rkey(b->lod, cz, cy, cx);
+                if (rk != last_mk) { vol_mark_region(v, b->lod, cz, cy, cx); last_mk = rk; }
+            }
+        }
+        v->fill_n = 0;                                 // consumed (keep fill_ids buffer)
+    }
+    mc_cache_freeze(v->cache);
+}
 
 // Thaw = the single batch-apply step of the render game loop. Between a frame's
 // freeze and the next, the lock-free frozen reads recorded their misses (blocks
@@ -7990,11 +8053,95 @@ void mc_volume_freeze(mc_volume *v) { if (v && v->cache) mc_cache_freeze(v->cach
 //      the render tick more than ~MC_THAW_BUDGET_MS. Leftover blocks re-record
 //      next frame and fill progressively; meanwhile the render shows coarser
 //      resident LODs (mc_lod_sample fallback).
-// INTERMEDIATE: the fill is synchronous on the caller's thread, but bounded.
-// The end-goal game loop runs this fill async on workers (lock-safe vs frozen
-// reads, deferred eviction); that lands incrementally. This stays race-free
-// because mutation happens only here, while unfrozen, before freeze()+render.
-// No network IO happens here; the decode workers staged the bytes to the archive.
+// The archive->cache fill runs on the persistent fill pool (filler_main),
+// OFF the calling (GUI) thread: thaw hands it the PRESENT set and returns;
+// freeze() waits for the pool before flipping frozen. Decode overlaps the
+// frame render. Still race-free: writes are shard-partitioned single-owner and
+// the only frozen-vs-fill barrier is freeze() joining the pool. No network IO.
+
+// One fill-pool worker: owns shards { me, me+nfillers, ... }. Waits for thaw to
+// bump fill_epoch, decodes its shards' blocks (lock-free, single-owner), then
+// signals completion. The shard partition guarantees no two workers touch the
+// same shard, so cache_fill_one needs no lock.
+typedef struct { mc_volume *v; int me; } filler_arg;
+static void *filler_main(void *ud) {
+    filler_arg *a = ud; mc_volume *v = a->v; int me = a->me; free(a);
+    uint64_t seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&v->fill_mu);
+        while (!v->fill_stop &&
+               atomic_load_explicit(&v->fill_epoch, memory_order_relaxed) == seen)
+            pthread_cond_wait(&v->fill_start, &v->fill_mu);
+        if (v->fill_stop) { pthread_mutex_unlock(&v->fill_mu); return NULL; }
+        seen = atomic_load_explicit(&v->fill_epoch, memory_order_relaxed);
+        pthread_mutex_unlock(&v->fill_mu);
+
+        uint64_t dec = 0;
+        if (v->fill_n && v->fill_bucket && v->fill_link && v->fill_ids) {
+            for (int s = me; s < NSHARD; s += v->nfillers)
+                for (uint32_t i = v->fill_bucket[s]; i != UINT32_MAX; i = v->fill_link[i]) {
+                    const mc_block_id *b = &v->fill_ids[i];
+                    dec += (uint64_t)cache_fill_one(v->cache, b->lod, b->bz, b->by, b->bx);
+                }
+        }
+        atomic_fetch_add_explicit(&v->fill_decoded, dec, memory_order_relaxed);
+        // Last worker to finish this epoch signals freeze().
+        pthread_mutex_lock(&v->fill_mu);
+        if (atomic_fetch_add_explicit(&v->fill_done, 1, memory_order_acq_rel) + 1
+            == (uint64_t)v->nfillers)
+            pthread_cond_signal(&v->fill_fin);
+        pthread_mutex_unlock(&v->fill_mu);
+    }
+}
+// Kick the pool on the current fill set (caller filled fill_ids/bucket/link/fill_n).
+static void fill_pool_start(mc_volume *v) {
+    if (v->nfillers <= 0) return;
+    pthread_mutex_lock(&v->fill_mu);
+    atomic_store_explicit(&v->fill_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&v->fill_decoded, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&v->fill_epoch, 1, memory_order_release);
+    pthread_cond_broadcast(&v->fill_start);
+    pthread_mutex_unlock(&v->fill_mu);
+}
+// Wait for the pool to finish the in-flight fill (the freeze barrier).
+static void fill_pool_wait(mc_volume *v) {
+    if (v->nfillers <= 0) return;
+    pthread_mutex_lock(&v->fill_mu);
+    while (atomic_load_explicit(&v->fill_done, memory_order_acquire) < (uint64_t)v->nfillers)
+        pthread_cond_wait(&v->fill_fin, &v->fill_mu);
+    pthread_mutex_unlock(&v->fill_mu);
+}
+// Spawn the persistent fill pool once at open. Sized like the decode pool (the
+// fill is the same DCT decode, just from the local archive). Call after v->cache
+// exists. On failure nfillers stays 0 and thaw falls back to the inline fill.
+static void fill_pool_init(mc_volume *v, int n) {
+    if (n < 1) n = 1; if (n > 32) n = 32;
+    pthread_mutex_init(&v->fill_mu, NULL);
+    pthread_cond_init(&v->fill_start, NULL);
+    pthread_cond_init(&v->fill_fin, NULL);
+    atomic_store(&v->fill_epoch, 0); atomic_store(&v->fill_done, n);   // idle: "epoch 0 done"
+    v->fill_stop = 0; v->nfillers = 0;
+    for (int i = 0; i < n; ++i) {
+        filler_arg *a = malloc(sizeof *a);
+        if (!a) break;
+        a->v = v; a->me = i;
+        if (pthread_create(&v->fillers[i], NULL, filler_main, a) != 0) { free(a); break; }
+        v->nfillers++;
+    }
+}
+static void fill_pool_stop(mc_volume *v) {
+    if (v->nfillers <= 0) return;
+    pthread_mutex_lock(&v->fill_mu);
+    v->fill_stop = 1;
+    pthread_cond_broadcast(&v->fill_start);
+    pthread_mutex_unlock(&v->fill_mu);
+    for (int i = 0; i < v->nfillers; ++i) pthread_join(v->fillers[i], NULL);
+    v->nfillers = 0;
+    free(v->fill_bucket); v->fill_bucket = NULL;
+    free(v->fill_link);   v->fill_link = NULL;
+    free(v->fill_ids);    v->fill_ids = NULL;
+}
+
 #define MC_THAW_BUDGET_MS 5.0
 #define MC_THAW_CHUNK 256          // blocks per mc_cache_update slice (time-checked)
 void mc_volume_thaw(mc_volume *v) {
@@ -8044,32 +8191,69 @@ void mc_volume_thaw(mc_volume *v) {
             if (rq != last_rq) { req_push(v, b->lod, cz, cy, cx); last_rq = rq; }
         }
     }
-    // Fill the PRESENT set in ONE mc_cache_update call: it spawns its worker
-    // threads exactly once (the old per-256-slice loop respawned 16 threads per
-    // slice -- ~2-3ms of pure pthread_create/join overhead per tick, dwarfing the
-    // ~0.01ms/block decode). Small fills run single-threaded (threading <~512
-    // blocks costs more in spawn than it saves). No time-slicing: the fill is the
-    // frame's working set, decode is cheap, and the thread overhead was the cost.
-    double t0 = mcv_now();
-    size_t filled = 0;
-    // Single-threaded fill. The working set per tick is now small (~hundreds of
-    // blocks after region-granular absent dedup) and decode is ~0.02ms/block, so a
-    // fill is a few ms. mc_cache_update's 16-thread spawn+join (~ms of pthread
-    // overhead per call) is NOT worth it at this size -- it made fills slower.
-    // (A persistent fill pool would beat both; that's the next step.)
-    if (keep) filled = mc_cache_update(v->cache, miss, keep, 1);
-    if (filled) {
-        v->change_gen++;                               // pixels can differ now
-        uint64_t last_mk = ~0ull;                      // mark filled regions (dedup'd
-        for (size_t i = 0; i < keep; ++i) {            // superset: errs toward render)
-            int cz = miss[i].bz / PER, cy = miss[i].by / PER, cx = miss[i].bx / PER;
-            uint64_t rk = rkey(miss[i].lod, cz, cy, cx);
-            if (rk != last_mk) { vol_mark_region(v, miss[i].lod, cz, cy, cx); last_mk = rk; }
+    // Hand the PRESENT set to the persistent fill pool and RETURN. The pool decodes
+    // (shard-partitioned, lock-free) while the frame renders; freeze() waits for it
+    // and does the change_gen/region-mark bookkeeping once the fill is complete.
+    // `miss` is thaw's thread-local buffer: stable until the next thaw, which can't
+    // run until the next freeze has drained the pool, so the workers' borrow is safe.
+    if (!keep || v->nfillers <= 0) {
+        // No fill pool (or nothing to fill): do it inline (small/degenerate case).
+        size_t filled = keep ? mc_cache_update(v->cache, miss, keep, 1) : 0;
+        if (filled) {
+            v->change_gen++;
+            uint64_t last_mk = ~0ull;
+            for (size_t i = 0; i < keep; ++i) {
+                int cz = miss[i].bz / PER, cy = miss[i].by / PER, cx = miss[i].bx / PER;
+                uint64_t rk = rkey(miss[i].lod, cz, cy, cx);
+                if (rk != last_mk) { vol_mark_region(v, miss[i].lod, cz, cy, cx); last_mk = rk; }
+            }
         }
+        return;
     }
-    double el = mcv_now() - t0;
-    if (el > 2.0) MCVLOG("thaw fill  drained=%zu present=%zu decoded=%zu in %.1fms (%.3fms/blk)",
-                         n, keep, filled, el, filled ? el/filled : 0.0);
+    // Shard-bucket the PRESENT blocks (same partition mc_cache_update uses) so each
+    // pool worker owns a disjoint set of shards. Buffers grow as needed, reused tick
+    // to tick. On alloc failure fall back to a synchronous inline fill.
+    if (!v->fill_bucket) v->fill_bucket = malloc(NSHARD * sizeof *v->fill_bucket);
+    if (!v->fill_link || v->fill_link_cap < keep) {
+        uint32_t *nl = realloc(v->fill_link, keep * sizeof *v->fill_link);
+        if (nl) { v->fill_link = nl; v->fill_link_cap = keep; }
+    }
+    if (!v->fill_bucket || !v->fill_link || v->fill_link_cap < keep) {
+        size_t filled = mc_cache_update(v->cache, miss, keep, 1);
+        if (filled) { v->change_gen++;
+            uint64_t last_mk = ~0ull;
+            for (size_t i = 0; i < keep; ++i) {
+                int cz = miss[i].bz / PER, cy = miss[i].by / PER, cx = miss[i].bx / PER;
+                uint64_t rk = rkey(miss[i].lod, cz, cy, cx);
+                if (rk != last_mk) { vol_mark_region(v, miss[i].lod, cz, cy, cx); last_mk = rk; } } }
+        return;
+    }
+    // Copy the kept blocks into the volume's OWN buffer: `miss` is thaw's thread-local
+    // scratch, and a sibling cache thawed later in the same tick would overwrite it
+    // while this pool still reads it -> cross-cache block corruption (junk reads).
+    if (!v->fill_ids || v->fill_ids_cap < keep) {
+        mc_block_id *ni = realloc(v->fill_ids, keep * sizeof *v->fill_ids);
+        if (ni) { v->fill_ids = ni; v->fill_ids_cap = keep; }
+    }
+    if (!v->fill_ids || v->fill_ids_cap < keep) {      // alloc failed: inline fallback
+        size_t filled = mc_cache_update(v->cache, miss, keep, 1);
+        if (filled) { v->change_gen++;
+            uint64_t last_mk = ~0ull;
+            for (size_t i = 0; i < keep; ++i) {
+                int cz = miss[i].bz / PER, cy = miss[i].by / PER, cx = miss[i].bx / PER;
+                uint64_t rk = rkey(miss[i].lod, cz, cy, cx);
+                if (rk != last_mk) { vol_mark_region(v, miss[i].lod, cz, cy, cx); last_mk = rk; } } }
+        return;
+    }
+    memcpy(v->fill_ids, miss, keep * sizeof *v->fill_ids);
+    for (int s = 0; s < NSHARD; ++s) v->fill_bucket[s] = UINT32_MAX;
+    for (size_t i = 0; i < keep; ++i) {
+        uint64_t key = bkey(v->fill_ids[i].lod, v->fill_ids[i].bz, v->fill_ids[i].by, v->fill_ids[i].bx);
+        int s = (int)((khash(key) >> 56) & (NSHARD - 1));
+        v->fill_link[i] = v->fill_bucket[s]; v->fill_bucket[s] = (uint32_t)i;
+    }
+    v->fill_n = keep;
+    fill_pool_start(v);                                // workers decode; freeze() waits
 }
 
 size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes) {
