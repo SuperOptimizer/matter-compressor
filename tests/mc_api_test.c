@@ -120,6 +120,17 @@ int main(void){
     CHECK(diff==0,"render_points_par != serial render_points (sum|diff|=%ld)",diff);
     long nzpix=0; for(int i=0;i<W*H;++i) if(im2[i]) nzpix++;
     CHECK(nzpix>0,"plane render produced an all-zero image");
+
+    // MC_COMP_INK: the papyrus ink-detection composite (transmission + cone SSS).
+    // Shares the SHADED emission-absorption march; exercise it explicitly (the
+    // render test covers the other 9 comp modes but not INK).
+    float *ipts=malloc(sizeof(float)*3*W*H),*inrm=malloc(sizeof(float)*3*W*H);
+    mc_plane_gen(&pl,W,H,1.0f,ipts,inrm);
+    mc_render_params ink={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_INK,
+                          .t0=-8,.t1=8,.dt=1,.alpha_min=0.1f,.alpha_opacity=0.8f};
+    uint8_t *iim=calloc(W*H,1);
+    mc_render_points(s,ipts,inrm,W,H,&ink,iim);  // must run + not OOB (ASan)
+    free(ipts);free(inrm);free(iim);
     free(gpts);free(gnrm);free(im1);free(im2);
 
     // ---- LOD pyramid: sample_lods + lod_sampler + lod render ----
