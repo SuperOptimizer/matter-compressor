@@ -8,6 +8,13 @@
 
 static const char *g_root;
 
+// read_shard sink: count chunks that carry payload.
+static void count_sink(void *ud, int cz, int cy, int cx,
+                       const uint8_t *raw, size_t n) {
+    (void)cz; (void)cy; (void)cx; (void)raw;
+    if (n) (*(int *)ud)++;
+}
+
 // filesystem byte source: key is relative to the level dir.
 static int fs_read(void *ud, const char *key, uint64_t off, uint64_t len,
                    uint8_t **out, size_t *out_len) {
@@ -64,6 +71,23 @@ int main(int argc, char **argv) {
 
     // shard_all_air on shard 0.
     printf("shard(0,0,0) all_air=%d\n", mc_zarr_shard_all_air(z, 0, 0, 0));
+
+    // chunk_locate: resolve key + byte range for inner chunk (0,0,0) without fetching.
+    char key[64]; uint64_t loff = 0, lnb = 0;
+    int lst = mc_zarr_chunk_locate(z, 0, 0, 0, key, &loff, &lnb);
+    printf("chunk_locate(0,0,0): st=%d key=%s off=%llu nb=%llu\n",
+           lst, key, (unsigned long long)loff, (unsigned long long)lnb);
+
+    // shard_index: enumerate present chunks in shard (0,0,0).
+    char skey[64]; mc_zarr_range *rng = NULL; int rn = 0;
+    int sst = mc_zarr_shard_index(z, 0, 0, 0, skey, &rng, &rn);
+    printf("shard_index(0,0,0): st=%d key=%s nranges=%d\n", sst, skey, rn);
+    free(rng);
+
+    // read_shard: stream every present chunk of shard (0,0,0) through a sink.
+    int shard_n = 0;
+    mc_zarr_read_shard(z, 0, 0, 0, count_sink, &shard_n);
+    printf("read_shard(0,0,0): %d chunks delivered\n", shard_n);
 
     mc_zarr_free(z);
     return err ? 1 : 0;

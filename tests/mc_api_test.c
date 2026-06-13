@@ -150,7 +150,18 @@ int main(void){
     uint8_t *qim=calloc(W*H,1);
     int qr=mc_render_quad_lod(&ls,&qd,0,0,1.0f,W,H,&rp,qim,2);
     CHECK(qr==0||qr==1,"render_quad_lod rc=%d unexpected",qr);
-    free(qim); free(l1);
+    free(qim);
+
+    // mc_render_points_par_lod: LOD-fallback parallel point render. Points are
+    // NATIVE level-0 coords through the center plane; must paint material.
+    float *lpts=malloc(sizeof(float)*3*W*H);
+    for(int j=0;j<H;++j)for(int i=0;i<W;++i){ float *p=&lpts[3*(j*W+i)];
+        p[0]=N/2.f; p[1]=(float)(N/2 + (j-H/2)); p[2]=(float)(N/2 + (i-W/2)); }
+    uint8_t *lim=calloc(W*H,1);
+    mc_render_points_par_lod(&ls,0,lpts,W,H,&rp,lim,2);
+    long lnz=0; for(int i=0;i<W*H;++i) if(lim[i]) lnz++;
+    CHECK(lnz>0,"render_points_par_lod produced an all-zero image");
+    free(lpts); free(lim); free(l1);
 
     // ---- cache introspection ----
     mc_archive *a=mc_archive_open_dims("/tmp/mc_api.mca",N,N,N,6.0f);
@@ -165,6 +176,16 @@ int main(void){
         CHECK(tr==0,"append_chunk_target rc=%d",tr);
         CHECK(qout>0,"append_chunk_target qout=%g not set",qout);
         free(vox);
+
+        // reserve_index: pre-grow the node tree for a (future) chunk slot.
+        int ri=mc_archive_reserve_index(a,0,1,1,1);
+        CHECK(ri==0||ri>0,"reserve_index rc=%d",ri);
+
+        // set_priors: stamp per-volume context priors (valid in-range tables).
+        static uint16_t plo[8][32], phi[8][32];
+        for(int ci=0;ci<8;++ci)for(int s=0;s<32;++s){ plo[ci][s]=1<<11; phi[ci][s]=1<<11; }
+        int sp=mc_archive_set_priors(a,plo,phi);
+        CHECK(sp==0,"set_priors rc=%d",sp);
 
         mc_cache *c=mc_cache_new_archive((size_t)64<<20,a);
         CHECK(c!=NULL,"cache_new_archive failed");

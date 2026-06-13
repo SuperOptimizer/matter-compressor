@@ -23,12 +23,6 @@ static void on_ready(void *ud){ (void)ud; g_ready++; }
 static mc_u8 probe_src(void *ud,int x,int y,int z){ (void)ud;
     return (x>128&&x<384&&y>96&&y<288&&z>64&&z<192) ? 180 : 0; }
 
-// a zarr shard sink: count chunks delivered.
-static int g_shard_chunks=0;
-static void shard_sink(void *ud,int cz,int cy,int cx,const uint8_t *raw,size_t n){
-    (void)ud;(void)cz;(void)cy;(void)cx;(void)raw; if(n) g_shard_chunks++;
-}
-
 int main(int argc,char**argv){
     const char *root = argc>1?argv[1]:getenv("MC_VOLUME_URL");
     const char *cache = argc>2?argv[2]:"/tmp";
