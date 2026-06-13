@@ -37,11 +37,18 @@ static void exercise(const uint8_t *data, size_t size) {
     if (!r) return;                        // cleanly rejected — good
 
     // mc_metadata reads fixed header fields; its precondition is a header-sized
-    // buffer. mc_open already gated len >= MC_HDR above (it returned non-NULL),
-    // so this is safe here.
+    // buffer (mc_open already gated len >= MC_HDR above). It returns a length
+    // from the header field clamped to the fixed 128KB carveout; for a WELL-
+    // FORMED archive those bytes are present, but a truncated fuzz input may be
+    // shorter, so touch only what actually exists in `data` (the metadata region
+    // starts at the 256-byte header).
     size_t ml = 0;
     const char *m = mc_metadata(data, &ml);
-    if (m && ml) { volatile char sink = m[0]; (void)sink; (void)m[ml - 1]; }
+    if (m && ml) {
+        size_t have = size > 256 ? size - 256 : 0;     // bytes after the header
+        size_t touch = ml < have ? ml : have;
+        for (size_t i = 0; i < touch; ++i) { volatile char sink = m[i]; (void)sink; }
+    }
 
     int nx = 0, ny = 0, nz = 0;
     mc_reader_dims(r, &nx, &ny, &nz);

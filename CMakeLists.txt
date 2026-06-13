@@ -124,6 +124,14 @@ if(MC_STANDALONE)
   target_link_libraries(mc_api_test matter_compressor)
   add_test(NAME api COMMAND mc_api_test)
 
+  # decode-path robustness: malformed/truncated archives must not crash the
+  # read-only consumer surface (mc_open/metadata/chunk_offset/decode_block/
+  # verify). Regression guard for the OOB + float-UB sites AFL++ found
+  # (tests/fuzz/FINDINGS.md). Most valuable run under ASan/UBSan (CI asan lane).
+  add_executable(mc_decode_robust_test tests/mc_decode_robust_test.c)
+  target_link_libraries(mc_decode_robust_test matter_compressor)
+  add_test(NAME decode_robust COMMAND mc_decode_robust_test)
+
   add_executable(mc_stream_volume_test tests/mc_stream_volume_test.c)
   target_link_libraries(mc_stream_volume_test matter_compressor)
   add_test(NAME stream_volume COMMAND mc_stream_volume_test)

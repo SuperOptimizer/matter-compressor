@@ -103,6 +103,26 @@ int main(void){
       put_u32(b,MCH_MAGIC,MC_MAGIC);
       run_case("all-0xFF header", b, T); free(b); }
 
+    // 7. a root that points to an in-bounds node whose chunk-blob offset is valid
+    //    but the blob's internal fields (fmaplen/bitmap/lens) run past EOF. This
+    //    is the mc_chunk_q / mc_block_range / mc_chunk_blob_len family of crashes:
+    //    chunk_off survives the node-tree bound but the blob structure does not.
+    //    We approximate by pointing a LOD root at a region of garbage near EOF;
+    //    mc_blob_struct_ok must reject it (decode -> zeros, verify -> corrupt).
+    { size_t T=MC_HDR + 4096; uint8_t *b=base_header(T);
+      memset(b+MC_HDR,0xAB,4096);                    // garbage "node tree" + blobs
+      put_u64(b,MCH_TOTLEN,T);
+      put_u64(b,MCH_ROOTOFF+0*8, MC_HDR);            // root -> garbage node array
+      run_case("root -> garbage node/blob region", b, T); free(b); }
+
+    // 8. quality field = NaN/Inf in an otherwise plausible tiny blob — exercises
+    //    the float-domain UB guard (NaN -> uint16_t quant cast). A chunk offset
+    //    pointing at a 0xFF f32 (NaN) quality must not poison the quant tables.
+    { size_t T=MC_HDR + 4096; uint8_t *b=base_header(T);
+      memset(b+MC_HDR,0xFF,64);                       // first 4 bytes (q) = NaN bit pattern
+      put_u64(b,MCH_TOTLEN,T);
+      run_case("NaN quality blob field", b, T); free(b); }
+
     printf("mc_decode_robust_test: %d cases, no crash -> OK\n", g_cases);
     return 0;   // reaching here under ASan/UBSan == pass
 }
