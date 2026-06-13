@@ -149,9 +149,30 @@ if(MC_STANDALONE)
   set_property(TARGET mc_fetch PROPERTY C_STANDARD 23)
   target_link_libraries(mc_fetch CURL::libcurl ${ZSTD_LIB})
 
+  # Offline zarr fixture: a tiny on-disk zarr v2 / raw-u8 tree the zarr +
+  # volume read paths run against with NO network (no S3, no c3d encode dep).
+  # A CTest "fixture" target builds the tree once; the offline zarr/volume
+  # tests declare FIXTURES_REQUIRED zarr_fixture so ctest sequences them.
+  add_executable(mc_make_fixture tests/support/mc_make_fixture.c)
+  set(MC_FIXTURE_DIR ${CMAKE_BINARY_DIR}/fixture)
+  add_test(NAME zarr_fixture_setup
+           COMMAND mc_make_fixture ${MC_FIXTURE_DIR})
+  set_tests_properties(zarr_fixture_setup PROPERTIES FIXTURES_SETUP zarr_fixture)
+
   add_executable(mc_zarr_test tests/mc_zarr_test.c)
   set_property(TARGET mc_zarr_test PROPERTY C_STANDARD 23)
   target_link_libraries(mc_zarr_test matter_compressor)
+  add_test(NAME zarr COMMAND mc_zarr_test ${MC_FIXTURE_DIR}/zarr/0)
+  set_tests_properties(zarr PROPERTIES FIXTURES_REQUIRED zarr_fixture)
+
+  # Offline volume path (discovery -> local read -> transcode -> cache -> sample)
+  # against the fixture. The original mc_volume_test below stays a real-network
+  # probe (run manually / in the opt-in S3 lane), so it is NOT registered here.
+  add_executable(mc_volume_offline_test tests/mc_volume_offline_test.c)
+  target_link_libraries(mc_volume_offline_test matter_compressor)
+  add_test(NAME volume_offline
+           COMMAND mc_volume_offline_test ${MC_FIXTURE_DIR}/zarr ${CMAKE_BINARY_DIR})
+  set_tests_properties(volume_offline PROPERTIES FIXTURES_REQUIRED zarr_fixture)
 
   add_executable(mc_volume_test tests/mc_volume_test.c)
   set_property(TARGET mc_volume_test PROPERTY C_STANDARD 23)

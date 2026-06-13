@@ -18,7 +18,10 @@
 #include <sys/stat.h>
 
 #define NLEV 3
-#define CHUNK 64          // inner (== shard) edge for v2
+// Inner (== shard) edge for v2. The mc_volume transcode path supports v2 inner
+// edges of 256 (sub=1) or 128 (sub=2) only — its decode_item sub-chunk arrays
+// are sized [8] = 2^3, so a 256^3 region holds at most 2x2x2 inner chunks.
+#define CHUNK 128
 
 static int mkdirp(const char *path) {
     char tmp[2048]; snprintf(tmp, sizeof tmp, "%s", path);
@@ -44,7 +47,7 @@ static uint8_t voxel(int gx, int gy, int gz, int dim) {
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <out_dir>\n", argv[0]); return 2; }
     const char *out = argv[1];
-    int base = 192;   // LOD0 cube edge
+    int base = 256;   // LOD0 cube edge (one 256^3 volume region; 2^3 inner chunks)
 
     for (int L = 0; L < NLEV; ++L) {
         int dim = base >> L; if (dim < CHUNK) dim = CHUNK;
