@@ -23,10 +23,7 @@ jobs:
       - name: build
         run: CC=clang cmake -B build -S . -DMC_NO_NATIVE=ON -DCMAKE_C_FLAGS="${{ matrix.cflags }}" && cmake --build build -j
       - name: test
-        # Exclude the "robustness" label: the decode-robustness regression test
-        # asserts hardening that hasn't landed yet, so on a plain build a corrupt
-        # input is a raw SIGSEGV. The asan job runs it as a hard assertion.
-        run: ctest --test-dir build --output-on-failure -LE robustness
+        run: ctest --test-dir build --output-on-failure
       - name: deterministic archive metrics
         run: |
           clang -O3 ${{ matrix.cflags }} -w -Isrc -Itools/vendor/libs3 -I/opt/homebrew/include \

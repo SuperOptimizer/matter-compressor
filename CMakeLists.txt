@@ -128,13 +128,8 @@ if(MC_STANDALONE)
   # read-only consumer surface (mc_open/metadata/chunk_offset/decode_block/
   # verify). Regression guard for the OOB + float-UB sites AFL++ found
   # (tests/fuzz/FINDINGS.md); the fix is in tests/fuzz/hardening.patch.md.
-  # It carries the "robustness" label. The ASan/UBSan CI lane runs it as a HARD
-  # assertion (that is where corrupt-input bugs surface as clean errors). The
-  # plain per-PR ctest gate EXCLUDES this label (`ctest -LE robustness`) because,
-  # until the reader hardening lands, an unbounded read is a raw SIGSEGV that
-  # CTest's WILL_FAIL cannot absorb (it only expects nonzero exit, not a signal).
-  # Once hardening lands (tests/fuzz/hardening.patch.md), drop the -LE exclusion
-  # so it gates every build. (See tests/fuzz/FINDINGS.md.)
+  # The reader hardening has landed, so this is a hard gate on every build (and
+  # the ASan/UBSan lane runs it too, where corrupt-input bugs surface cleanly).
   add_executable(mc_decode_robust_test tests/mc_decode_robust_test.c)
   target_link_libraries(mc_decode_robust_test matter_compressor)
   add_test(NAME decode_robust COMMAND mc_decode_robust_test)
