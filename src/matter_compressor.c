@@ -4668,11 +4668,12 @@ static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
             if (T < 0.02f) break;
         }
     }
-    // INK: backlit transmission -- the light that survives the whole slab.
-    // Papyrus is translucent, carbon ink is denser: ink reads locally dark in
-    // transmission while the sheet's thickness/texture modulates around it.
+    // INK: backlit transmission -- the light that survives the slab. Papyrus is
+    // translucent, carbon ink denser, so ink reads locally dark in transmission.
+    // Gate on material actually traversed (1-T): a pure-air ray accumulates nothing
+    // and must stay 0 (air -> black), not glow at trans*255.
     if (cfg->trans > 0.0f)
-        acc += T * cfg->trans * 255.0f;
+        acc += T * cfg->trans * 255.0f * (1.0f - T);
     return to_u8(acc);
 }
 
@@ -5447,7 +5448,10 @@ void mc_colormap_lut(uint32_t lut[256], float win_low, float win_high, int cmap_
         uint8_t v=(uint8_t)(g<0?0:g>255?255:g);
         lut[i]=0xFF000000u|((uint32_t)pal[v][0]<<16)|((uint32_t)pal[v][1]<<8)|(uint32_t)pal[v][2];
     }
-    if(cmap_id!=0) lut[0]=0xFF000000u;
+    // A composite value of 0 means "no material" (air / block edge / air-bitmask),
+    // independent of how it was zeroed -> always black. The colormap (incl. window/
+    // level for grayscale) applies to real data, 1..255, only.
+    lut[0]=0xFF000000u;
 }
 // Apply a 256-ARGB LUT to a w*h u8 image -> ARGB32 (out_stride in pixels).
 void mc_colormap_apply(const uint8_t *vals, int w, int h, const uint32_t lut[256],
