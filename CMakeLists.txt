@@ -198,6 +198,15 @@ if(MC_STANDALONE)
            COMMAND mc_volume_offline_test ${MC_FIXTURE_DIR}/zarr ${CMAKE_BINARY_DIR})
   set_tests_properties(volume_offline PROPERTIES FIXTURES_REQUIRED zarr_fixture)
 
+  # volume/zarr introspection + prefetch + LOD-render surface against the fixture
+  # (get_level_meta, region_gen, request_region, prefetch_level/shard,
+  # sample_lods, set_cache/staging_bytes, set_ready_cb, mc_mca_probe).
+  add_executable(mc_volume_api_test tests/mc_volume_api_test.c)
+  target_link_libraries(mc_volume_api_test matter_compressor)
+  add_test(NAME volume_api
+           COMMAND mc_volume_api_test ${MC_FIXTURE_DIR}/zarr ${CMAKE_BINARY_DIR})
+  set_tests_properties(volume_api PROPERTIES FIXTURES_REQUIRED zarr_fixture)
+
   add_executable(mc_volume_test tests/mc_volume_test.c)
   set_property(TARGET mc_volume_test PROPERTY C_STANDARD 23)
   target_link_libraries(mc_volume_test matter_compressor)
