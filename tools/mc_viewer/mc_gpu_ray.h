@@ -30,11 +30,19 @@ bool mc_gpu_ray_upload(mc_gpu_ray *r, int gz,int gy,int gx,
 
 void mc_gpu_ray_set_lut(mc_gpu_ray *r, const uint32_t lut[256]);
 
-/* Raycast the decoded volume into `target` with the given inverse-view-proj
- * (clip->volume), camera position (volume space), and step (voxels). MIP. */
+/* Composite modes for mc_gpu_ray_render. */
+#define MC_RAY_MIP 0   /* max intensity projection */
+#define MC_RAY_EA  1   /* emission-absorption (transfer function via the LUT's alpha) */
+
+/* Raycast the decoded volume into `target`. inv_view_proj maps clip->volume;
+ * cam_pos is volume space; step in voxels; gain scales the sampled value.
+ * mode = MC_RAY_MIP or MC_RAY_EA. For EA: alpha_min is the value threshold
+ * (below = transparent) and absorption is the Beer-Lambert extinction scale;
+ * the LUT's RGB is emission color and its alpha is per-value base opacity. */
 void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target,
                        const float inv_view_proj[16], const float cam_pos[3],
-                       float step_voxels, float gain);
+                       float step_voxels, float gain,
+                       int mode, float alpha_min, float absorption);
 
 /* The dense 3D texture (for readback validation). */
 SDL_GPUTexture *mc_gpu_ray_volume(mc_gpu_ray *r, int *vx,int *vy,int *vz);
@@ -243,7 +251,8 @@ SDL_GPUTexture *mc_gpu_ray_volume(mc_gpu_ray *r, int *vx,int *vy,int *vz){
 
 void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target,
                        const float inv_view_proj[16], const float cam_pos[3],
-                       float step_voxels, float gain){
+                       float step_voxels, float gain,
+                       int mode, float alpha_min, float absorption){
     if(!r->vol) return;
     SDL_GPUColorTargetInfo cti={0};
     cti.texture=target; cti.load_op=SDL_GPU_LOADOP_CLEAR; cti.store_op=SDL_GPU_STOREOP_STORE;
@@ -257,7 +266,7 @@ void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture 
     mcr_ray_ubo u; SDL_memcpy(u.inv_view_proj,inv_view_proj,16*sizeof(float));
     u.cam_pos[0]=cam_pos[0]; u.cam_pos[1]=cam_pos[1]; u.cam_pos[2]=cam_pos[2]; u.cam_pos[3]=0;
     u.vol_dim[0]=(float)r->vx; u.vol_dim[1]=(float)r->vy; u.vol_dim[2]=(float)r->vz; u.vol_dim[3]=step_voxels;
-    u.params[0]=0; u.params[1]=gain; u.params[2]=0; u.params[3]=0;
+    u.params[0]=(float)mode; u.params[1]=gain; u.params[2]=alpha_min; u.params[3]=absorption;
     SDL_PushGPUFragmentUniformData(cmd,0,&u,sizeof u);
     SDL_DrawGPUPrimitives(rp,3,1,0,0);
     SDL_EndGPURenderPass(rp);

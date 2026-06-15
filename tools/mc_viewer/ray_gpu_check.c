@@ -123,7 +123,7 @@ int main(void){
     SDL_GPUTexture *rt=SDL_CreateGPUTexture(dev,&rtc);
 
     SDL_GPUCommandBuffer *cb2=SDL_AcquireGPUCommandBuffer(dev);
-    mc_gpu_ray_render(R,cb2,rt,ivp,campos,0.5f,1.0f);
+    mc_gpu_ray_render(R,cb2,rt,ivp,campos,0.5f,1.0f, MC_RAY_MIP, 0.0f, 0.0f);
     uint32_t obytes=(uint32_t)RW*RH*4;
     SDL_GPUTransferBufferCreateInfo o={0}; o.usage=SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD; o.size=obytes;
     SDL_GPUTransferBuffer *otb=SDL_CreateGPUTransferBuffer(dev,&o);
@@ -177,10 +177,50 @@ int main(void){
     double frac_close = m2checked ? (double)(m2checked - m2diff) / m2checked : 0.0;
     int m2ok = (nonzero > m2checked/8) && (frac_close > 0.85);
 
-    printf("%s\n", (m1ok && m2ok) ? "ray_gpu_check: OK" : "ray_gpu_check: FAIL");
+    // ---- M3: emission-absorption with a transfer function ----
+    // TF: a viridis-ish color ramp, alpha rising with value (opacity grows
+    // toward the dense ball center). The EA composite should put a bright,
+    // colored, opaque ball on the background.
+    uint32_t tf[256];
+    for(int i=0;i<256;++i){
+        float v=i/255.0f;
+        uint32_t rr=(uint32_t)(255.0f*v);            // R ramps up
+        uint32_t gg=(uint32_t)(255.0f*(0.3f+0.7f*v));
+        uint32_t bb=(uint32_t)(255.0f*(1.0f-v));     // B ramps down
+        uint32_t aa=(uint32_t)(255.0f*v*v);          // alpha ~ v^2 (dense core opaque)
+        tf[i]=(aa<<24)|(rr<<16)|(gg<<8)|bb;
+    }
+    mc_gpu_ray_set_lut(R,tf);
+    SDL_GPUCommandBuffer *cb3=SDL_AcquireGPUCommandBuffer(dev);
+    mc_gpu_ray_render(R,cb3,rt,ivp,campos,0.5f,1.0f, MC_RAY_EA, 0.1f, 4.0f);
+    SDL_GPUTransferBuffer *otb3=SDL_CreateGPUTransferBuffer(dev,&o);
+    SDL_GPUCopyPass *cp3=SDL_BeginGPUCopyPass(cb3);
+    SDL_GPUTextureTransferInfo oi3={0}; oi3.transfer_buffer=otb3; oi3.pixels_per_row=(Uint32)RW; oi3.rows_per_layer=(Uint32)RH;
+    SDL_DownloadFromGPUTexture(cp3,&rr,&oi3);
+    SDL_EndGPUCopyPass(cp3);
+    SDL_GPUFence *f3=SDL_SubmitGPUCommandBufferAndAcquireFence(cb3);
+    SDL_WaitForGPUFences(dev,true,&f3,1); SDL_ReleaseGPUFence(dev,f3);
+    uint32_t *img3=SDL_MapGPUTransferBuffer(dev,otb3,false);
+    // structural check: center pixel (the dense ball core) should be brightly
+    // colored + opaque; a far corner should be background. Coverage > a disk.
+    long ea_lit=0; int bgcorner = img3[0]&0xFFFFFF;
+    int center = img3[(RH/2)*RW + RW/2] & 0xFFFFFF;
+    for(int i=0;i<RW*RH;++i) if((img3[i]&0xFFFFFF)!=bgcorner) ea_lit++;
+    const char *dumpea=SDL_getenv("RAY_DUMP_EA");
+    if(dumpea){ FILE*fp=fopen(dumpea,"wb"); if(fp){ fprintf(fp,"P6\n%d %d\n255\n",RW,RH);
+        for(int i=0;i<RW*RH;++i){ uint32_t p=img3[i]; unsigned char c[3]={(p>>16)&255,(p>>8)&255,p&255}; fwrite(c,1,3,fp);} fclose(fp);
+        fprintf(stderr,"wrote %s\n",dumpea);} }
+    SDL_UnmapGPUTransferBuffer(dev,otb3);
+    printf("M3 (emission-absorption): lit=%ld/%d center=0x%06x corner=0x%06x\n",
+           ea_lit, RW*RH, center, bgcorner);
+    // center must differ from the background corner (the ball rendered) and a
+    // disk-sized region must be lit.
+    int m3ok = (center != bgcorner) && (ea_lit > RW*RH/8);
+
+    printf("%s\n", (m1ok && m2ok && m3ok) ? "ray_gpu_check: OK" : "ray_gpu_check: FAIL");
 
     for(int b=0;b<NB;++b) free(payloads[b].p);
     mc_codec_ctx_free(C); mc_gpu_ray_destroy(R);
     SDL_DestroyGPUDevice(dev); SDL_Quit();
-    return (m1ok && m2ok) ? 0 : 1;
+    return (m1ok && m2ok && m3ok) ? 0 : 1;
 }

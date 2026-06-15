@@ -16,7 +16,8 @@ layout(set = 3, binding = 0) uniform RayUBO {
     mat4 inv_view_proj;   // clip -> world(volume) space
     vec4 cam_pos;         // ray origin (volume space), .w unused
     vec4 vol_dim;         // volume extent in voxels (x,y,z), .w = step (voxels)
-    vec4 params;          // x = mode (0=MIP), y = value gain, z,w unused
+    vec4 params;          // x = mode (0=MIP, 1=emission-absorption), y = gain,
+                          // z = alpha_min, w = absorption
 } u;
 
 // ray vs axis-aligned box [0, vol_dim]; returns (tmin,tmax), tmin<tmax if hit.
@@ -47,16 +48,43 @@ void main() {
         return;
     }
 
-    float dt = max(u.vol_dim.w, 0.25);
+    float dt   = max(u.vol_dim.w, 0.25);
     float gain = max(u.params.y, 1.0);
-    float maxv = 0.0;
-    // MIP: max sample along the ray. Sample in normalized [0,1] texture coords.
-    for (float t = tmin; t <= tmax; t += dt) {
-        vec3 p = ro + rd * t;                 // voxel-space position
-        vec3 uvw = (p + 0.5) / dim;           // -> [0,1], +0.5 voxel-center
-        float s = texture(u_vol, uvw).r;      // r8 unorm -> [0,1]
-        maxv = max(maxv, s);
+    int   mode = int(u.params.x + 0.5);
+
+    if (mode == 0) {
+        // ---- MIP: max sample along the ray ----
+        float maxv = 0.0;
+        for (float t = tmin; t <= tmax; t += dt) {
+            vec3 uvw = (ro + rd * t + 0.5) / dim;
+            maxv = max(maxv, texture(u_vol, uvw).r);
+        }
+        maxv = clamp(maxv * gain, 0.0, 1.0);
+        o_color = texture(u_lut, vec2(maxv * 255.0/256.0 + 0.5/256.0, 0.5));
+        return;
     }
-    maxv = clamp(maxv * gain, 0.0, 1.0);
-    o_color = texture(u_lut, vec2(maxv * 255.0 / 256.0 + 0.5/256.0, 0.5));
+
+    // ---- emission-absorption (VTK-style direct volume rendering) ----
+    // Per step: look up the transfer function (u_lut: rgb = color, a = base
+    // opacity for that value). density d = clamp((v - alpha_min)/(1-alpha_min))
+    // * tf.a; Beer-Lambert opacity a = 1 - exp(-absorption * d * dt). Composite
+    // front-to-back with early-ray-termination. Mirrors the CPU MC_COMP_SHADED
+    // emission-absorption core (lighting added in M4).
+    float alpha_min  = clamp(u.params.z, 0.0, 0.99);
+    float absorption = max(u.params.w, 0.0);
+    vec3  Crgb = vec3(0.0);
+    float A    = 0.0;
+    for (float t = tmin; t <= tmax && A < 0.99; t += dt) {
+        vec3 uvw = (ro + rd * t + 0.5) / dim;
+        float v = clamp(texture(u_vol, uvw).r * gain, 0.0, 1.0);
+        if (v <= alpha_min) continue;
+        vec4 tf = texture(u_lut, vec2(v * 255.0/256.0 + 0.5/256.0, 0.5));
+        float d = (v - alpha_min) / (1.0 - alpha_min) * tf.a;
+        float a = 1.0 - exp(-absorption * d * dt);
+        Crgb += (1.0 - A) * a * tf.rgb;
+        A    += (1.0 - A) * a;
+    }
+    // composite over the background.
+    vec3 bg = vec3(0.04, 0.04, 0.05);
+    o_color = vec4(Crgb + (1.0 - A) * bg, 1.0);
 }
