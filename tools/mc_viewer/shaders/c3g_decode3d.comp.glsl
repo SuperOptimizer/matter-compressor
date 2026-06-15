@@ -24,6 +24,8 @@ const int  MAXSYM = 16;
 const float MC_DZ_FRAC = 0.80;
 
 layout(std430, set = 0, binding = 0) readonly buffer Payloads { uint payload[]; };
+// per block: [byteoff, bytelen, dst]. dst = destination texel origin / 16,
+// packed (x | y<<10 | z<<20) for the atlas/contiguous output (use_dst path).
 layout(std430, set = 0, binding = 1) readonly buffer BlockTab { uint blkoff[]; };
 layout(std430, set = 0, binding = 2) readonly buffer RansFreq { uint freq[]; };
 layout(std430, set = 0, binding = 3) readonly buffer RansCdf  { uint cdf[]; };
@@ -32,11 +34,12 @@ layout(std430, set = 0, binding = 5) readonly buffer StepTab  { float step_tab[]
 layout(std430, set = 0, binding = 6) readonly buffer ScanTab  { uint scan[]; };
 layout(std430, set = 0, binding = 7) readonly buffer DctBasis { float cm[]; };
 
-layout(r8, set = 1, binding = 0) uniform writeonly image3D outVol;   // dense slab voxels
+layout(r8, set = 1, binding = 0) uniform writeonly image3D outVol;   // dense voxels
 
 layout(set = 2, binding = 0) uniform Params {
     uint nblocks;
-    uint gz, gy, gx;        // slab block-grid dims
+    uint gz, gy, gx;        // slab block-grid dims (unused when use_dst != 0)
+    uint use_dst;           // 0 = derive origin from (gz,gy,gx); 1 = blkoff[].dst
 } P;
 
 shared float s_buf0[N3];
@@ -52,14 +55,21 @@ void main() {
     uint lid = gl_LocalInvocationID.x;
     if (b >= P.nblocks) return;
 
-    uint base  = blkoff[2u*b + 0u];
-    uint len   = blkoff[2u*b + 1u];
+    uint base  = blkoff[3u*b + 0u];
+    uint len   = blkoff[3u*b + 1u];
 
-    // block b -> slab block coord (bgz,bgy,bgx) in (gz*gy*gx) raster.
-    uint bgx = b % P.gx;
-    uint bgy = (b / P.gx) % P.gy;
-    uint bgz = b / (P.gx * P.gy);
-    ivec3 borigin = ivec3(int(bgx)*N, int(bgy)*N, int(bgz)*N);   // texel origin (x,y,z)
+    // destination texel origin: either the slab grid position (contiguous) or a
+    // per-block packed origin (atlas brick slot, from blkoff[].dst).
+    ivec3 borigin;
+    if (P.use_dst != 0u) {
+        uint d = blkoff[3u*b + 2u];
+        borigin = ivec3(int(d & 0x3FFu), int((d >> 10) & 0x3FFu), int((d >> 20) & 0x3FFu)) * N;
+    } else {
+        uint bgx = b % P.gx;
+        uint bgy = (b / P.gx) % P.gy;
+        uint bgz = b / (P.gx * P.gy);
+        borigin = ivec3(int(bgx), int(bgy), int(bgz)) * N;
+    }
 
     for (uint i = lid; i < uint(N3); i += gl_WorkGroupSize.x) s_buf0[i] = 0.0;
     for (uint i = lid; i < uint(N3/32); i += gl_WorkGroupSize.x) s_air[i] = 0u;

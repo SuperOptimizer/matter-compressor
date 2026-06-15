@@ -73,7 +73,7 @@ SDL_GPUTexture *mc_gpu_ray_volume(mc_gpu_ray *r, int *vx,int *vy,int *vz);
 static const uint16_t MCR_FREQ[MCR_MAXSYM] =
     { 2200,980,360,180,110,70,48,34,24,18,14,10,8,6,5,21 };
 
-typedef struct { uint32_t nblocks, gz, gy, gx; } mcr_decode_ubo;
+typedef struct { uint32_t nblocks, gz, gy, gx, use_dst; } mcr_decode_ubo;
 typedef struct {
     float inv_view_proj[16];
     float cam_pos[4];
@@ -91,7 +91,7 @@ struct mc_gpu_ray {
     SDL_GPUGraphicsPipeline *ray_pipe;
     SDL_GPUSampler          *vol_samp, *lut_samp;
     SDL_GPUBuffer *b_freq,*b_cdf,*b_slot,*b_step,*b_scan,*b_dct;
-    SDL_GPUBuffer *b_payload,*b_blktab;
+    SDL_GPUBuffer *b_payload,*b_blktab;   // blktab = [off,len,dst] x nblocks
     SDL_GPUTexture *vol;          // dense 3D decoded volume (r8)
     SDL_GPUTexture *lut_tex;      // 256x1 colormap
     int vx,vy,vz;                 // current volume voxel dims
@@ -175,7 +175,7 @@ mc_gpu_ray *mc_gpu_ray_create(SDL_GPUDevice *dev, SDL_GPUTextureFormat swfmt, fl
     r->b_scan=mcr_robuf(dev,sizeof scan); mcr_up(dev,r->b_scan,scan,sizeof scan);
     r->b_dct =mcr_robuf(dev,sizeof cm);   mcr_up(dev,r->b_dct,cm,sizeof cm);
     r->b_payload=mcr_robuf(dev,MCR_PAYLOAD_CAP);
-    r->b_blktab =mcr_robuf(dev,MCR_MAX_BLOCKS*2*4);
+    r->b_blktab =mcr_robuf(dev,MCR_MAX_BLOCKS*3*4);
 
     SDL_GPUSamplerCreateInfo si={0};
     si.address_mode_u=si.address_mode_v=si.address_mode_w=SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
@@ -234,19 +234,20 @@ bool mc_gpu_ray_upload(mc_gpu_ray *r, int gz,int gy,int gx,
         if(!r->vol) return false;
         r->vx=vx; r->vy=vy; r->vz=vz;
     }
-    // pack compressed blocks + [off,len] table.
+    // pack compressed blocks + [off,len,dst] table (dst unused here: use_dst=0,
+    // the contiguous (gz,gy,gx) layout is derived in the shader).
     uint8_t *packed=SDL_malloc(MCR_PAYLOAD_CAP);
-    uint32_t *tab=SDL_malloc((size_t)nb*2*4);
+    uint32_t *tab=SDL_malloc((size_t)nb*3*4);
     uint32_t off=0;
     for(int i=0;i<nb;++i){
         uint32_t l=blobs[i]?lens[i]:0;
         if(off+((l+3)&~3u)>MCR_PAYLOAD_CAP){ SDL_free(packed); SDL_free(tab); return false; }
-        tab[2*i]=off; tab[2*i+1]=l;
+        tab[3*i]=off; tab[3*i+1]=l; tab[3*i+2]=0;
         if(l){ SDL_memcpy(packed+off,blobs[i],l); off+=(l+3)&~3u; }
     }
     if(off==0) off=4;
     mcr_up(r->dev,r->b_payload,packed,off);
-    mcr_up(r->dev,r->b_blktab,tab,(uint32_t)nb*2*4);
+    mcr_up(r->dev,r->b_blktab,tab,(uint32_t)nb*3*4);
     SDL_free(packed); SDL_free(tab);
     r->gz=gz; r->gy=gy; r->gx=gx; r->nblocks=nb;
 
@@ -257,7 +258,7 @@ bool mc_gpu_ray_upload(mc_gpu_ray *r, int gz,int gy,int gx,
     SDL_BindGPUComputePipeline(cp,r->decode_pipe);
     SDL_GPUBuffer *ro[8]={r->b_payload,r->b_blktab,r->b_freq,r->b_cdf,r->b_slot,r->b_step,r->b_scan,r->b_dct};
     SDL_BindGPUComputeStorageBuffers(cp,0,ro,8);
-    mcr_decode_ubo du={ (uint32_t)nb, (uint32_t)gz, (uint32_t)gy, (uint32_t)gx };
+    mcr_decode_ubo du={ (uint32_t)nb, (uint32_t)gz, (uint32_t)gy, (uint32_t)gx, 0u };  // use_dst=0
     SDL_PushGPUComputeUniformData(cb,0,&du,sizeof du);
     SDL_DispatchGPUCompute(cp,(Uint32)nb,1,1);
     SDL_EndGPUComputePass(cp);
