@@ -1497,11 +1497,9 @@ static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,i
 }
 
 // Validate that the chunk blob at `chunk_off` is structurally in-bounds for an
-// `end`-byte buffer: header + fmap + bitmap + present-block lens + all payload
-// bytes lie within [0,end). Returns the total blob length (>0) if so, else 0.
-// Every blob-field reader on the UNTRUSTED path (mc_decode_block,
-// mc_verify_archive) gates on this so no derived offset/length is dereferenced
-// past the buffer. Writer-trusted callers use mc_chunk_blob_len directly.
+// `end`-byte buffer: header+fmap+bitmap+lens+payloads lie within [0,end).
+// Returns the total blob length (>0) if so, else 0. Untrusted-path blob-field
+// readers (mc_decode_block, mc_verify_archive) gate on this.
 static uint64_t mc_blob_struct_ok(const uint8_t*arc, uint64_t chunk_off, uint64_t end){
     if(chunk_off > end || end - chunk_off < (uint64_t)MC_BLOB_HDR) return 0;
     uint16_t fml; memcpy(&fml,arc+chunk_off+12,2);
@@ -2537,11 +2535,8 @@ void mc_archive_close(mc_archive*a){ (void)a; }
 // VERIFY — walk every chunk of every LOD, recompute xxh64, compare to stored.
 // ============================================================================
 long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
-    // Recommended pre-flight for UNTRUSTED archives, so it must be safe on
-    // arbitrary bytes: bound every header-derived offset to [MC_HDR,len) before
-    // dereferencing. A node is an array of MC_GRID3 u64 slots; an out-of-range
-    // node/blob is counted corrupt (or skipped), never dereferenced. <0 if the
-    // buffer is too small to even hold a header.
+    // Recommended pre-flight for UNTRUSTED archives -> safe on arbitrary bytes:
+    // bound every header-derived offset to [MC_HDR,len) before dereferencing.
     if(!arc || len < MC_HDR) return -1;
     const uint64_t NODE_BYTES = (uint64_t)MC_GRID3 * 8;
     #define MC_NODE_OK(off) ((off) >= MC_HDR && (off) <= len && len - (off) >= NODE_BYTES)
@@ -2583,11 +2578,9 @@ long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
 // ============================================================================
 // READER (flat buffer + streaming byte-source)
 // ============================================================================
-// Read the user-metadata region. `arc` is flat-archive bytes of at least the
-// 256-byte header. The region is an ARCHITECTURAL invariant — always at MC_HDR,
-// at most MC_META_CAP bytes (archive data starts at MC_META_END = 128KB) — so
-// bound against that fixed layout, NOT the attacker-controlled MCH_METAOFF/TOTLEN
-// fields. A corrupt length yields a clamped view, never an out-of-bounds read.
+// The metadata region is an ARCHITECTURAL invariant: always at MC_HDR, at most
+// MC_META_CAP bytes (data starts at MC_META_END=128KB). Bound against that fixed
+// layout, NOT the attacker-controlled MCH_METAOFF/TOTLEN fields.
 const char *mc_metadata(const uint8_t *arc, size_t *out_len){
     if(!arc){ if(out_len)*out_len=0; return NULL; }
     uint64_t len; memcpy(&len,arc+MCH_METALEN,8);
@@ -2633,9 +2626,9 @@ static void reader_hdr_load(mc_reader *r, const u8 *hdr){
 }
 
 mc_reader *mc_open(const uint8_t *arc, size_t len){
-    // Untrusted-input gate: a valid flat archive is at least the 256-byte header
-    // with the right magic. Reject anything shorter/garbage so no downstream
-    // path reads header fields past the buffer. (Streaming uses mc_open_streaming.)
+    // Untrusted-input gate: a valid flat archive is >= the 256-byte header with
+    // the right magic. Reject shorter/garbage so no downstream path reads header
+    // fields past the buffer. (Streaming uses mc_open_streaming.)
     if(!arc || len < MC_HDR) return NULL;
     uint32_t magic; memcpy(&magic,arc+MCH_MAGIC,4);
     if(magic != MC_MAGIC) return NULL;
@@ -2644,13 +2637,13 @@ mc_reader *mc_open(const uint8_t *arc, size_t len){
     r->arc=arc; r->len=len;
     r->codec=mc_codec_ctx_new();
     reader_hdr_load(r, arc);
-    // Optional prior blob: install only if the full blob fits and magic matches.
+    // Optional prior blob: install only if the full blob fits + magic matches.
     uint64_t poff; memcpy(&poff,arc+MCH_PRIOROFF,8);
     if(poff && poff <= len && len - poff >= (uint64_t)MC_PRIORS_BYTES){
         uint32_t pmagic; memcpy(&pmagic,arc+poff,4);
         if(pmagic==MC_PRIORS_MAGIC){
             memcpy(r->priors,arc+poff,MC_PRIORS_BYTES); r->has_priors=1;
-            priors_load(arc);                       // offset validated above -> safe
+            priors_load(arc);                       // offset validated -> safe
         }
     }
     return r;
@@ -2853,7 +2846,7 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
 void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
     if(chunk_off<=MC_SLOT_ZERO){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     // Flat reader on untrusted bytes: validate the whole chunk-blob structure is
-    // in-bounds BEFORE reading any blob field (mc_chunk_q / mc_block_range read
+    // in-bounds BEFORE reading any blob field (mc_chunk_q/mc_block_range read
     // header/fmap/bitmap/lens at chunk_off-derived offsets). Streaming fetches
     // bounded windows already.
     if(r->arc && !mc_blob_struct_ok(r->arc, chunk_off, r->len)){
@@ -2874,10 +2867,10 @@ void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_
         blob_origin = 0;
     }
     (void)blob_origin;
-    // Per-chunk quality is an f32 from the (untrusted) blob; a NaN/Inf/OOR value
-    // poisons the quant-table interpolation (NaN -> uint16_t cast is UB). Clamp.
+    // Per-chunk quality is an f32 from the (untrusted) blob; NaN/Inf/OOR poisons
+    // the quant-table interpolation (NaN -> uint16_t cast is UB). Clamp.
     float cq = mc_chunk_q(blob_base,chunk_off);
-    if(!(cq > 0.0f) || cq > 1024.0f) cq = 1.0f;   // !(>0) also catches NaN
+    if(!(cq > 0.0f) || cq > 1024.0f) cq = 1.0f;
     mc_codec_ctx_set_quality(r->codec,cq);
     uint64_t boff; uint32_t blen;
     if(!mc_block_range(blob_base,chunk_off,bz,by,bx,&boff,&blen)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
@@ -6915,7 +6908,12 @@ static void blit_sub(uint8_t *region, const uint8_t *src, int edge,
 // Decode one item (the sub^3 cube for a region) -> assemble 256^3 -> append.
 // Frees the item's raw buffers. Runs on a decode-pool thread (off the download
 // thread). The c3d decode + mc re-encode are the CPU cost we keep off the net.
-static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
+// `dense` and `tile` are PERSISTENT per-decoder-thread scratch (each CHUNK^3 =
+// 16MB), allocated once in decoder_main and reused. Per-call posix_memalign of a
+// 16MB buffer across N decode threads under heavy streaming drove the kernel into
+// direct page reclaim (native_queued_spin_lock_slowpath storm in profiling).
+static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it,
+                       uint8_t *dense, uint8_t *tile) {
     const char *codec = mc_zarr_inner_codec(v->lv[it->lod].z);
     const int edge = CHUNK / it->sub;
     const uint64_t key = rkey(it->lod, it->rz, it->ry, it->rx);
@@ -6932,20 +6930,14 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
         pthread_mutex_lock(&v->mu); inflight_del(v, key); pthread_mutex_unlock(&v->mu);
         return;
     }
-    uint8_t *dense = NULL;
-    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) goto done;
     double t_dec0 = mcv_now();
     if (it->sub == 1) {                                // c3d: chunk == region
         decode_inner(dec, codec, it->raw[0], it->rlen[0], dense, CHUNK);
     } else {                                           // v2: blit the cube
         memset(dense, 0, (size_t)CHUNK * CHUNK * CHUNK);
-        uint8_t *tile = malloc((size_t)edge * edge * edge);
-        if (tile) {
-            for (int k = 0; k < it->nsub; ++k) {
-                decode_inner(dec, codec, it->raw[k], it->rlen[k], tile, edge);
-                blit_sub(dense, tile, edge, it->oz[k], it->oy[k], it->ox[k]);
-            }
-            free(tile);
+        for (int k = 0; k < it->nsub; ++k) {
+            decode_inner(dec, codec, it->raw[k], it->rlen[k], tile, edge);
+            blit_sub(dense, tile, edge, it->oz[k], it->oy[k], it->ox[k]);
         }
     }
     double t_enc0 = mcv_now();
@@ -6955,8 +6947,6 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
     MCVLOG("decoded   lod%d region(%d,%d,%d) codec=%s decode=%.0fms encode=%.0fms",
            it->lod, it->rz, it->ry, it->rx, codec,
            t_enc0 - t_dec0, t_end - t_enc0);
-    free(dense);
-done:
     for (int k = 0; k < it->nsub; ++k) free(it->raw[k]);
     pthread_mutex_lock(&v->mu); inflight_del(v, key); pthread_mutex_unlock(&v->mu);  // single-flight clear
 }
@@ -6969,6 +6959,16 @@ static void *decoder_main(void *ud) {
     mc_thread_setname("mc-decode");        // distinguish in profilers
     c3d_decoder *dec = c3d_decoder_new();
     if (dec) c3d_decoder_set_denoise(dec, false);   // render cache: no denoise pass
+    // Persistent per-thread decode scratch (16MB each), allocated once and reused
+    // across every decode -- per-call 16MB allocs across the pool drove kernel page
+    // reclaim under heavy streaming. tile holds the sub-cube for v2 (edge<=128).
+    uint8_t *dense = NULL, *tile = NULL;
+    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK) ||
+        posix_memalign((void **)&tile,  64, (size_t)CHUNK * CHUNK * CHUNK)) {
+        free(dense); free(tile);
+        if (dec) c3d_decoder_free(dec);
+        return NULL;                                 // OOM at startup: this worker bows out
+    }
     for (;;) {
         pthread_mutex_lock(&v->mu);
         while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
@@ -6984,10 +6984,11 @@ static void *decoder_main(void *ud) {
         pthread_cond_signal(&v->dq_nf);                // wake a blocked producer
         pthread_mutex_unlock(&v->mu);
         atomic_fetch_add_explicit(&v->dec_active, 1, memory_order_relaxed);
-        decode_one(v, dec, &it);
+        decode_one(v, dec, &it, dense, tile);
         atomic_fetch_sub_explicit(&v->dec_active, 1, memory_order_relaxed);
         if (v->ready_cb) v->ready_cb(v->ready_ud);     // region became serveable
     }
+    free(dense); free(tile);
     if (dec) c3d_decoder_free(dec);
     return NULL;
 }
