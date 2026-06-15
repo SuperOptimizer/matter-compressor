@@ -1319,6 +1319,224 @@ void mc_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst){
 }
 
 // ============================================================================
+// c3g — GPU-amenable block codec (static rANS over the quantized DCT levels).
+// See docs/c3g_format.md. Decode reuses the same DCT-16 + dequant as the CABAC
+// path; only the entropy stage differs (a per-block, byte-aligned, static-table
+// rANS one GPU thread can decode — no adaptive/cross-block state). The existing
+// mc_enc/dec_block format and every .mca are UNCHANGED.
+//
+// To guarantee c3g quantizes IDENTICALLY to the production codec without
+// duplicating the (determinism-sensitive) forward/air-fill path, c3g encode
+// runs the real mc_enc_block, recovers its quantized levels + dc + air mask by
+// CABAC-decoding the header/mask/coefs, then re-codes exactly those with rANS.
+// Encode does ~2x work (irrelevant: the goal is decode-side GPU bandwidth).
+// ============================================================================
+
+// --- static rANS (12-bit total, 8-bit renorm), shared constants for CPU+GPU ---
+enum { C3G_TOTAL_BITS=12, C3G_TOTAL=1<<C3G_TOTAL_BITS, C3G_RANS_L=1u<<16,
+       C3G_MAXSYM=16 };
+
+// Symbol mapping for a signed level: sym = min(|v|, MAXSYM-1); the heavy tail
+// (|v| >= MAXSYM-1) carries an Exp-Golomb remainder in a side byte-stream, and
+// every nonzero level carries one sign bit in a side bit-stream. So the rANS
+// alphabet is just the MAXSYM magnitude buckets over the EOB-truncated scan.
+static inline int c3g_sym_of(rc_i16 v){ int a=v<0?-v:v; return a<C3G_MAXSYM-1?a:C3G_MAXSYM-1; }
+
+// Default static frequency table (normalized to C3G_TOTAL). The level histogram
+// is dominated by 0, then ±1, with a fast-decaying tail — a fixed table avoids
+// any per-block table cost and keeps the GPU decoder table tiny + uniform.
+// freqs sum to C3G_TOTAL; tuned to the typical post-quant level distribution.
+static const uint16_t C3G_FREQ[C3G_MAXSYM] = {
+    /*0*/2200, /*1*/980, /*2*/360, /*3*/180, /*4*/110, /*5*/70, /*6*/48, /*7*/34,
+    /*8*/24, /*9*/18, /*10*/14, /*11*/10, /*12*/8, /*13*/6, /*14*/5, /*15(esc)*/21
+};
+static uint16_t C3G_CDF[C3G_MAXSYM+1];          // prefix sums (built once)
+static uint8_t  C3G_SLOT[C3G_TOTAL];            // slot -> symbol (built once)
+static _Atomic int C3G_TAB_READY = 0;
+static pthread_mutex_t C3G_TAB_MU = PTHREAD_MUTEX_INITIALIZER;
+static void c3g_tables_build(void){
+    if(atomic_load_explicit(&C3G_TAB_READY,memory_order_acquire)) return;
+    pthread_mutex_lock(&C3G_TAB_MU);
+    if(!atomic_load_explicit(&C3G_TAB_READY,memory_order_relaxed)){
+        uint32_t acc=0;
+        for(int s=0;s<C3G_MAXSYM;++s){ C3G_CDF[s]=(uint16_t)acc; acc+=C3G_FREQ[s]; }
+        C3G_CDF[C3G_MAXSYM]=(uint16_t)acc;       // == C3G_TOTAL
+        for(int s=0;s<C3G_MAXSYM;++s)
+            for(uint32_t f=C3G_CDF[s];f<C3G_CDF[s+1];++f) C3G_SLOT[f]=(uint8_t)s;
+        atomic_store_explicit(&C3G_TAB_READY,1,memory_order_release);
+    }
+    pthread_mutex_unlock(&C3G_TAB_MU);
+}
+
+// rANS encoder emits the byte stream BACK-TO-FRONT into buf[0..cap); returns the
+// start offset of the produced bytes (bytes live in [ret, cap)). The decoder
+// reads them front-to-back from the recorded initial state.
+typedef struct { uint32_t x; uint8_t *buf; int cap; int pos; } c3g_renc;
+static void c3g_renc_init(c3g_renc *r, uint8_t *buf, int cap){ r->x=C3G_RANS_L; r->buf=buf; r->cap=cap; r->pos=cap; }
+static void c3g_renc_put(c3g_renc *r, int sym){
+    uint32_t freq=C3G_FREQ[sym], cdf=C3G_CDF[sym];
+    // renormalize: emit low bytes while x would overflow the freq slot.
+    uint32_t x_max=((C3G_RANS_L>>C3G_TOTAL_BITS)<<8)*freq;
+    while(r->x>=x_max){ r->buf[--r->pos]=(uint8_t)(r->x&0xFF); r->x>>=8; }
+    r->x=((r->x/freq)<<C3G_TOTAL_BITS)+(r->x%freq)+cdf;
+}
+// rANS decoder reads forward from p[0..len); state seeded by caller.
+typedef struct { uint32_t x; const uint8_t *p; int len; int pos; } c3g_rdec;
+static inline int c3g_rdec_get(c3g_rdec *r){
+    uint32_t slot=r->x&(C3G_TOTAL-1);
+    int sym=C3G_SLOT[slot];
+    r->x=C3G_FREQ[sym]*(r->x>>C3G_TOTAL_BITS)+slot-C3G_CDF[sym];
+    while(r->x<C3G_RANS_L && r->pos<r->len) r->x=(r->x<<8)|r->p[r->pos++];
+    return sym;
+}
+
+// little-endian field helpers
+static inline void c3g_put_u16(uint8_t*b,uint16_t v){ b[0]=(uint8_t)v; b[1]=(uint8_t)(v>>8); }
+static inline void c3g_put_u32(uint8_t*b,uint32_t v){ b[0]=(uint8_t)v; b[1]=(uint8_t)(v>>8); b[2]=(uint8_t)(v>>16); b[3]=(uint8_t)(v>>24); }
+static inline uint16_t c3g_get_u16(const uint8_t*b){ return (uint16_t)(b[0]|(b[1]<<8)); }
+static inline uint32_t c3g_get_u32(const uint8_t*b){ return (uint32_t)b[0]|((uint32_t)b[1]<<8)|((uint32_t)b[2]<<16)|((uint32_t)b[3]<<24); }
+
+// Recover the production codec's quantized levels + dc + air mask for `vox` by
+// running mc_enc_block then CABAC-decoding what it produced. ql[N3] gets the
+// signed levels, *dc the block DC, air[N3] the 0/1 air mask. Returns 1 if the
+// block is coded (nonzero), 0 if all-air.
+static int c3g_recover_levels(mc_codec_ctx *C, const mc_u8 *vox,
+                              rc_i16 *ql, int *dc_out, mc_u8 *air){
+    mc_buf tmp={0}; uint32_t plen=0;
+    int coded=mc_enc_block(C,vox,&tmp,&plen);
+    if(!coded){ free(tmp.p); return 0; }
+    // mirror mc_dec_block's parse to recover dc / air / levels exactly.
+    const uint8_t *p=tmp.p; int dc=0, flags=0; int n=N3;
+    rc_dec d; dec_init(&d,p,plen);
+    const uint16_t (*pri)[RC_NSLOT]=C->pri;
+    ctx_t cf[2]; for(int i=0;i<2;++i) ctx_init_p(&cf[i],RC_PRIOR_FLAG(pri)[i]);
+    ctx_t cd[8]; for(int i=0;i<8;++i) ctx_init_p(&cd[i],RC_PRIOR_DC(pri)[i]);
+    flags |= dec_bit(&d,&cf[0]) ? 1 : 0;
+    flags |= dec_bit(&d,&cf[1]) ? 2 : 0;
+    for(int b=0;b<8;++b) dc=(dc<<1)|dec_bit(&d,&cd[b]);
+    if(flags&1) dec_blockmask(&d,air,C->pri); else memset(air,0,n);
+    dec_block_coefs(&d,ql,MC_BLK,C->pri);
+    // NOTE: c3g intentionally drops the optional max-error corrections (flags&2);
+    // they are an opt-in CABAC-only refinement. GPU decode targets max_err==0.
+    *dc_out=dc;
+    free(tmp.p);
+    return 1;
+}
+
+int mc_c3g_enc_block(mc_codec_ctx *C, const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
+    c3g_tables_build();
+    step_tab_build(C);
+    rc_i16 ql[N3]; mc_u8 air[N3]; int dc=0;
+    if(!c3g_recover_levels(C,vox,ql,&dc,air)){ *len_out=0; return 0; }
+
+    // EOB in ascending-frequency scan order (reuse the shared scan table).
+    scanS_build(MC_BLK); int l=0,t=MC_BLK; while(t>1){t>>=1;l++;} const uint16_t*scan=g_scanS[l];
+    int n=N3; rc_u32 eob=0; for(rc_u32 q=n;q-->0;){ if(ql[scan[q]]!=0){eob=q+1;break;} }
+
+    // side streams: signs (1 bit per nonzero, packed) + Exp-Golomb escapes for
+    // |v| >= MAXSYM-1, in scan order. rANS codes the magnitude symbols.
+    // Build symbol list first; rANS encodes in reverse.
+    int nsym=(int)eob;
+    uint8_t signbuf[N3/8+1]; int signbits=0; memset(signbuf,0,sizeof signbuf);
+    uint8_t escbuf[N3*3]; int esclen=0;
+    // collect escapes/signs forward (decoder consumes them forward too).
+    for(rc_u32 p=0;p<eob;++p){
+        rc_i16 v=ql[scan[p]];
+        if(v!=0){
+            if(v<0) signbuf[signbits>>3]|=(uint8_t)(1u<<(signbits&7));
+            signbits++;
+            int a=v<0?-v:v;
+            if(a>=C3G_MAXSYM-1){            // escape: Exp-Golomb of (a-(MAXSYM-1)) as bytes
+                uint32_t r=(uint32_t)(a-(C3G_MAXSYM-1));
+                // simple LEB128 varint (GPU-trivial to decode)
+                do{ escbuf[esclen++]=(uint8_t)((r&0x7F)|(r>=0x80?0x80:0)); r>>=7; }while(r);
+            }
+        }
+    }
+    // rANS-encode the magnitude symbols (reverse order).
+    uint8_t ransbuf[N3*2]; c3g_renc re; c3g_renc_init(&re,ransbuf,(int)sizeof ransbuf);
+    for(rc_u32 p=eob; p-->0;){ c3g_renc_put(&re,c3g_sym_of(ql[scan[p]])); }
+    int rans_len=re.cap-re.pos; uint32_t init_state=re.x;
+
+    // assemble payload: header | [air mask] | rans stream | sign bytes | esc bytes
+    int has_air=0; for(int i=0;i<n;++i){ if(air[i]){has_air=1;break;} }
+    int signbytes=(signbits+7)>>3;
+    uint8_t hdr[10];
+    hdr[0]=(uint8_t)(has_air?1:0);
+    hdr[1]=(uint8_t)dc;
+    c3g_put_u16(hdr+2,(uint16_t)nsym);
+    c3g_put_u16(hdr+4,(uint16_t)rans_len);
+    c3g_put_u32(hdr+6,init_state);
+    // payload: header | [air bitmask: ceil(N3/8)=512 B] | rANS | signs | escapes
+    // (packed 1 bit/voxel — GPU reads bit (air[i>>3]>>(i&7))&1, still branchless,
+    // 8x smaller than a byte-per-voxel mask).
+    int airbytes = has_air ? ((n+7)>>3) : 0;
+    uint8_t airbits[N3/8];
+    if(has_air){ memset(airbits,0,sizeof airbits);
+        for(int i=0;i<n;++i) if(air[i]) airbits[i>>3]|=(uint8_t)(1u<<(i&7)); }
+    mc_buf_put(out,hdr,sizeof hdr);
+    if(has_air) mc_buf_put(out,airbits,(size_t)airbytes);
+    mc_buf_put(out,ransbuf+re.pos,(size_t)rans_len);
+    mc_buf_put(out,signbuf,(size_t)signbytes);
+    mc_buf_put(out,escbuf,(size_t)esclen);
+
+    *len_out = (uint32_t)(sizeof hdr + airbytes + rans_len + signbytes + esclen);
+    return 1;
+}
+
+void mc_c3g_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst){
+    c3g_tables_build();
+    step_tab_build(C);
+    int n=N3;
+    if(plen<10){ memset(dst,0,n); return; }
+    int has_air=p[0]&1; int dc=p[1];
+    int nsym=c3g_get_u16(p+2);
+    int rans_len=c3g_get_u16(p+4);
+    uint32_t init_state=c3g_get_u32(p+6);
+    if(nsym>n) nsym=n;
+    size_t off=10;
+    const uint8_t *air = has_air ? (p+off) : NULL; if(has_air) off+=(size_t)((n+7)>>3);
+    const uint8_t *rans=p+off; off+=rans_len;
+    const uint8_t *signs=p+off;
+    // bounds: sign bytes follow; escapes after. Clamp to plen for safety.
+    if(off>plen){ memset(dst,0,n); return; }
+
+    scanS_build(MC_BLK); int l=0,t=MC_BLK; while(t>1){t>>=1;l++;} const uint16_t*scan=g_scanS[l];
+    rc_i16 *ql=C->scratch.ql; memset(ql,0,n*sizeof(rc_i16));
+
+    // Decode rANS magnitude symbols (forward), then resolve signs + escapes.
+    // signs occupy ceil(nz/8) bytes right after the rANS stream; escapes follow.
+    c3g_rdec rd; rd.x=init_state; rd.p=rans; rd.len=rans_len; rd.pos=0;
+    int syms[N3];
+    for(int i=0;i<nsym;++i) syms[i]=c3g_rdec_get(&rd);
+    int nz=0; for(int i=0;i<nsym;++i) if(syms[i]!=0) nz++;
+    int signbytes=(nz+7)>>3;
+    const uint8_t *esc = signs + signbytes;
+    int signbit=0; size_t esc_cur=0;
+    for(int i=0;i<nsym;++i){
+        int s=syms[i]; if(!s) continue;
+        int a=s;
+        if(s==C3G_MAXSYM-1){                 // escape: read LEB128 remainder
+            uint32_t r=0; int sh=0; uint8_t b;
+            do{ b=esc[esc_cur++]; r|=(uint32_t)(b&0x7F)<<sh; sh+=7; }while(b&0x80);
+            a=(int)(C3G_MAXSYM-1)+(int)r;
+        }
+        int neg=(signs[signbit>>3]>>(signbit&7))&1; signbit++;
+        ql[scan[i]]=(rc_i16)(neg?-a:a);
+    }
+
+    // dequant -> inverse DCT -> clamp + dc + air mask (same back-end as CABAC).
+    mc_tls_t *T=&C->scratch; float *coef=T->coef, *blk=T->blk;
+    for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],C->step_tab[idx]);
+    mc_dct3_inv(&C->dct,coef,blk);
+    for(int i=0;i<n;++i){
+        int isair = has_air && ((air[i>>3]>>(i&7))&1);
+        int v = isair ? 0 : (int)lrintf(blk[i])+dc;
+        if(v<0)v=0; if(v>255)v=255; dst[i]=(mc_u8)v;
+    }
+}
+
+// ============================================================================
 // mc_archive.h — matter-compressor on-disk archive format constants.
 //
 // An APPENDABLE, crash-safe, persistent archive: a node tree of dense 256^3 chunks,

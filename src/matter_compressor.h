@@ -113,6 +113,22 @@ int   mc_enc_block(mc_codec_ctx *ctx, const mc_u8 *vox, mc_buf *out, uint32_t *l
 // contained (mask in payload); plen comes from the chunk's block-length table.
 void  mc_dec_block(mc_codec_ctx *ctx, const mc_u8 *payload, uint32_t plen, mc_u8 *dst);
 
+// ---------------------------------------------------------------------------
+// c3g — GPU-amenable block codec (parallel rANS entropy; see docs/c3g_format.md)
+// ---------------------------------------------------------------------------
+// A SEPARATE, additional 16^3 block format whose payload one GPU thread can
+// decode (static rANS, no adaptive/cross-block state) while reusing the same
+// DCT-16 + dead-zone quant as the CABAC codec. The existing mc_enc/dec_block
+// format is unchanged. Same ctx (quality/scratch) drives both.
+//
+// Encode: same quant as mc_enc_block, then rANS-code the coefficient levels.
+// Appends a self-contained payload to `out`, sets *len_out. Returns 1 if coded,
+// 0 if the block is all-air (no payload, like mc_enc_block).
+int   mc_c3g_enc_block(mc_codec_ctx *ctx, const mc_u8 *vox, mc_buf *out, uint32_t *len_out);
+// Decode a c3g payload of `plen` bytes into dst (16^3). The reference the GPU
+// compute decoder must match bit-for-bit (same bytes in -> same 4096 voxels).
+void  mc_c3g_dec_block(mc_codec_ctx *ctx, const mc_u8 *payload, uint32_t plen, mc_u8 *dst);
+
 // per-chunk material-fraction map (4096 nibbles 0..15), context-coded.
 uint32_t mc_enc_fracmap(const mc_u8 *frac, mc_u8 *out, size_t cap);
 void     mc_dec_fracmap(const mc_u8 *in, uint32_t len, mc_u8 *frac);

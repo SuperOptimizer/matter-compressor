@@ -118,6 +118,11 @@ if(MC_STANDALONE)
   target_link_libraries(mc_render_test matter_compressor)
   add_test(NAME render COMMAND mc_render_test)
 
+  # c3g (GPU-amenable rANS block codec) parity vs CABAC + determinism.
+  add_executable(mc_c3g_test tests/mc_c3g_test.c)
+  target_link_libraries(mc_c3g_test matter_compressor)
+  add_test(NAME c3g COMMAND mc_c3g_test)
+
   # public-API surface coverage: introspection getters, codec/quality extras,
   # colormap + image filters, plane/quad/LOD samplers + parallel renderers.
   add_executable(mc_api_test tests/mc_api_test.c)
