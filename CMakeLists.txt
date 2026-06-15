@@ -135,6 +135,13 @@ if(MC_STANDALONE)
   add_test(NAME decode_robust COMMAND mc_decode_robust_test)
   set_tests_properties(decode_robust PROPERTIES LABELS robustness)
 
+  # archive/reader error paths: dims-mismatch reopen rejection, reopen load,
+  # mca_probe on missing/garbage, mc_open untrusted-input gate. (Caught an 8MB
+  # leak on the rejected-open path under LSan.)
+  add_executable(mc_archive_errpaths_test tests/mc_archive_errpaths_test.c)
+  target_link_libraries(mc_archive_errpaths_test matter_compressor)
+  add_test(NAME archive_errpaths COMMAND mc_archive_errpaths_test)
+
   add_executable(mc_stream_volume_test tests/mc_stream_volume_test.c)
   target_link_libraries(mc_stream_volume_test matter_compressor)
   add_test(NAME stream_volume COMMAND mc_stream_volume_test)

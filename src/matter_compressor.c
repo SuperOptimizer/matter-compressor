@@ -2062,7 +2062,9 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
         uint32_t ux,uy,uz; memcpy(&ux,base+MCH_NX,4); memcpy(&uy,base+MCH_NY,4); memcpy(&uz,base+MCH_NZ,4);
         if(magic!=MC_MAGIC || ver!=MC_VERSION || (int)ux!=nx || (int)uy!=ny || (int)uz!=nz){
             fprintf(stderr,"mc_archive_open: %s is not a matching mc archive (magic/ver/dims)\n",path);
-            munmap(base,reserve); close(fd); free(w); return NULL;
+            munmap(base,reserve); close(fd);
+            pthread_mutex_destroy(&w->grow_mu); free(w->cov); free(w);   // no leak on reject
+            return NULL;
         }
         uint64_t totlen; memcpy(&totlen,base+MCH_TOTLEN,8);
         if(totlen < MC_META_END) totlen=MC_META_END;

@@ -38,6 +38,7 @@ OFFLINE_TESTS=(
   mc_cache_test mc_render_test mc_stream_volume_test mc_archive_concurrent_test
   mc_volume_offline_test mc_volume_api_test mc_zarr_test mc_api_test
   mc_decode_robust_test mc_stream_volume_api_test mc_volume_v3_test
+  mc_archive_errpaths_test
 )
 
 rm -rf "$OUT"; mkdir -p "$OUT/prof" "$OUT/bin"
