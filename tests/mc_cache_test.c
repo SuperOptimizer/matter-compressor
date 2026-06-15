@@ -96,6 +96,20 @@ int main(void){
     if(!st.evictions){ fprintf(stderr,"FAIL: tiny cache never evicted\n"); return 1; }
     mc_cache_free(c);
 
+    // 2b) COLD churn: touch every block of a 256^3 chunk EXACTLY ONCE into a tiny
+    //     cache. One-touch keys are never re-referenced, so they evict from the
+    //     S3-FIFO small queue (the ghost_put cold-eviction path) instead of being
+    //     promoted to main — distinct from the cyclic pattern above.
+    c=mc_cache_new_archive((1ull<<20),a);
+    mc_u8 g2[4096];
+    for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx)
+        mc_cache_get_copy(c,0,bz,by,bx,g2);          // each block touched once
+    mc_cache_get_stats(c,&st);
+    printf("cold-churn: evictions %llu used %zu/%zu\n",
+        (unsigned long long)st.evictions,st.used,st.slots);
+    if(!st.evictions){ fprintf(stderr,"FAIL: cold churn never evicted\n"); return 1; }
+    mc_cache_free(c);
+
     // 3) hit-path throughput (informational) + prefetch coverage
     c=mc_cache_new_archive(64ull<<20,a);
     mc_cache_prefetch_chunk(c,0,0,0,0);
