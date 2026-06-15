@@ -65,3 +65,4 @@ dkms.conf
 # stray PGO/coverage profiles written to the tree
 default.profraw
 *.profraw
+/build_viewer_asan/

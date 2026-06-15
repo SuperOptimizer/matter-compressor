@@ -1,7 +1,7 @@
-/* nuklear_impl.c — the single translation unit that compiles the Nuklear
- * library implementation and the SDL3 backend implementation. Keeping the
- * heavy NK_IMPLEMENTATION in its own TU (built once) keeps mc_viewer.c fast to
- * recompile during iteration. */
+/* nuklear_impl.c — single TU compiling the Nuklear library implementation and
+ * the SDL_GPU frontend implementation (slice blit + Nuklear backend). Kept in
+ * its own TU so the heavy NK_IMPLEMENTATION + mc_gpu code builds once and
+ * mc_viewer.c stays fast to recompile. */
 
 #define NK_INCLUDE_FIXED_TYPES
 #define NK_INCLUDE_STANDARD_IO
@@ -13,5 +13,5 @@
 #define NK_IMPLEMENTATION
 #include "nuklear.h"
 
-#define NK_SDL3_IMPLEMENTATION
-#include "nk_sdl3.h"
+#define MC_GPU_IMPLEMENTATION
+#include "mc_gpu.h"

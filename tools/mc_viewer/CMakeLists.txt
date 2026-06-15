@@ -36,12 +36,39 @@ set(SDL_SHARED     ON  CACHE BOOL "" FORCE)
 set(SDL_STATIC     OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(SDL3)
 
+# Shaders: GLSL -> SPIR-V via glslangValidator. The generated .spv.h headers are
+# COMMITTED, so a checkout without a shader compiler still builds. When
+# glslangValidator IS present, regenerate them at build time so edits to the
+# .glsl sources take effect (a custom command per shader, fed into the target).
+set(MC_VIEWER_SHADERS
+  blit.vert:vert blit.frag:frag ui.vert:vert ui.frag:frag)
+find_program(GLSLANG_VALIDATOR glslangValidator)
+set(_shader_hdrs "")
+if(GLSLANG_VALIDATOR)
+  foreach(entry ${MC_VIEWER_SHADERS})
+    string(REPLACE ":" ";" parts ${entry})
+    list(GET parts 0 name)
+    list(GET parts 1 stage)
+    string(REPLACE "." "_" vn ${name})
+    set(src ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.glsl)
+    set(hdr ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.spv.h)
+    add_custom_command(
+      OUTPUT ${hdr}
+      COMMAND ${GLSLANG_VALIDATOR} -V -S ${stage} ${src} --vn ${vn}_spv -o ${hdr}
+      DEPENDS ${src}
+      COMMENT "glslang ${name}.glsl -> ${name}.spv.h")
+    list(APPEND _shader_hdrs ${hdr})
+  endforeach()
+endif()
+
 add_executable(mc_viewer
   ${CMAKE_CURRENT_SOURCE_DIR}/mc_viewer.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/nuklear_impl.c)
+  ${CMAKE_CURRENT_SOURCE_DIR}/nuklear_impl.c
+  ${_shader_hdrs})
 
 target_include_directories(mc_viewer PRIVATE
   ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor)
 
 # The viewer is interactive glue, not the hot codec path: build it at -O2 and

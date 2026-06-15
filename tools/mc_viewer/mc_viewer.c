@@ -1,13 +1,15 @@
 /* mc_viewer — integrated slice viewer for matter-compressor.
  *
- * Milestone 1: open a volume (local .mca / zarr path or s3://, https://),
- * software-render an axis-aligned slice with the existing LOD-matched renderer
- * (mc_render_plane_lod), colormap it to ARGB32, and blit it via an SDL_Renderer
- * streaming texture. A Nuklear panel drives axis / slice index / zoom /
- * window-level / colormap. Mouse drag pans, wheel zooms.
+ * Open a volume (local .mca / zarr path or s3://, https://), software-render an
+ * axis-aligned slice with the existing LOD-matched renderer (mc_render_plane_lod),
+ * colormap it to ARGB32, then hand it to the SDL_GPU frontend (mc_gpu) which
+ * uploads it as a texture and draws it on a fullscreen quad (zoom/pan in the
+ * vertex shader). The Nuklear UI renders in the same SDL_GPU frame. Mouse drag
+ * pans, wheel zooms.
  *
- * This is intentionally a thin client over the public matter_compressor.h API;
- * all the heavy lifting (decode, cache, LOD, render) already lives in the core.
+ * Thin client over the public matter_compressor.h API; all the heavy lifting
+ * (decode, cache, LOD, render) already lives in the core. The GPU path lives in
+ * mc_gpu.h (slice pipeline + a from-scratch Nuklear SDL_GPU backend).
  */
 
 #include <stdio.h>
@@ -27,7 +29,7 @@
 #define NK_INCLUDE_FONT_BAKING
 #define NK_INCLUDE_DEFAULT_FONT
 #include "nuklear.h"
-#include "nk_sdl3.h"
+#include "mc_gpu.h"
 
 #include "matter_compressor.h"
 
@@ -54,9 +56,7 @@ typedef struct {
     uint32_t *argb;                  /* img_w*img_h ARGB32 (colormapped) */
     uint32_t  lut[256];
 
-    SDL_Renderer *ren;
-    SDL_Texture *tex;
-    int          tex_w, tex_h;
+    mc_gpu      *gpu;                 /* SDL_GPU frontend (slice + Nuklear) */
 
     atomic_int   dirty;              /* set by ready_cb -> repaint slice */
 } viewer;
@@ -144,14 +144,9 @@ static void render_slice(viewer *v) {
     mc_colormap_lut(v->lut, v->win_low / 255.0f, v->win_high / 255.0f, v->cmap);
     mc_colormap_apply(v->vals, iw, ih, v->lut, v->argb, iw);
 
-    /* (re)create the SDL texture to match. */
-    if (v->tex && (v->tex_w != iw || v->tex_h != ih)) {
-        SDL_DestroyTexture(v->tex); v->tex = NULL;
-    }
-    if (!v->tex) {
-        v->tex = SDL_CreateTexture(v->ren, SDL_PIXELFORMAT_ARGB8888,
-                                   SDL_TEXTUREACCESS_STREAMING, iw, ih);
-    }
+    /* Hand the colormapped slice to the GPU frontend (it owns the texture and
+     * recreates it on size change). */
+    if (v->gpu) mc_gpu_upload_slice(v->gpu, v->argb, iw, ih);
 }
 
 int main(int argc, char **argv) {
@@ -201,19 +196,16 @@ int main(int argc, char **argv) {
     V.slice = V.nz / 2;
 
     SDL_Window *win = SDL_CreateWindow("mc_viewer", 1280, 800, SDL_WINDOW_RESIZABLE);
-    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
-    if (!win || !ren) {
-        fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError());
+    if (!win) {
+        fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
     }
-    V.ren = ren;
-
-    struct nk_context *nk = nk_sdl3_init(win, ren);
-    {
-        struct nk_font_atlas *atlas;
-        nk_sdl3_font_stash_begin(&atlas);
-        nk_sdl3_font_stash_end();
+    V.gpu = mc_gpu_create(win);
+    if (!V.gpu) {
+        fprintf(stderr, "mc_gpu_create (SDL_GPU): %s\n", SDL_GetError());
+        return 1;
     }
+    struct nk_context *nk = mc_gpu_nk(V.gpu);
 
     int running = 1;
     int dragging = 0;
@@ -221,9 +213,14 @@ int main(int argc, char **argv) {
         "gray","viridis","magma","fire","red","green","blue","cyan","magenta"
     };
 
+    /* MC_VIEWER_FRAMES=N: render N frames then exit (headless GPU smoke test). */
+    const char *frames_env = SDL_getenv("MC_VIEWER_FRAMES");
+    long max_frames = frames_env ? SDL_atoi(frames_env) : 0;
+    long frame = 0;
+
     while (running) {
         SDL_Event e;
-        nk_input_begin(nk);
+        mc_gpu_nk_input_begin(V.gpu);
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) running = 0;
             if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
@@ -241,9 +238,9 @@ int main(int argc, char **argv) {
                 if (V.zoom > 64.0f) V.zoom = 64.0f;
                 atomic_store(&V.dirty, 1);
             }
-            nk_sdl3_handle_event(&e);
+            mc_gpu_nk_handle_event(V.gpu, &e);
         }
-        nk_input_end(nk);
+        mc_gpu_nk_input_end(V.gpu);
 
         /* --- UI panel --- */
         int along, sw, sh; axis_extent(&V, &along, &sw, &sh);
@@ -291,70 +288,58 @@ int main(int argc, char **argv) {
         }
         nk_end(nk);
 
-        /* --- (re)render slice if dirty --- */
+        /* --- (re)render slice if dirty (uploads to the GPU texture) --- */
         if (atomic_exchange(&V.dirty, 0)) {
             render_slice(&V);
-            if (V.tex && V.argb) {
-                SDL_UpdateTexture(V.tex, NULL, V.argb, V.img_w * 4);
-                V.tex_w = V.img_w; V.tex_h = V.img_h;
-                /* MC_VIEWER_DUMP=path.ppm: write the first rendered slice and
-                 * exit. Used for headless verification (no display needed). */
-                const char *dump = SDL_getenv("MC_VIEWER_DUMP");
-                if (dump) {
-                    /* For deterministic headless verification, re-render once
-                     * with a BLOCKING sample source so absent regions are
-                     * transcoded synchronously rather than sampling as 0. */
-                    V.lods = mc_volume_sample_lods(V.vol, /*blocking=*/1);
-                    render_slice(&V);
-                    SDL_UpdateTexture(V.tex, NULL, V.argb, V.img_w * 4);
-                    long nz = 0, mn = 256, mx = -1;
-                    for (int i = 0; i < V.img_w * V.img_h; i++) {
-                        int g = V.vals[i];
-                        if (g) nz++;
-                        if (g < mn) mn = g;
-                        if (g > mx) mx = g;
-                    }
-                    FILE *f = fopen(dump, "wb");
-                    if (f) {
-                        fprintf(f, "P6\n%d %d\n255\n", V.img_w, V.img_h);
-                        for (int i = 0; i < V.img_w * V.img_h; i++) {
-                            uint32_t p = V.argb[i];
-                            unsigned char rgb[3] = { (p>>16)&255, (p>>8)&255, p&255 };
-                            fwrite(rgb, 1, 3, f);
-                        }
-                        fclose(f);
-                    }
-                    fprintf(stderr, "dump %s: %dx%d vals nonzero=%ld min=%ld max=%ld\n",
-                            dump, V.img_w, V.img_h, nz, mn, mx);
-                    running = 0;
+
+            /* MC_VIEWER_DUMP=path.ppm: re-render once with a BLOCKING sample
+             * source (so absent regions transcode synchronously instead of
+             * sampling 0), write the slice as PPM, and exit. Headless
+             * verification path — no display / swapchain needed. */
+            const char *dump = SDL_getenv("MC_VIEWER_DUMP");
+            if (dump && V.vals && V.argb) {
+                V.lods = mc_volume_sample_lods(V.vol, /*blocking=*/1);
+                render_slice(&V);
+                long nz = 0, mn = 256, mx = -1;
+                for (int i = 0; i < V.img_w * V.img_h; i++) {
+                    int g = V.vals[i];
+                    if (g) nz++;
+                    if (g < mn) mn = g;
+                    if (g > mx) mx = g;
                 }
+                FILE *f = fopen(dump, "wb");
+                if (f) {
+                    fprintf(f, "P6\n%d %d\n255\n", V.img_w, V.img_h);
+                    for (int i = 0; i < V.img_w * V.img_h; i++) {
+                        uint32_t p = V.argb[i];
+                        unsigned char rgb[3] = { (p>>16)&255, (p>>8)&255, p&255 };
+                        fwrite(rgb, 1, 3, f);
+                    }
+                    fclose(f);
+                }
+                fprintf(stderr, "dump %s: %dx%d vals nonzero=%ld min=%ld max=%ld\n",
+                        dump, V.img_w, V.img_h, nz, mn, mx);
+                running = 0;
             }
         }
 
-        /* --- draw --- */
-        SDL_SetRenderDrawColor(ren, 16, 16, 20, 255);
-        SDL_RenderClear(ren);
-        if (V.tex) {
-            int out_w, out_h; SDL_GetRenderOutputSize(ren, &out_w, &out_h);
+        /* --- draw the GPU frame (slice quad + Nuklear), centered + panned --- */
+        mc_gpu_set_nearest(V.gpu, V.zoom >= 1.0f);
+        {
             /* On screen the whole slice spans (slice voxels * zoom) px,
-             * regardless of how many pixels we rendered the texture at. */
+             * independent of the texture's rendered pixel count. */
             int al2, vw, vh; axis_extent(&V, &al2, &vw, &vh);
-            float dw = vw * V.zoom, dh = vh * V.zoom;
-            SDL_FRect dst;
-            dst.w = dw; dst.h = dh;
-            dst.x = (out_w - dw) * 0.5f + V.pan_x;
-            dst.y = (out_h - dh) * 0.5f + V.pan_y;
-            SDL_SetTextureScaleMode(V.tex, V.zoom >= 1.0f ? SDL_SCALEMODE_NEAREST
-                                                          : SDL_SCALEMODE_LINEAR);
-            SDL_RenderTexture(ren, V.tex, NULL, &dst);
+            mc_gpu_render(V.gpu, vw * V.zoom, vh * V.zoom, V.pan_x, V.pan_y,
+                          /*gain=*/1.0f, /*bias=*/0.0f);
         }
-        nk_sdl3_render(NK_ANTI_ALIASING_ON);
-        SDL_RenderPresent(ren);
+
+        if (max_frames && ++frame >= max_frames) {
+            fprintf(stderr, "rendered %ld frames -> exit\n", frame);
+            running = 0;
+        }
     }
 
-    nk_sdl3_shutdown();
-    if (V.tex) SDL_DestroyTexture(V.tex);
-    SDL_DestroyRenderer(ren);
+    mc_gpu_destroy(V.gpu);
     SDL_DestroyWindow(win);
     mc_volume_free(V.vol);
     free(V.vals); free(V.argb);
