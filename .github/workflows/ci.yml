@@ -63,19 +63,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libzstd-dev
-      - name: cache concurrency under ThreadSanitizer
+      - name: concurrency under ThreadSanitizer
         run: |
-          # The cache's 64-shard concurrent get/evict + freeze/thaw tick-phase is
-          # the project's lock-free read surface; TSan guards it against races.
-          # NOTE: mc_archive_concurrent_test is intentionally NOT here — the
-          # archive mmaps a 10 TiB MAP_NORESERVE region that collides with TSan's
-          # shadow address space (mmap ENOMEM). That test's append-index race is
-          # covered by the plain ctest + ASan lanes instead.
+          # Two threaded surfaces under TSan:
+          #  - cache: 64-shard concurrent get/evict + freeze/thaw tick-phase.
+          #  - archive append index: the lock-free node-tree CAS-publish path
+          #    (w_ensure_shard_slot / w_publish_child) — the index-corruption race
+          #    class. It mmaps a 10 TiB MAP_NORESERVE region by default, which
+          #    collides with TSan's shadow (mmap ENOMEM), so shrink the reservation
+          #    via -DMC_RESERVE for the TSan build (MC_RESERVE is #ifndef-guarded).
           SRCS="src/matter_compressor.c src/c3d.c tools/vendor/libs3/libs3.c"
           FLAGS="-O1 -g -fsanitize=thread -fno-sanitize-recover=all -w -Isrc -Itools/vendor/libs3"
           LIBS="-lm -lpthread -lzstd -lcurl"
           clang $FLAGS tests/mc_cache_test.c $SRCS $LIBS -o cache_tsan
           ./cache_tsan
+          clang $FLAGS -DMC_RESERVE='(2ull*1024*1024*1024)' \
+            tests/mc_archive_concurrent_test.c $SRCS $LIBS -o archive_tsan
+          TSAN_OPTIONS=halt_on_error=1 ./archive_tsan
   coverage:
     runs-on: ubuntu-24.04
     steps:

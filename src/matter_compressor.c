@@ -1803,7 +1803,13 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
 // ============================================================================
 #if MC_HAVE_MMAP
 
-#define MC_RESERVE   (10ull*1024*1024*1024*1024)   // 10 TiB virtual reservation (NORESERVE)
+// 10 TiB virtual reservation (NORESERVE). Overridable at compile time so the
+// ThreadSanitizer build can shrink it -- TSan maps its own huge shadow regions
+// and a 10 TiB MAP_NORESERVE reservation collides (mmap ENOMEM). Tests that run
+// under TSan pass -DMC_RESERVE=... ; production keeps the default.
+#ifndef MC_RESERVE
+#define MC_RESERVE   (10ull*1024*1024*1024*1024)
+#endif
 #define MC_GROW_STEP (1ull*1024*1024*1024)          // grow the file 1 GiB at a time
 
 // Coverage memo: an O(1) resident-region set so frozen render reads never walk
@@ -1946,7 +1952,12 @@ static uint64_t w_ensure_shard_slot(mc_archive *w, int lod, int cz,int cy,int cx
     // allocate a zeroed node then CAS-publish it into the parent slot. If we lose the
     // CAS another thread's node is live and we abandon ours (a bounded 32KB bump-alloc
     // leak, only on genuine concurrent first-touch of the same parent). No lock.
-    uint64_t root = w_read_u64(w, MCH_ROOTOFF + (uint64_t)lod*8);
+    // acquire-load the per-LOD root slot (it is published atomically by
+    // w_publish_child from concurrent appenders) — pairs with that release and
+    // matches the inner-node walk below. A plain w_read_u64 here is a data race.
+    uint64_t root = atomic_load_explicit(
+        (_Atomic uint64_t*)(void*)(w->base + MCH_ROOTOFF + (uint64_t)lod*8),
+        memory_order_acquire);
     if(!root){
         uint64_t no = w_alloc(w, MC_NODE_BYTES); if(no==~0ull) return ~0ull;
         memset(w->base+no, 0, MC_NODE_BYTES);
@@ -1990,14 +2001,20 @@ static int w_install_blob(mc_archive *w,int lod,int cz,int cy,int cx,const u8 *b
     uint64_t off = w_alloc(w, len);
     if(off==~0ull) return -1;
     memcpy(w->base+off, blob, len);
-    // release fence so the payload bytes are visible before the commit word.
-    atomic_thread_fence(memory_order_release);
-    w_write_u64(w, slot, off);   // publish chunk offset = commit
+    // Publish the chunk offset as the commit word: an atomic RELEASE store so a
+    // concurrent reader (mc_resolve_chunk) or appender (w_ensure_shard_slot)
+    // that acquire-loads this slot sees the fully-written payload. (A plain
+    // store here races those atomic readers.)
+    atomic_store_explicit((_Atomic uint64_t*)(void*)(w->base+slot), off,
+                          memory_order_release);
     mc_cov_put(w, lod, cz, cy, cx, 0 /*present*/);
     atomic_fetch_add_explicit(&w->gen, 1, memory_order_release);
-    // keep the header's total length current so the file is valid if reopened now.
+    // Keep the header's total length current so the file is valid if reopened
+    // now. Concurrent appenders all touch MCH_TOTLEN -> atomic relaxed store
+    // (monotone-ish snapshot of the cursor; exact value not load-bearing).
     uint64_t cur = atomic_load_explicit(&w->cursor, memory_order_relaxed);
-    w_write_u64(w, MCH_TOTLEN, cur);
+    atomic_store_explicit((_Atomic uint64_t*)(void*)(w->base+MCH_TOTLEN), cur,
+                          memory_order_relaxed);
     return 0;
 }
 
