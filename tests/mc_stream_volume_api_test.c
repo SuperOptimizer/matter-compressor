@@ -10,6 +10,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #define NX 512
 #define NY 384
@@ -31,6 +32,10 @@ static void nap(int ms){ struct timespec t={0,ms*1000*1000}; nanosleep(&t,NULL);
 
 int main(void){
     const char *path="/tmp/mc_stream_api.mca";
+    // Clear any stale derived mirror from a prior run: mc_volume_open_streaming
+    // builds <cache>/<base>.local.mca, and a stale one (different dims/state)
+    // makes the reopen fail or read garbage. The source + mirror are rebuilt here.
+    remove(path); remove("/tmp/mc_stream_api.local.mca");
     mc_build_opts o={.nx=NX,.ny=NY,.nz=NZ,.quality=6.0f};
     if(mc_build_to_file(src_fn,NULL,&o,path)!=0){ fprintf(stderr,"build failed\n"); return 1; }
 
@@ -128,15 +133,18 @@ int main(void){
     //      present-but-uncached blocks and the renderer falls to a coarser level.
     if(nl>1){
         mc_volume_thaw(v);                  // ensure not frozen
-        // a brand-new volume to guarantee a cold fine level.
-        mc_volume *v2=mc_volume_open_streaming(path,"/tmp",(size_t)64<<20);
+        // a brand-new volume to guarantee a cold fine level. Use a SEPARATE cache
+        // dir so its local mirror doesn't collide with v's (same source basename).
+        mkdir("/tmp/mc_sva_v2", 0755);
+        remove("/tmp/mc_sva_v2/mc_stream_api.local.mca");
+        mc_volume *v2=mc_volume_open_streaming(path,"/tmp/mc_sva_v2",(size_t)64<<20);
         if(v2){
             mc_sample_lods ls=mc_volume_sample_lods(v2,0);   // blocking=0 -> resident checks
             mc_plane pl={.origin={nz/2.f,ny/2.f,nx/2.f},.normal={1,0,0}}; mc_plane_basis(&pl);
             mc_render_params rp={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_MAX,.t0=-4,.t1=4,.dt=1};
             uint8_t *im=calloc(96*96,1);
             mc_volume_freeze(v2);
-            mc_render_plane_lod(&ls,&pl,96,96,2.0f,&rp,im,2);   // scale=2 -> may pick L1
+            mc_render_plane_lod(&ls,&pl,96,96,2.0f,&rp,im,1);   // 1 thread (cold cache mutates)
             mc_volume_thaw(v2);
             free(im);
             mc_volume_free(v2);
@@ -147,6 +155,10 @@ int main(void){
     // 4c) SHADED + INK with the full lighting/SSS/curvature/ink-lock fields set,
     //     rendered against the r=[90,110] sheet -> covers shade_ray's secondary
     //     march, curvature, and the ink sheet-lock run detection.
+    //     SINGLE-THREADED: a blocking volume source MUTATES the cache on a miss
+    //     (decode+insert), so parallel render bands would race each other on the
+    //     shared shards. Parallel render over a volume requires a frozen cache
+    //     (lock-free reads); these mutating renders run on one thread.
     {
         mc_sample_src bs=mc_volume_sample_src(v,0,1);
         // aim a plane tangent to the shell so the ray crosses the sheet.
@@ -157,11 +169,11 @@ int main(void){
             .light={1,0.3f,0.2f},.ambient=0.2f,.diffuse=0.8f,.specular=0.3f,
             .shininess=20,.absorption=1.0f,.shadow=0.5f,.sss=0.4f,.curvature=0.5f,
             .light_surface_rel=1};
-        mc_render_plane(&bs,&pl,64,64,1.0f,&sh,im,2);
+        mc_render_plane(&bs,&pl,64,64,1.0f,&sh,im,1);   // 1 thread: mutating source
         mc_render_params ink={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_INK,
             .t0=-30,.t1=30,.dt=1,.alpha_min=0.1f,.alpha_opacity=0.9f,
             .sss=0.4f,.transmission=0.4f,.ink_lock=6.0f,.curvature=0.3f};
-        mc_render_plane(&bs,&pl,64,64,1.0f,&ink,im,2);
+        mc_render_plane(&bs,&pl,64,64,1.0f,&ink,im,1);
         free(im);
     }
 

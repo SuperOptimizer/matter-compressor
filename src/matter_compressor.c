@@ -7860,6 +7860,13 @@ int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
     int cz = bz / PER, cy = by / PER, cx = bx / PER;
     mc_cover cov = ensure_region(v, lod, cz, cy, cx);   // pulls the region if ABSENT
     if (cov == MC_ZERO || cov == MC_ABSENT) { memset(dst, 0, BLK * BLK * BLK); return cov == MC_ZERO ? 0 : -1; }
+    // mc_cache_get_copy below MUTATES the shard (map insert / slot alloc) on a
+    // miss. The fill pool (kicked by thaw) mutates the SAME shards from worker
+    // threads under the no-lock single-owner contract, so a blocking get issued
+    // between thaw and the next freeze would race it. Quiesce in-flight fills
+    // first — blocking get is not on the lock-free render path, so the wait is
+    // acceptable. (freeze() does the same fill_pool_wait before a frozen frame.)
+    fill_pool_wait(v);
     mc_cache_get_copy(v->cache, lod, bz, by, bx, dst);
     return 1;
 }
