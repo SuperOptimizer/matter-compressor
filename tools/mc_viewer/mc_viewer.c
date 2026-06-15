@@ -31,6 +31,7 @@
 #include "nuklear.h"
 #include "mc_gpu.h"
 #include "mc_gpu_vol.h"
+#include "mc_gpu_ray.h"
 
 #include "matter_compressor.h"
 
@@ -61,6 +62,15 @@ typedef struct {
     mc_gpu_vol  *gvol;                /* GPU c3g decode+sample path (c3g archives) */
     int          gpu_mode;            /* 0 = CPU render+blit, 1 = GPU decode+sample */
     int          gpu_avail;           /* 1 if the volume archive is c3g (gvol usable) */
+
+    /* 3D raycast mode (c3g archives) */
+    mc_gpu_ray  *gray;                /* GPU volume raycaster */
+    int          ray_mode;            /* 1 = 3D raycast active (else slice modes) */
+    int          ray_loaded;          /* a region is uploaded to the 3D volume */
+    int          rgz, rgy, rgx;       /* loaded region block-grid dims */
+    float        cam_az, cam_el;      /* orbit camera azimuth/elevation (radians) */
+    float        cam_dist;            /* camera distance (in voxel units) */
+    int          ray_comp;            /* MC_RAY_MIP or MC_RAY_EA */
 
     atomic_int   dirty;              /* set by ready_cb -> repaint slice */
 } viewer;
@@ -206,6 +216,74 @@ static int gather_slab(viewer *v, int *out_gz,int *out_gy,int *out_gx,
     return 1;
 }
 
+/* Gather a 3D cube of c3g blocks (up to MC_RAY_WIN^3 anchored at the volume
+ * origin, LOD0) into the raycaster's dense 3D volume. Same per-block read as
+ * gather_slab. Returns 1 + region block dims in *gz/*gy/*gx. */
+#define MC_RAY_WIN 8    /* region block cube edge (8 blocks = 128 voxels) */
+static int gather_region(viewer *v, int *out_gz,int *out_gy,int *out_gx,
+                         const uint8_t **blobs, uint32_t *lens, uint8_t *scratch4096){
+    mc_archive *arc = mc_volume_archive(v->vol);
+    if(!arc) return 0;
+    int bgz,bgy,bgx; mc_volume_block_grid(v->vol, 0, &bgz,&bgy,&bgx);
+    int gz = bgz<MC_RAY_WIN?bgz:MC_RAY_WIN;
+    int gy = bgy<MC_RAY_WIN?bgy:MC_RAY_WIN;
+    int gx = bgx<MC_RAY_WIN?bgx:MC_RAY_WIN;
+    int nb = gz*gy*gx;
+    if(nb<=0) return 0;
+    for(int Bz=0; Bz<gz; ++Bz) for(int By=0; By<gy; ++By) for(int Bx=0; Bx<gx; ++Bx){
+        int i = (Bz*gy + By)*gx + Bx;
+        blobs[i]=NULL; lens[i]=0;
+        mc_volume_get_block(v->vol, 0, Bz,By,Bx, scratch4096);
+        uint64_t co = mc_archive_chunk_offset(arc, 0, Bz>>4,By>>4,Bx>>4);
+        if(!co) continue;
+        const uint8_t *p=NULL; uint32_t l=0;
+        if(mc_archive_block_blob(arc, co, Bz&15,By&15,Bx&15, &p, &l)){ blobs[i]=p; lens[i]=l; }
+    }
+    *out_gz=gz; *out_gy=gy; *out_gx=gx;
+    return 1;
+}
+
+/* Build an inverse-view-projection (clip->volume) for an orbit camera looking
+ * at the center of a vx*vy*vz volume from (az,el,dist). Column-major mat4.
+ * Orthographic (simple, no perspective foreshortening) sized to fit the volume.
+ * The frag uses near/far unprojection, so we encode an ortho box around the
+ * camera's view of the volume. */
+static void build_orbit_ivp(int vx,int vy,int vz, float az,float el,float dist,
+                            float out[16]){
+    float cx=vx*0.5f, cy=vy*0.5f, cz=vz*0.5f;
+    // camera basis from azimuth/elevation (eye on a sphere around the center).
+    float ce=cosf(el), se=sinf(el), ca=cosf(az), sa=sinf(az);
+    float fwd[3]  = { ce*ca, se, ce*sa };               // center -> eye (unit)
+    float eye[3]  = { cx+fwd[0]*dist, cy+fwd[1]*dist, cz+fwd[2]*dist };
+    // view dir = -fwd (eye -> center). up = world +Y unless near-parallel.
+    float vdir[3] = { -fwd[0], -fwd[1], -fwd[2] };
+    float up0[3]  = { 0.0f, 1.0f, 0.0f };
+    if (fabsf(vdir[1]) > 0.95f){ up0[0]=1.0f; up0[1]=0.0f; }
+    // right = vdir x up, up = right x vdir (orthonormal)
+    float right[3] = { vdir[1]*up0[2]-vdir[2]*up0[1],
+                       vdir[2]*up0[0]-vdir[0]*up0[2],
+                       vdir[0]*up0[1]-vdir[1]*up0[0] };
+    float rl=sqrtf(right[0]*right[0]+right[1]*right[1]+right[2]*right[2]); if(rl<1e-6f)rl=1;
+    right[0]/=rl; right[1]/=rl; right[2]/=rl;
+    float up[3] = { right[1]*vdir[2]-right[2]*vdir[1],
+                    right[2]*vdir[0]-right[0]*vdir[2],
+                    right[0]*vdir[1]-right[1]*vdir[0] };
+    // ortho half-extent: fit the volume diagonal so it never clips.
+    float half = 0.5f*sqrtf((float)vx*vx + (float)vy*vy + (float)vz*vz);
+    float zrange = dist + half;     // march from eye through the far side
+    // clip (nx,ny,nz) in [-1,1] -> volume point:
+    //   p = eye + right*(nx*half) + up*(ny*half) + vdir*((nz*0.5+0.5)*zrange)
+    // i.e. nz=-1 at the eye (near), nz=+1 at eye + vdir*zrange (far).
+    // column-major M with M*(nx,ny,nz,1):
+    //   col0 = right*half;  col1 = up*half;  col2 = vdir*(zrange*0.5);
+    //   col3 = eye + vdir*(zrange*0.5)
+    out[0]=right[0]*half;  out[1]=right[1]*half;  out[2]=right[2]*half;  out[3]=0;
+    out[4]=up[0]*half;     out[5]=up[1]*half;     out[6]=up[2]*half;     out[7]=0;
+    out[8]=vdir[0]*zrange*0.5f; out[9]=vdir[1]*zrange*0.5f; out[10]=vdir[2]*zrange*0.5f; out[11]=0;
+    out[12]=eye[0]+vdir[0]*zrange*0.5f; out[13]=eye[1]+vdir[1]*zrange*0.5f;
+    out[14]=eye[2]+vdir[2]*zrange*0.5f; out[15]=1.0f;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -274,10 +352,19 @@ int main(int argc, char **argv) {
                                        SDL_GetGPUSwapchainTextureFormat(mc_gpu_device(V.gpu), win),
                                        6.0f);
             V.gpu_avail = (V.gvol != NULL);
+            // 3D raycaster (also c3g-only).
+            if (V.gpu_avail) {
+                V.gray = mc_gpu_ray_create(mc_gpu_device(V.gpu),
+                                           SDL_GetGPUSwapchainTextureFormat(mc_gpu_device(V.gpu), win),
+                                           6.0f);
+            }
         }
     }
     // MC_VIEWER_GPU=1 starts in GPU decode mode (headless testing / default-on).
     if (V.gpu_avail && SDL_getenv("MC_VIEWER_GPU")) V.gpu_mode = 1;
+    // 3D orbit camera defaults.
+    V.cam_az = 0.7f; V.cam_el = 0.5f; V.cam_dist = 200.0f; V.ray_comp = MC_RAY_EA;
+    if (V.gray && SDL_getenv("MC_VIEWER_3D")) V.ray_mode = 1;   // headless 3D test
 
     int running = 1;
     int dragging = 0;
@@ -300,20 +387,42 @@ int main(int argc, char **argv) {
                 atomic_store(&V.dirty, 1);
                 fprintf(stderr, "GPU decode mode: %s\n", V.gpu_mode ? "ON" : "OFF");
             }
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_3 && V.gray) {
+                V.ray_mode = !V.ray_mode;
+                atomic_store(&V.dirty, 1);
+                fprintf(stderr, "3D raycast mode: %s\n", V.ray_mode ? "ON" : "OFF");
+            }
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_M && V.ray_mode) {
+                V.ray_comp = (V.ray_comp == MC_RAY_MIP) ? MC_RAY_EA : MC_RAY_MIP;
+                fprintf(stderr, "3D composite: %s\n", V.ray_comp==MC_RAY_MIP?"MIP":"emission-absorption");
+            }
             if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                 e.button.button == SDL_BUTTON_RIGHT) dragging = 1;
             if (e.type == SDL_EVENT_MOUSE_BUTTON_UP &&
                 e.button.button == SDL_BUTTON_RIGHT) dragging = 0;
             if (e.type == SDL_EVENT_MOUSE_MOTION && dragging) {
-                V.pan_x += e.motion.xrel;
-                V.pan_y += e.motion.yrel;
+                if (V.ray_mode) {                       // 3D: drag orbits the camera
+                    V.cam_az += e.motion.xrel * 0.01f;
+                    V.cam_el += e.motion.yrel * 0.01f;
+                    if (V.cam_el >  1.55f) V.cam_el =  1.55f;
+                    if (V.cam_el < -1.55f) V.cam_el = -1.55f;
+                } else {                                // slice: drag pans
+                    V.pan_x += e.motion.xrel;
+                    V.pan_y += e.motion.yrel;
+                }
             }
             if (e.type == SDL_EVENT_MOUSE_WHEEL) {
                 float f = (e.wheel.y > 0) ? 1.1f : (e.wheel.y < 0 ? 1.0f/1.1f : 1.0f);
-                V.zoom *= f;
-                if (V.zoom < 0.01f) V.zoom = 0.01f;
-                if (V.zoom > 64.0f) V.zoom = 64.0f;
-                atomic_store(&V.dirty, 1);
+                if (V.ray_mode) {                       // 3D: wheel = dolly in/out
+                    V.cam_dist /= f;
+                    if (V.cam_dist < 8.0f)    V.cam_dist = 8.0f;
+                    if (V.cam_dist > 4096.0f) V.cam_dist = 4096.0f;
+                } else {
+                    V.zoom *= f;
+                    if (V.zoom < 0.01f) V.zoom = 0.01f;
+                    if (V.zoom > 64.0f) V.zoom = 64.0f;
+                    atomic_store(&V.dirty, 1);
+                }
             }
             mc_gpu_nk_handle_event(V.gpu, &e);
         }
@@ -371,6 +480,15 @@ int main(int argc, char **argv) {
             } else {
                 nk_label(nk, "decode: CPU (c3g archive: MC_BLOCK_CODEC=c3g)", NK_TEXT_LEFT);
             }
+            if (V.gray) {
+                if (V.ray_mode) {
+                    snprintf(info, sizeof(info), "3D raycast: %s ('3' off, 'M' mode, drag/wheel)",
+                             V.ray_comp==MC_RAY_MIP ? "MIP" : "emission-absorption");
+                    nk_label(nk, info, NK_TEXT_LEFT);
+                } else {
+                    nk_label(nk, "3D raycast: off  ('3' toggles)", NK_TEXT_LEFT);
+                }
+            }
         }
         nk_end(nk);
 
@@ -411,7 +529,36 @@ int main(int argc, char **argv) {
 
         /* --- draw the frame --- */
         mc_gpu_set_nearest(V.gpu, V.zoom >= 1.0f);
-        if (V.gpu_mode && V.gvol) {
+        if (V.ray_mode && V.gray) {
+            /* 3D raycast: gather a region of compressed c3g blocks into the
+             * dense 3D volume (once, when dirty), then raycast it from the orbit
+             * camera and draw Nuklear over it. */
+            if (atomic_exchange(&V.dirty, 0) || !V.ray_loaded) {
+                static const uint8_t *rblobs[MC_RAY_WIN*MC_RAY_WIN*MC_RAY_WIN];
+                static uint32_t       rlens[MC_RAY_WIN*MC_RAY_WIN*MC_RAY_WIN];
+                static uint8_t        rscratch[4096];
+                int gz,gy,gx;
+                if (gather_region(&V,&gz,&gy,&gx,rblobs,rlens,rscratch) &&
+                    mc_gpu_ray_upload(V.gray,gz,gy,gx,rblobs,rlens)) {
+                    V.rgz=gz; V.rgy=gy; V.rgx=gx; V.ray_loaded=1;
+                }
+            }
+            mc_gpu_ray_set_lut(V.gray, V.lut);
+            float ldir[3] = { 1.0f, 1.0f, 0.5f };   // raking light
+            mc_gpu_ray_set_lighting(V.gray, 1, ldir, 0.2f, 0.8f, 0.25f, 24.0f, 8.0f);
+
+            int vx=V.rgx*16, vy=V.rgy*16, vz=V.rgz*16;
+            float ivp[16]; build_orbit_ivp(vx,vy,vz, V.cam_az,V.cam_el,V.cam_dist, ivp);
+            float campos[3] = {0,0,0};   // frag derives origin from ivp near plane
+
+            SDL_GPUCommandBuffer *cmd; SDL_GPUTexture *swap; Uint32 ow, oh;
+            if (V.ray_loaded && mc_gpu_frame_begin(V.gpu, &cmd, &swap, &ow, &oh)) {
+                mc_gpu_ray_render(V.gray, cmd, swap, ivp, campos,
+                                  /*step=*/0.5f, /*gain=*/1.0f,
+                                  V.ray_comp, /*alpha_min=*/0.08f, /*absorption=*/3.0f);
+                mc_gpu_frame_end_nuklear(V.gpu, cmd, swap, ow, oh);
+            }
+        } else if (V.gpu_mode && V.gvol) {
             /* GPU decode+sample path: gather the visible slab's COMPRESSED c3g
              * blocks, upload, and let the GPU decode + sample the slice, then
              * draw Nuklear over it in a second (LOAD) pass. */
@@ -445,6 +592,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (V.gray) mc_gpu_ray_destroy(V.gray);
     if (V.gvol) mc_gpu_vol_destroy(V.gvol);
     mc_gpu_destroy(V.gpu);
     SDL_DestroyWindow(win);

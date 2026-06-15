@@ -73,8 +73,11 @@ system SDL3 install needed. Nuklear is the vendored single header in `vendor/`.
 | panel `zoom` / mouse wheel | magnification |
 | panel `win low/high` | window/level (display range) |
 | panel colormap combo | gray / viridis / magma / fire / r/g/b/c/m |
-| right-drag | pan |
+| right-drag | pan (slice modes) / orbit camera (3D mode) |
+| wheel | zoom (slice) / dolly (3D) |
 | `G` | toggle CPU render vs GPU decode (c3g archives only) |
+| `3` | toggle 3D volume raycast mode (c3g archives only) |
+| `M` | in 3D mode: switch MIP vs emission-absorption |
 
 ### GPU decode mode
 
@@ -86,6 +89,16 @@ reads the visible slab's **compressed** c3g blocks straight from the `.mca`
 (`mc_archive_block_blob`, no CPU decode), uploads them to a VRAM cache, and the
 GPU compute-decodes + samples the slice (see `mc_gpu_vol.h`). The panel shows
 which path is active. CPU mode (the default) is always available as a fallback.
+
+### 3D volume raycast mode
+
+On a c3g volume, press `3` (or `MC_VIEWER_3D=1`) for real-time 3D volume
+rendering: a region of compressed c3g blocks is decoded into a dense 3D texture
+and raycast from an orbit camera (right-drag rotates, wheel dollies). `M`
+switches between MIP and transfer-function emission-absorption (with gradient
+lighting). See `mc_gpu_ray.h`; the standalone `ray_gpu_check` validates the
+decode + MIP + EA + lighting against a CPU reference. Currently renders a
+bounded region (no out-of-core paging yet — that's the next milestone).
 
 ### Headless verification
 

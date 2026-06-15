@@ -19,3 +19,6 @@
 #include "matter_compressor.h"   /* MC_HF_EXP for the c3g dequant table */
 #define MC_GPU_VOL_IMPLEMENTATION
 #include "mc_gpu_vol.h"
+
+#define MC_GPU_RAY_IMPLEMENTATION
+#include "mc_gpu_ray.h"
