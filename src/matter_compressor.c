@@ -1414,25 +1414,16 @@ static inline int mc_rank(const uint8_t*bm,int idx){
 // resolve chunk (cz,cy,cx) -> chunk-blob offset (0 = empty/absent). Walks the dense
 // node tree: nibble 2 (root node) -> nibble 1 (inner node) -> nibble 0 (shard) ->
 // chunk-blob offset. Each level is a direct u64 array index.
-// `end` bounds every node read to [0,end): a corrupt/untrusted header may point
-// a node offset past EOF, so each level's MC_GRID3-u64 slot array must fit in the
-// buffer. Out-of-range -> absent (0), never dereferenced. Reader callers pass
-// r->len; writer-trusted callers use the (uint64_t)-1 wrapper below.
-static uint64_t mc_resolve_chunk_b(const uint8_t*arc, uint64_t root_off,
-                                   int cz,int cy,int cx, uint64_t end){
+static uint64_t mc_resolve_chunk(const uint8_t*arc, uint64_t root_off,int cz,int cy,int cx){
     uint64_t node = root_off;
     for(int nib=MC_TREE_LEVELS-1; nib>=0; --nib){
         if(!node) return 0;
         int dz=mc_nib(cz,nib), dy=mc_nib(cy,nib), dx=mc_nib(cx,nib);
         int idx=(dz*16+dy)*16+dx;
-        if(node > end || (size_t)idx*8 + 8 > end - node) return 0;   // OOB slot -> absent
         uint64_t childoff; memcpy(&childoff, arc+node + (size_t)idx*8, 8);
         node = childoff;
     }
     return node;   // chunk-blob offset (0 if absent)
-}
-static uint64_t mc_resolve_chunk(const uint8_t*arc, uint64_t root_off,int cz,int cy,int cx){
-    return mc_resolve_chunk_b(arc, root_off, cz,cy,cx, (uint64_t)-1);   // writer-trusted
 }
 
 // chunk blob (v7): [f32 q][u64 xxh64][u16 fmaplen][fmap][512B block-bitmap]
@@ -1494,26 +1485,6 @@ static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,i
     if(!ix->off[bi]) return 0;                        // absent (ZERO) block
     *abs_off = ix->off[bi]; *len = ix->len[bi];
     return 1;
-}
-
-// Validate that the chunk blob at `chunk_off` is structurally in-bounds for an
-// `end`-byte buffer: header+fmap+bitmap+lens+payloads lie within [0,end).
-// Returns the total blob length (>0) if so, else 0. Untrusted-path blob-field
-// readers (mc_decode_block, mc_verify_archive) gate on this.
-static uint64_t mc_blob_struct_ok(const uint8_t*arc, uint64_t chunk_off, uint64_t end){
-    if(chunk_off > end || end - chunk_off < (uint64_t)MC_BLOB_HDR) return 0;
-    uint16_t fml; memcpy(&fml,arc+chunk_off+12,2);
-    uint64_t bm_off = chunk_off + MC_BLOB_HDR + fml;
-    if(bm_off > end || end - bm_off < (uint64_t)MC_BITMAP_BYTES) return 0;
-    const uint8_t*bm = arc + bm_off;
-    int np=0; for(int i=0;i<MC_BITMAP_BYTES;++i) np+=__builtin_popcount(bm[i]);
-    uint64_t lens_off = bm_off + MC_BITMAP_BYTES;
-    if(end - lens_off < (uint64_t)np*2) return 0;
-    uint64_t paybytes=0; const uint8_t*lens = arc + lens_off;
-    for(int s=0;s<np;++s){ uint16_t l; memcpy(&l,lens+(size_t)s*2,2); paybytes+=l; }
-    uint64_t total = lens_off + (uint64_t)np*2 + paybytes - chunk_off;
-    if(chunk_off + total > end) return 0;
-    return total;
 }
 
 // total byte length of a chunk blob — used to copy a whole compressed chunk verbatim
@@ -2535,30 +2506,22 @@ void mc_archive_close(mc_archive*a){ (void)a; }
 // VERIFY — walk every chunk of every LOD, recompute xxh64, compare to stored.
 // ============================================================================
 long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
-    // Recommended pre-flight for UNTRUSTED archives -> safe on arbitrary bytes:
-    // bound every header-derived offset to [MC_HDR,len) before dereferencing.
-    if(!arc || len < MC_HDR) return -1;
-    const uint64_t NODE_BYTES = (uint64_t)MC_GRID3 * 8;
-    #define MC_NODE_OK(off) ((off) >= MC_HDR && (off) <= len && len - (off) >= NODE_BYTES)
+    (void)len;
     long bad=0, total=0;
     for(int lod=0;lod<8;++lod){
         uint64_t root; memcpy(&root,arc+MCH_ROOTOFF+(uint64_t)lod*8,8);
         if(!root) continue;
-        if(!MC_NODE_OK(root)){ bad++; continue; }
         for(int n2=0;n2<MC_GRID3;++n2){
             uint64_t inner; memcpy(&inner,arc+root+(size_t)n2*8,8);
             if(!inner) continue;
-            if(!MC_NODE_OK(inner)){ bad++; continue; }
             for(int n1=0;n1<MC_GRID3;++n1){
                 uint64_t shard; memcpy(&shard,arc+inner+(size_t)n1*8,8);
                 if(!shard) continue;
-                if(!MC_NODE_OK(shard)){ bad++; continue; }
                 for(int n0=0;n0<MC_GRID3;++n0){
                     uint64_t co; memcpy(&co,arc+shard+(size_t)n0*8,8);
                     if(co<=MC_SLOT_ZERO) continue;
                     total++;
-                    uint64_t blen=mc_blob_struct_ok(arc,co,len);   // bounded: 0 if OOB/corrupt
-                    if(blen==0){ bad++; continue; }
+                    uint64_t blen=mc_chunk_blob_len(arc,co);
                     uint64_t want=mc_chunk_stored_hash(arc,co);
                     uint64_t got=mc_chunk_compute_hash(arc+co,blen);
                     if(want!=got){
@@ -2570,7 +2533,6 @@ long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
             }
         }
     }
-    #undef MC_NODE_OK
     if(verbose) fprintf(stderr,"mc_verify: %ld chunks checked, %ld corrupt\n",total,bad);
     return bad;
 }
@@ -2578,15 +2540,11 @@ long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
 // ============================================================================
 // READER (flat buffer + streaming byte-source)
 // ============================================================================
-// The metadata region is an ARCHITECTURAL invariant: always at MC_HDR, at most
-// MC_META_CAP bytes (data starts at MC_META_END=128KB). Bound against that fixed
-// layout, NOT the attacker-controlled MCH_METAOFF/TOTLEN fields.
 const char *mc_metadata(const uint8_t *arc, size_t *out_len){
-    if(!arc){ if(out_len)*out_len=0; return NULL; }
-    uint64_t len; memcpy(&len,arc+MCH_METALEN,8);
-    if(len > MC_META_CAP) len = MC_META_CAP;
+    uint64_t off,len; memcpy(&off,arc+MCH_METAOFF,8); memcpy(&len,arc+MCH_METALEN,8);
+    if(!off) off=MC_HDR;
     if(out_len) *out_len=(size_t)len;
-    return (const char*)(arc+MC_HDR);
+    return (const char*)(arc+off);
 }
 
 #define MC_RD_NODE_CACHE 512   // cached node tables per streaming reader (512*32KB = 16MB):
@@ -2626,26 +2584,13 @@ static void reader_hdr_load(mc_reader *r, const u8 *hdr){
 }
 
 mc_reader *mc_open(const uint8_t *arc, size_t len){
-    // Untrusted-input gate: a valid flat archive is >= the 256-byte header with
-    // the right magic. Reject shorter/garbage so no downstream path reads header
-    // fields past the buffer. (Streaming uses mc_open_streaming.)
-    if(!arc || len < MC_HDR) return NULL;
-    uint32_t magic; memcpy(&magic,arc+MCH_MAGIC,4);
-    if(magic != MC_MAGIC) return NULL;
     mc_codec_init();
-    mc_reader *r=calloc(1,sizeof *r); if(!r) return NULL;
-    r->arc=arc; r->len=len;
+    mc_reader *r=calloc(1,sizeof *r); r->arc=arc; r->len=len;
     r->codec=mc_codec_ctx_new();
     reader_hdr_load(r, arc);
-    // Optional prior blob: install only if the full blob fits + magic matches.
     uint64_t poff; memcpy(&poff,arc+MCH_PRIOROFF,8);
-    if(poff && poff <= len && len - poff >= (uint64_t)MC_PRIORS_BYTES){
-        uint32_t pmagic; memcpy(&pmagic,arc+poff,4);
-        if(pmagic==MC_PRIORS_MAGIC){
-            memcpy(r->priors,arc+poff,MC_PRIORS_BYTES); r->has_priors=1;
-            priors_load(arc);                       // offset validated -> safe
-        }
-    }
+    if(poff){ memcpy(r->priors,arc+poff,MC_PRIORS_BYTES); r->has_priors=1; }
+    priors_load(arc);
     return r;
 }
 
@@ -2781,13 +2726,13 @@ static uint64_t sresolve_chunk(mc_reader *r,int lod,int cz,int cy,int cx,int *er
 uint64_t mc_chunk_offset_chk(mc_reader *r,int lod,int cz,int cy,int cx,int *err){
     if(err)*err=0;
     if(!r||lod<0||lod>7) return 0;
-    if(r->arc) return mc_resolve_chunk_b(r->arc,r->roots[lod],cz,cy,cx,r->len);  // flat: bounded
+    if(r->arc) return mc_resolve_chunk(r->arc,r->roots[lod],cz,cy,cx);  // flat: no I/O
     return sresolve_chunk(r,lod,cz,cy,cx,err);
 }
 
 uint64_t mc_chunk_offset(mc_reader *r,int lod,int cz,int cy,int cx){
     if(lod<0||lod>7) return 0;
-    if(r->arc) return mc_resolve_chunk_b(r->arc,r->roots[lod],cz,cy,cx,r->len);
+    if(r->arc) return mc_resolve_chunk(r->arc,r->roots[lod],cz,cy,cx);
     return sresolve_chunk(r,lod,cz,cy,cx,NULL);
 }
 
@@ -2827,9 +2772,7 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
         if(np && sread(r,chunk_off+MC_BLOB_HDR+fml+MC_BITMAP_BYTES,(uint32_t)(np*2),r->hdr+MC_BLOB_HDR+MC_BITMAP_BYTES)!=0) return -1;
         r->hdr_np=np; r->hdr_off=chunk_off;
     }
-    { float q; memcpy(&q,r->hdr,4);
-      if(!(q > 0.0f) || q > 1024.0f) q = 1.0f;   // untrusted blob: reject NaN/Inf/OOR
-      mc_codec_ctx_set_quality(r->codec,q); }
+    { float q; memcpy(&q,r->hdr,4); mc_codec_ctx_set_quality(r->codec,q); }
     const u8 *bm=r->hdr+MC_BLOB_HDR;
     if(!mc_bit_get(bm,bi)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return 0; }
     int slot=mc_rank(bm,bi);
@@ -2845,13 +2788,6 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
 
 void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
     if(chunk_off<=MC_SLOT_ZERO){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    // Flat reader on untrusted bytes: validate the whole chunk-blob structure is
-    // in-bounds BEFORE reading any blob field (mc_chunk_q/mc_block_range read
-    // header/fmap/bitmap/lens at chunk_off-derived offsets). Streaming fetches
-    // bounded windows already.
-    if(r->arc && !mc_blob_struct_ok(r->arc, chunk_off, r->len)){
-        memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return;
-    }
     if(!r->arc && r->partial){
         if(spartial_decode(r,chunk_off,(bz*16+by)*16+bx,dst)==0) return;
         memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return;
@@ -2867,11 +2803,7 @@ void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_
         blob_origin = 0;
     }
     (void)blob_origin;
-    // Per-chunk quality is an f32 from the (untrusted) blob; NaN/Inf/OOR poisons
-    // the quant-table interpolation (NaN -> uint16_t cast is UB). Clamp.
-    float cq = mc_chunk_q(blob_base,chunk_off);
-    if(!(cq > 0.0f) || cq > 1024.0f) cq = 1.0f;
-    mc_codec_ctx_set_quality(r->codec,cq);
+    mc_codec_ctx_set_quality(r->codec,mc_chunk_q(blob_base,chunk_off));
     uint64_t boff; uint32_t blen;
     if(!mc_block_range(blob_base,chunk_off,bz,by,bx,&boff,&blen)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     mc_dec_block(r->codec,blob_base+boff,blen,dst);
@@ -8142,6 +8074,7 @@ void mc_volume_freeze(mc_volume *v) {
 typedef struct { mc_volume *v; int me; } filler_arg;
 static void *filler_main(void *ud) {
     filler_arg *a = ud; mc_volume *v = a->v; int me = a->me; free(a);
+    mc_thread_setname("mc-fill");          // distinguish from the GUI thread in profilers
     uint64_t seen = 0;
     for (;;) {
         pthread_mutex_lock(&v->fill_mu);
