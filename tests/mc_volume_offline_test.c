@@ -17,6 +17,11 @@ int main(int argc, char **argv) {
     const char *cache = argc > 2 ? argv[2] : "/tmp";
     if (!root) { fprintf(stderr, "usage: %s <zarr-root-dir> [cache-dir]\n", argv[0]); return 2; }
 
+    // mc_volume_open writes a derived <cache>/<root-basename>.mca mirror. Clear a
+    // stale one first (e.g. left by a prior run with different fixture dims) — the
+    // mirror is rebuildable and mc_archive_open rightly refuses a dims-mismatch.
+    { char mca[1280]; snprintf(mca, sizeof mca, "%s/zarr.mca", cache); remove(mca); }
+
     mc_volume *v = mc_volume_open(root, cache, (size_t)256 << 20, 6.0f);
     if (!v) { fprintf(stderr, "mc_volume_open(%s) failed\n", root); return 1; }
 

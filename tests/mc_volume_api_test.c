@@ -28,6 +28,9 @@ int main(int argc,char**argv){
     const char *cache = argc>2?argv[2]:"/tmp";
     if(!root){ fprintf(stderr,"usage: %s <zarr-root-dir> [cache-dir]\n",argv[0]); return 2; }
 
+    // clear any stale derived .mca mirror (rebuildable; dims may differ across runs).
+    { char mca[1280]; snprintf(mca,sizeof mca,"%s/zarr.mca",cache); remove(mca); }
+
     // ---- mc_volume_open_ex (config path) + tunables ----
     mc_volume *v = mc_volume_open_ex(root, cache, (size_t)256<<20, 6.0f, NULL);
     CHECK(v!=NULL,"mc_volume_open_ex failed");

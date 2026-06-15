@@ -47,7 +47,9 @@ static uint8_t voxel(int gx, int gy, int gz, int dim) {
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <out_dir>\n", argv[0]); return 2; }
     const char *out = argv[1];
-    int base = 256;   // LOD0 cube edge (one 256^3 volume region; 2^3 inner chunks)
+    int base = 512;   // LOD0 cube edge: 2^3 = 8 volume regions of 256^3, each
+                      // 2^3 inner chunks of edge 128 -> exercises the multi-region
+                      // prefetch_level walk + per-region decode-pool batching.
 
     for (int L = 0; L < NLEV; ++L) {
         int dim = base >> L; if (dim < CHUNK) dim = CHUNK;
