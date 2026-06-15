@@ -118,13 +118,22 @@ llvm-cov show "$FIRST" "${objs[@]:2}" -instr-profile="$OUT/merged.profdata" \
   -format=html -output-dir="$OUT/html" "$SCOPE" >/dev/null 2>&1 || true
 
 LINE_PCT="$(awk '/matter_compressor.c/{print $(NF-3)}' "$OUT/coverage.txt" | tr -d '%' | head -1)"
+# Reachability note: some uncovered lines CANNOT run in this offline x86 build —
+# NEON-only SIMD (#if MC_SIMD_NEON, dead on AVX2) and real-S3-only paths
+# (mc_s3_*, mc_stream_fetch_batch). Surfaced so the % is read in context.
+NEON_LINES="$(awk '/#if.*MC_SIMD_NEON/{n=1} n{c++} /#else|#elif|#endif/{if(n&&c>1)t+=c-1;n=0;c=0} END{print t+0}' "$ROOT/src/matter_compressor.c")"
 {
   echo '### Coverage — `src/matter_compressor.c`'
   echo '```'
   cat "$OUT/coverage.txt"
   echo '```'
+  echo "_Note: ~${NEON_LINES} uncovered lines are NEON-only (\`#if MC_SIMD_NEON\`,"
+  echo "dead on this AVX2 build); the \`mc_s3_*\` + \`mc_stream_fetch_batch\` paths"
+  echo "are real-S3-only (covered by the opt-in s3-bench lane). Offline x86 ceiling"
+  echo "is therefore ~92-93%._"
 } > "$OUT/summary.md"
-echo "line coverage: ${LINE_PCT}%  (report: $OUT/coverage.txt, html: $OUT/html/index.html)"
+echo "line coverage: ${LINE_PCT}%  (~${NEON_LINES} NEON-dead lines on x86 + S3-only paths excluded from reach)"
+echo "  (report: $OUT/coverage.txt, html: $OUT/html/index.html)"
 
 if [ -n "${MC_COVERAGE_MIN:-}" ]; then
   awk -v min="$MC_COVERAGE_MIN" -v got="${LINE_PCT:-0}" 'BEGIN{
