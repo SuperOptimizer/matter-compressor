@@ -2582,6 +2582,24 @@ void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,in
     mc_archive_decode_block_ctx(C,a,chunk_off,bz,by,bx,dst);
 }
 
+// Raw compressed block payload: returns a pointer into the live mmap to the
+// block's encoded bytes and its length, WITHOUT decoding. For a c3g archive
+// these are exactly the bytes the GPU compute decoder consumes — the viewer
+// reads them off disk and uploads them verbatim. Returns 1 on a present block,
+// 0 if absent/air or out of bounds (*ptr=NULL,*len=0).
+int mc_archive_block_blob(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx,
+                          const uint8_t **ptr, uint32_t *len){
+    if(ptr) *ptr=NULL; if(len) *len=0;
+    if(!a||chunk_off<=MC_SLOT_ZERO) return 0;
+    uint64_t boff; uint32_t bl;
+    if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)) return 0;
+    uint64_t end=atomic_load_explicit(&a->cursor,memory_order_acquire);
+    if(boff+bl>end) return 0;
+    if(ptr) *ptr=a->base+boff;
+    if(len) *len=bl;
+    return 1;
+}
+
 // ---- parallel whole-chunk helpers ------------------------------------------
 typedef struct {
     mc_archive *a; uint64_t chunk_off; mc_u8 *out; float q;
@@ -7772,6 +7790,17 @@ static void rstrip_slash(char *s) {
     while (n && s[n - 1] == '/') s[--n] = 0;
 }
 
+// MC_BLOCK_CODEC=c3g makes the local transcode .mca use the GPU-decodable c3g
+// block codec instead of CABAC (default). Lets the S3 -> transcode -> .mca
+// pipeline write blocks the GPU compute decoder can read straight off disk.
+// Only the transcoding open path honors this (the verbatim streaming copy path
+// must keep the source's codec). Applied right after the archive is opened.
+static void mc_volume_apply_codec_env(mc_archive *arc) {
+    const char *e = getenv("MC_BLOCK_CODEC");
+    if (e && (strcmp(e, "c3g") == 0 || strcmp(e, "1") == 0))
+        mc_archive_set_block_codec(arc, MC_BLOCKCODEC_C3G);
+}
+
 mc_volume *mc_volume_open(const char *url, const char *cache_dir,
                           size_t cache_bytes, float quality) {
     return mc_volume_open_ex(url, cache_dir, cache_bytes, quality, NULL);
@@ -7830,6 +7859,7 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
         for (int i = 0; i < v->nlods; ++i) mc_zarr_free(v->lv[i].z);
         s3_client_free(v->s3); free(v); return NULL;
     }
+    mc_volume_apply_codec_env(v->arc);
     v->cache = mc_cache_new_archive(cache_bytes, v->arc);
     if (!v->cache) {
         mc_archive_close(v->arc);
@@ -8080,6 +8110,11 @@ void mc_volume_free(mc_volume *v) {
 }
 
 int  mc_volume_nlods(const mc_volume *v) { return v ? v->nlods : 0; }
+// The volume's local archive (where transcoded chunks land). Lets a client read
+// compressed block blobs (mc_archive_block_blob) / the block codec for the GPU
+// decode path. The transcode pipeline must have produced the chunk first
+// (mc_volume_get_block / prefetch); absent chunks have no blob yet.
+mc_archive *mc_volume_archive(mc_volume *v) { return v ? v->arc : NULL; }
 void mc_volume_shape(const mc_volume *v, int lod, int *nz, int *ny, int *nx) {
     if (v->streaming) {
         if (lod < 0 || lod >= v->nlods) { if(nz)*nz=0; if(ny)*ny=0; if(nx)*nx=0; return; }

@@ -42,7 +42,7 @@ FetchContent_MakeAvailable(SDL3)
 # .glsl sources take effect (a custom command per shader, fed into the target).
 set(MC_VIEWER_SHADERS
   blit.vert:vert blit.frag:frag ui.vert:vert ui.frag:frag
-  c3g_decode.comp:comp)
+  c3g_decode.comp:comp vol.vert:vert vol_slice.frag:frag)
 find_program(GLSLANG_VALIDATOR glslangValidator)
 set(_shader_hdrs "")
 if(GLSLANG_VALIDATOR)
@@ -93,3 +93,16 @@ target_include_directories(c3g_gpu_check PRIVATE
 target_compile_options(c3g_gpu_check PRIVATE -O2)
 target_link_libraries(c3g_gpu_check PRIVATE matter_compressor SDL3::SDL3 m)
 set_property(TARGET c3g_gpu_check PROPERTY C_STANDARD 11)
+
+# vol_gpu_check — validates the full GPU vol path: upload compressed c3g slab ->
+# GPU compute-decode -> GPU slice-sample -> readback vs CPU reference. Headless.
+add_executable(vol_gpu_check
+  ${CMAKE_CURRENT_SOURCE_DIR}/vol_gpu_check.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/c3g_decode.comp.spv.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vol.vert.spv.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vol_slice.frag.spv.h)
+target_include_directories(vol_gpu_check PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(vol_gpu_check PRIVATE -O2)
+target_link_libraries(vol_gpu_check PRIVATE matter_compressor SDL3::SDL3 m)
+set_property(TARGET vol_gpu_check PROPERTY C_STANDARD 11)

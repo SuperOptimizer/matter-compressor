@@ -207,6 +207,13 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
 int      mc_archive_set_block_codec(mc_archive *a, uint32_t codec);
 uint32_t mc_archive_block_codec(const mc_archive *a);
 
+// Raw compressed bytes of one 16^3 block (no decode): on success points *ptr
+// into the archive's live mapping and sets *len. For a c3g archive these are
+// exactly the bytes the GPU compute decoder reads. Returns 1 if present, 0 if
+// absent/air/out-of-bounds. Pointer is valid while the archive is open.
+int mc_archive_block_blob(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx,
+                          const uint8_t **ptr, uint32_t *len);
+
 // Append one 256^3 chunk of raw u8 voxels at chunk coords (cz,cy,cx) in `lod`. Encodes
 // via the mc codec, writes the compressed chunk blob contiguously at EOF, installs it
 // in the index. Returns 0 on success. An all-air chunk is a no-op (slot stays absent,
@@ -1062,6 +1069,10 @@ int mc_mca_probe(const char *url, int *nx, int *ny, int *nz, int *nlods, float *
 void       mc_volume_free(mc_volume *v);
 
 int  mc_volume_nlods(const mc_volume *v);
+// The volume's local transcode archive (compressed blocks land here). Use with
+// mc_archive_chunk_offset + mc_archive_block_blob to read compressed c3g block
+// bytes for the GPU decode path. NULL for a streaming (verbatim-copy) volume.
+mc_archive *mc_volume_archive(mc_volume *v);
 void mc_volume_shape(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
 // block (16^3) grid extent of a level.
 void mc_volume_block_grid(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
