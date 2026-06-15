@@ -139,6 +139,12 @@ if(MC_STANDALONE)
   target_link_libraries(mc_stream_volume_test matter_compressor)
   add_test(NAME stream_volume COMMAND mc_stream_volume_test)
 
+  # streaming (.mca) volume pipeline against a local file: dl thread, decode pool,
+  # freeze/thaw fill, prefetch_shard/level, request_region, ensure_region, stats.
+  add_executable(mc_stream_volume_api_test tests/mc_stream_volume_api_test.c)
+  target_link_libraries(mc_stream_volume_api_test matter_compressor)
+  add_test(NAME stream_volume_api COMMAND mc_stream_volume_api_test)
+
   # concurrent archive append: stresses w_ensure_shard_slot node creation under N
   # threads (regression guard for the index-corruption publish race).
   add_executable(mc_archive_concurrent_test tests/mc_archive_concurrent_test.c)

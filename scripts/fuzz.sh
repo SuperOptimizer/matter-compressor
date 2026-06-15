@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# fuzz.sh — fuzz the matter-compressor decode path with AFL++.
+# fuzz.sh — fuzz a matter-compressor surface with AFL++.
 #
-# The harness (tests/fuzz/mc_fuzz_decode.c) exposes the standard libFuzzer
-# entrypoint; AFL++ compiles it directly (afl-clang-fast wraps its own
-# persistent driver) and instruments matter_compressor.c + c3d.c. We build with
-# ASan+UBSan so any memory/UB error in the decode path is a crash AFL++ saves.
+# Harnesses (tests/fuzz/) expose the standard libFuzzer entrypoint; AFL++
+# compiles them directly (afl-clang-fast wraps its own persistent driver) under
+# ASan+UBSan, so any memory/UB error is a crash AFL++ saves.
 #
-#   usage: scripts/fuzz.sh [seconds] [out_dir]
-#   env:   AFL_DIR=/usr/local/bin  (location of afl-clang-fast / afl-fuzz)
+#   usage: scripts/fuzz.sh [seconds] [out_dir] [target]
+#     target = decode (default) | block
+#       decode: whole .mca through mc_open/decode_block/verify (header + tree)
+#       block : a single block payload through mc_dec_block (range coder + IDCT)
+#   env: AFL_DIR=/usr/local/bin  (location of afl-clang-fast / afl-fuzz)
 #
 # A nonzero exit means AFL++ found a crash (saved under <out>/findings/*/crashes
 # and replayed under plain ASan with line/stack detail). CI runs a short bounded
@@ -17,6 +19,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECS="${1:-120}"
 OUT="${2:-$ROOT/build_fuzz}"
+TARGET="${3:-decode}"
 AFL_DIR="${AFL_DIR:-$(dirname "$(command -v afl-fuzz)")}"
 CC="$AFL_DIR/afl-clang-fast"
 [ -x "$CC" ] || { echo "afl-clang-fast not found (set AFL_DIR); is AFL++ installed?"; exit 2; }
@@ -24,29 +27,34 @@ CC="$AFL_DIR/afl-clang-fast"
 SRC=(src/matter_compressor.c src/c3d.c tools/vendor/libs3/libs3.c)
 INC=(-Isrc -Itools/vendor/libs3)
 LIBS=(-lm -lpthread -lzstd -lcurl)
+case "$TARGET" in
+  decode) HARNESS=tests/fuzz/mc_fuzz_decode.c; SEEDGEN=tests/fuzz/mc_fuzz_seed.c;;
+  block)  HARNESS=tests/fuzz/mc_fuzz_block.c;  SEEDGEN=tests/fuzz/mc_fuzz_block_seed.c;;
+  *) echo "unknown target '$TARGET' (decode|block)"; exit 2;;
+esac
 
 rm -rf "$OUT"; mkdir -p "$OUT/corpus" "$OUT/findings"
 cd "$ROOT"
 
-# 1. seed generator (plain clang — it just writes valid .mca files).
-clang -O1 -w "${INC[@]}" tests/fuzz/mc_fuzz_seed.c "${SRC[@]}" "${LIBS[@]}" -o "$OUT/seedgen"
+# 1. seed generator (plain clang — emits valid inputs for the chosen target).
+clang -O1 -w "${INC[@]}" "$SEEDGEN" "${SRC[@]}" "${LIBS[@]}" -o "$OUT/seedgen"
 "$OUT/seedgen" "$OUT/corpus"
 
 # 2. AFL++-instrumented harness, ASan+UBSan. afl-clang-fast intercepts
 #    -fsanitize=fuzzer and links its own driver (libAFLDriver.a) around the
 #    libFuzzer-style LLVMFuzzerTestOneInput entrypoint.
 AFL_USE_ASAN=1 AFL_USE_UBSAN=1 "$CC" -O1 -g -fsanitize=fuzzer "${INC[@]}" \
-  tests/fuzz/mc_fuzz_decode.c "${SRC[@]}" "${LIBS[@]}" -o "$OUT/mc_fuzz_decode"
+  "$HARNESS" "${SRC[@]}" "${LIBS[@]}" -o "$OUT/mc_fuzz"
 
 # 3. standalone replay build (plain clang + ASan) for crash triage / CI smoke.
 clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -w -DMC_FUZZ_STANDALONE \
-  "${INC[@]}" tests/fuzz/mc_fuzz_decode.c "${SRC[@]}" "${LIBS[@]}" -o "$OUT/mc_fuzz_replay"
+  "${INC[@]}" "$HARNESS" "${SRC[@]}" "${LIBS[@]}" -o "$OUT/mc_fuzz_replay"
 
 # 4. run AFL++ for the budget. -V = wall-clock seconds, then exit.
 export AFL_NO_UI=1 AFL_BENCH_UNTIL_CRASH=0 AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 echo "== afl-fuzz ${SECS}s =="
 set +e
-"$AFL_DIR/afl-fuzz" -i "$OUT/corpus" -o "$OUT/findings" -V "$SECS" -- "$OUT/mc_fuzz_decode" @@
+"$AFL_DIR/afl-fuzz" -i "$OUT/corpus" -o "$OUT/findings" -V "$SECS" -- "$OUT/mc_fuzz" @@
 set -e
 
 # 5. report + replay any crashes with full ASan detail.

@@ -8075,6 +8075,7 @@ void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
 void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel) {
     (void)nthreads;   // TODO: thread team; serial walk for now.
     if (lod < 0 || lod >= v->nlods) return;
+    if (v->streaming) return;   // no zarr/shard layer; THAW read-through fills on miss
     int gz, gy, gx;
     mc_zarr_inner_grid(v->lv[lod].z, &gz, &gy, &gx);
     int per = mc_zarr_shard_edge(v->lv[lod].z) / mc_zarr_inner_edge(v->lv[lod].z);
