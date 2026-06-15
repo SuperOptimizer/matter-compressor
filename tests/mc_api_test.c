@@ -150,6 +150,25 @@ int main(void){
     long nzpix=0; for(int i=0;i<W*H;++i) if(im2[i]) nzpix++;
     CHECK(nzpix>0,"plane render produced an all-zero image");
 
+    // dense source with NON-16-multiple dims -> the partial-edge block accessor
+    // (dense_block memset+partial-copy path) when a sampled block overruns the
+    // volume edge. Sample across the whole volume incl. the ragged edge.
+    {
+        int D=100; uint8_t *odd=malloc((size_t)D*D*D);
+        for(int z=0;z<D;++z)for(int y=0;y<D;++y)for(int x=0;x<D;++x)
+            odd[((size_t)z*D+y)*D+x]=(uint8_t)(50+((x+y+z)%180));
+        mc_sample_src os=mc_sample_src_dense(odd,D,D,D);
+        mc_sampler *osmp=mc_sampler_new(&os);
+        // sample near the ragged edge (block at x=96 overruns 100) both filters.
+        float v_edge=mc_sample_point(osmp,D-2.0f,D-2.0f,D-2.0f,MC_FILTER_TRILINEAR);
+        float v_nn  =mc_sample_point(osmp,(float)(D-1),(float)(D-1),(float)(D-1),MC_FILTER_NEAREST);
+        CHECK(v_edge>=0&&v_nn>=0,"odd-dim edge sample failed");
+        // a batch across the volume to exercise the block cache + partial blocks.
+        float bp[3*8]; for(int i=0;i<8;++i){ bp[3*i]=i*14.0f; bp[3*i+1]=i*13.0f; bp[3*i+2]=i*12.0f; }
+        float bo[8]; mc_sample_points(osmp,bp,8,MC_FILTER_TRILINEAR,bo);
+        mc_sampler_free(osmp); free(odd);
+    }
+
     // single-sample render path (t0==t1 -> one tap, no march loop) + a NON-unit
     // normal so render_pixel renormalizes it. Covers the scalar early-outs.
     {
