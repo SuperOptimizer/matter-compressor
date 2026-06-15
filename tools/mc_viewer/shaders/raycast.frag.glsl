@@ -18,6 +18,10 @@ layout(set = 3, binding = 0) uniform RayUBO {
     vec4 vol_dim;         // volume extent in voxels (x,y,z), .w = step (voxels)
     vec4 params;          // x = mode (0=MIP, 1=emission-absorption), y = gain,
                           // z = alpha_min, w = absorption
+    vec4 light;           // xyz = direction TOWARD light (volume, x,y,z);
+                          // (0,0,0) -> headlight (toward camera). w = lighting on
+    vec4 lparams;         // x = ambient, y = diffuse, z = specular, w = shininess
+    vec4 lparams2;        // x = grad_g0 (u8/voxel at half surface-ness)
 } u;
 
 // ray vs axis-aligned box [0, vol_dim]; returns (tmin,tmax), tmin<tmax if hit.
@@ -72,19 +76,50 @@ void main() {
     // emission-absorption core (lighting added in M4).
     float alpha_min  = clamp(u.params.z, 0.0, 0.99);
     float absorption = max(u.params.w, 0.0);
+    bool  lit        = u.light.w > 0.5;
+    float ka = u.lparams.x, kd = u.lparams.y, ks = u.lparams.z, sh = max(u.lparams.w, 1.0);
+    float g0 = max(u.lparams2.x, 1e-3);   // grad_g0 in u8/voxel
+    vec3  invdim = 1.0 / dim;
+    // light direction toward the light; headlight (0,0,0) -> toward the camera.
+    vec3  L = (dot(u.light.xyz, u.light.xyz) > 1e-6) ? normalize(u.light.xyz) : -rd;
+    vec3  V = -rd;                         // view dir (toward camera)
+    vec3  H = normalize(L + V);            // Blinn-Phong half vector
+
     vec3  Crgb = vec3(0.0);
     float A    = 0.0;
     for (float t = tmin; t <= tmax && A < 0.99; t += dt) {
-        vec3 uvw = (ro + rd * t + 0.5) / dim;
+        vec3 p = ro + rd * t;
+        vec3 uvw = (p + 0.5) * invdim;
         float v = clamp(texture(u_vol, uvw).r * gain, 0.0, 1.0);
         if (v <= alpha_min) continue;
         vec4 tf = texture(u_lut, vec2(v * 255.0/256.0 + 0.5/256.0, 0.5));
+
+        vec3 rgb = tf.rgb;
+        if (lit) {
+            // central-difference gradient (u8/voxel units): sample +-1 voxel.
+            float gx = texture(u_vol, (p + vec3(1,0,0) + 0.5)*invdim).r
+                     - texture(u_vol, (p - vec3(1,0,0) + 0.5)*invdim).r;
+            float gy = texture(u_vol, (p + vec3(0,1,0) + 0.5)*invdim).r
+                     - texture(u_vol, (p - vec3(0,1,0) + 0.5)*invdim).r;
+            float gz = texture(u_vol, (p + vec3(0,0,1) + 0.5)*invdim).r
+                     - texture(u_vol, (p - vec3(0,0,1) + 0.5)*invdim).r;
+            vec3 g = vec3(gx, gy, gz) * (255.0 * 0.5);   // -> u8/voxel
+            float gmag2 = dot(g, g);
+            float surf = gmag2 / (gmag2 + g0*g0);        // surface-ness in [0,1]
+            vec3 N = (gmag2 > 1e-8) ? g * inversesqrt(gmag2) : vec3(0.0);
+            float ndl = abs(dot(N, L));                  // two-sided diffuse
+            float spec = (gmag2 > 1e-8) ? pow(max(dot(N, H), 0.0), sh) : 0.0;
+            float shade = ka + kd*ndl + ks*spec;
+            // blend lit shading toward unshaded (1.0) by surface-ness, so smooth
+            // interior emits flat instead of sparkling.
+            rgb *= mix(1.0, shade, surf);
+        }
+
         float d = (v - alpha_min) / (1.0 - alpha_min) * tf.a;
         float a = 1.0 - exp(-absorption * d * dt);
-        Crgb += (1.0 - A) * a * tf.rgb;
+        Crgb += (1.0 - A) * a * rgb;
         A    += (1.0 - A) * a;
     }
-    // composite over the background.
     vec3 bg = vec3(0.04, 0.04, 0.05);
     o_color = vec4(Crgb + (1.0 - A) * bg, 1.0);
 }

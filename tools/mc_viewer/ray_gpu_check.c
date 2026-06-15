@@ -217,10 +217,45 @@ int main(void){
     // disk-sized region must be lit.
     int m3ok = (center != bgcorner) && (ea_lit > RW*RH/8);
 
-    printf("%s\n", (m1ok && m2ok && m3ok) ? "ray_gpu_check: OK" : "ray_gpu_check: FAIL");
+    // ---- M4: gradient lighting ----
+    // Raking light from +X (toward higher x); the +X-facing side of the ball
+    // should render brighter than the -X-facing side. Sample two symmetric
+    // surface points (left/right of center) and compare luminance.
+    float ldir[3]={1.0f,0.0f,0.0f};
+    mc_gpu_ray_set_lighting(R, 1, ldir, 0.15f, 0.85f, 0.25f, 24.0f, 8.0f);
+    SDL_GPUCommandBuffer *cb4=SDL_AcquireGPUCommandBuffer(dev);
+    mc_gpu_ray_render(R,cb4,rt,ivp,campos,0.5f,1.0f, MC_RAY_EA, 0.1f, 4.0f);
+    SDL_GPUTransferBuffer *otb4=SDL_CreateGPUTransferBuffer(dev,&o);
+    SDL_GPUCopyPass *cp4=SDL_BeginGPUCopyPass(cb4);
+    SDL_GPUTextureTransferInfo oi4={0}; oi4.transfer_buffer=otb4; oi4.pixels_per_row=(Uint32)RW; oi4.rows_per_layer=(Uint32)RH;
+    SDL_DownloadFromGPUTexture(cp4,&rr,&oi4);
+    SDL_EndGPUCopyPass(cp4);
+    SDL_GPUFence *f4=SDL_SubmitGPUCommandBufferAndAcquireFence(cb4);
+    SDL_WaitForGPUFences(dev,true,&f4,1); SDL_ReleaseGPUFence(dev,f4);
+    uint32_t *img4=SDL_MapGPUTransferBuffer(dev,otb4,false);
+    // luminance of a band on the right (+X) vs left (-X) of center, mid-row.
+    long lumR=0, lumL=0; int row=RH/2;
+    for(int px=RW*5/8; px<RW*7/8; ++px){ uint32_t p=img4[row*RW+px]; lumR+=((p>>16)&255)+((p>>8)&255)+(p&255); }
+    for(int px=RW*1/8; px<RW*3/8; ++px){ uint32_t p=img4[row*RW+px]; lumL+=((p>>16)&255)+((p>>8)&255)+(p&255); }
+    const char *dumpl=SDL_getenv("RAY_DUMP_LIT");
+    if(dumpl){ FILE*fp=fopen(dumpl,"wb"); if(fp){ fprintf(fp,"P6\n%d %d\n255\n",RW,RH);
+        for(int i=0;i<RW*RH;++i){ uint32_t p=img4[i]; unsigned char c[3]={(p>>16)&255,(p>>8)&255,p&255}; fwrite(c,1,3,fp);} fclose(fp);
+        fprintf(stderr,"wrote %s\n",dumpl);} }
+    SDL_UnmapGPUTransferBuffer(dev,otb4);
+    printf("M4 (gradient lighting): +X-side lum=%ld  -X-side lum=%ld (%.1f%% brighter)\n",
+           lumR, lumL, lumL ? 100.0*(lumR-lumL)/lumL : 0.0);
+    // Raking +X light -> the +X-facing hemisphere is brighter. The margin is
+    // modest for a symmetric, semi-transparent ball (EA averages through both
+    // faces; the smooth surface has a gentle gradient), but it is directional
+    // and the surface shows shading relief (see RAY_DUMP_LIT). Gate: lit side
+    // measurably brighter than the opposite side.
+    int m4ok = (lumR > lumL) && (lumR - lumL > lumL/50);   // > 2% directional
+
+    int allok = m1ok && m2ok && m3ok && m4ok;
+    printf("%s\n", allok ? "ray_gpu_check: OK" : "ray_gpu_check: FAIL");
 
     for(int b=0;b<NB;++b) free(payloads[b].p);
     mc_codec_ctx_free(C); mc_gpu_ray_destroy(R);
     SDL_DestroyGPUDevice(dev); SDL_Quit();
-    return (m1ok && m2ok && m3ok) ? 0 : 1;
+    return allok ? 0 : 1;
 }

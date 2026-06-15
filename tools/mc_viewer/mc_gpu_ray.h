@@ -39,6 +39,14 @@ void mc_gpu_ray_set_lut(mc_gpu_ray *r, const uint32_t lut[256]);
  * mode = MC_RAY_MIP or MC_RAY_EA. For EA: alpha_min is the value threshold
  * (below = transparent) and absorption is the Beer-Lambert extinction scale;
  * the LUT's RGB is emission color and its alpha is per-value base opacity. */
+/* Gradient lighting for EA mode (off by default). light_dir = direction TOWARD
+ * the light in volume coords (x,y,z); pass {0,0,0} for a headlight. Weights
+ * follow the CPU MC_COMP_SHADED defaults if you pass them; grad_g0 is the
+ * gradient magnitude (u8/voxel) at half surface-ness. on=0 disables. */
+void mc_gpu_ray_set_lighting(mc_gpu_ray *r, int on, const float light_dir[3],
+                             float ambient, float diffuse, float specular,
+                             float shininess, float grad_g0);
+
 void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target,
                        const float inv_view_proj[16], const float cam_pos[3],
                        float step_voxels, float gain,
@@ -66,7 +74,15 @@ static const uint16_t MCR_FREQ[MCR_MAXSYM] =
     { 2200,980,360,180,110,70,48,34,24,18,14,10,8,6,5,21 };
 
 typedef struct { uint32_t nblocks, gz, gy, gx; } mcr_decode_ubo;
-typedef struct { float inv_view_proj[16]; float cam_pos[4]; float vol_dim[4]; float params[4]; } mcr_ray_ubo;
+typedef struct {
+    float inv_view_proj[16];
+    float cam_pos[4];
+    float vol_dim[4];
+    float params[4];      // mode, gain, alpha_min, absorption
+    float light[4];       // dir x,y,z; w = lighting on
+    float lparams[4];     // ambient, diffuse, specular, shininess
+    float lparams2[4];    // grad_g0, _, _, _
+} mcr_ray_ubo;
 
 struct mc_gpu_ray {
     SDL_GPUDevice *dev;
@@ -80,6 +96,10 @@ struct mc_gpu_ray {
     SDL_GPUTexture *lut_tex;      // 256x1 colormap
     int vx,vy,vz;                 // current volume voxel dims
     int gz,gy,gx, nblocks;
+    // lighting (EA mode); on=0 -> unshaded emission-absorption.
+    int   light_on;
+    float light_dir[3];
+    float ambient, diffuse, specular, shininess, grad_g0;
 };
 
 static SDL_GPUBuffer *mcr_robuf(SDL_GPUDevice *d, uint32_t sz){
@@ -249,6 +269,16 @@ SDL_GPUTexture *mc_gpu_ray_volume(mc_gpu_ray *r, int *vx,int *vy,int *vz){
     if(vx)*vx=r->vx; if(vy)*vy=r->vy; if(vz)*vz=r->vz; return r->vol;
 }
 
+void mc_gpu_ray_set_lighting(mc_gpu_ray *r, int on, const float light_dir[3],
+                             float ambient, float diffuse, float specular,
+                             float shininess, float grad_g0){
+    r->light_on = on;
+    if(light_dir){ r->light_dir[0]=light_dir[0]; r->light_dir[1]=light_dir[1]; r->light_dir[2]=light_dir[2]; }
+    else { r->light_dir[0]=r->light_dir[1]=r->light_dir[2]=0.0f; }
+    r->ambient=ambient; r->diffuse=diffuse; r->specular=specular;
+    r->shininess=shininess; r->grad_g0=grad_g0;
+}
+
 void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target,
                        const float inv_view_proj[16], const float cam_pos[3],
                        float step_voxels, float gain,
@@ -267,6 +297,10 @@ void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture 
     u.cam_pos[0]=cam_pos[0]; u.cam_pos[1]=cam_pos[1]; u.cam_pos[2]=cam_pos[2]; u.cam_pos[3]=0;
     u.vol_dim[0]=(float)r->vx; u.vol_dim[1]=(float)r->vy; u.vol_dim[2]=(float)r->vz; u.vol_dim[3]=step_voxels;
     u.params[0]=(float)mode; u.params[1]=gain; u.params[2]=alpha_min; u.params[3]=absorption;
+    u.light[0]=r->light_dir[0]; u.light[1]=r->light_dir[1]; u.light[2]=r->light_dir[2];
+    u.light[3]=(mode==MC_RAY_EA && r->light_on) ? 1.0f : 0.0f;
+    u.lparams[0]=r->ambient; u.lparams[1]=r->diffuse; u.lparams[2]=r->specular; u.lparams[3]=r->shininess;
+    u.lparams2[0]=r->grad_g0; u.lparams2[1]=u.lparams2[2]=u.lparams2[3]=0.0f;
     SDL_PushGPUFragmentUniformData(cmd,0,&u,sizeof u);
     SDL_DrawGPUPrimitives(rp,3,1,0,0);
     SDL_EndGPURenderPass(rp);
