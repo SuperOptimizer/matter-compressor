@@ -65,6 +65,31 @@ int main(void){
             CHECK(pq>0,"apply_preset(%d) q=%g",lvl,pq);
         }
         free(buf.p);
+
+        // all-AIR block: mc_enc_block must return 0 (no payload) — the !any path.
+        mc_u8 air[16*16*16]; memset(air,0,sizeof air);
+        mc_buf ab={0}; uint32_t al=0;
+        int ac=mc_enc_block(cx,air,&ab,&al);
+        CHECK(ac==0,"all-air block should encode to 0 (got coded=%d len=%u)",ac,al);
+        free(ab.p);
+
+        // MIXED air/material block: a half-air block forces the harmonic air-fill
+        // SOR (relax air toward the material mean before the DCT, force-zero on
+        // decode). Air voxels must restore to exactly 0.
+        mc_u8 mix[16*16*16];
+        for(int z=0;z<16;++z)for(int y=0;y<16;++y)for(int x=0;x<16;++x){
+            int i=(z*16+y)*16+x;
+            double r=sqrt((x-8)*(x-8)+(y-8)*(y-8)+(z-8)*(z-8));
+            mix[i]= r<6 ? (mc_u8)(120+(i%80)) : 0;     // material ball in air
+        }
+        mc_codec_ctx_set_max_error(cx,0);
+        mc_buf mb={0}; uint32_t mlx=0;
+        int mc=mc_enc_block(cx,mix,&mb,&mlx);
+        CHECK(mc==1&&mlx>0,"mixed block enc coded=%d len=%u",mc,mlx);
+        mc_u8 mdec[16*16*16]; mc_dec_block(cx,mb.p,mlx,mdec);
+        long airleak=0; for(int i=0;i<4096;++i) if(mix[i]==0 && mdec[i]!=0) airleak++;
+        CHECK(airleak==0,"air-fill leaked %ld air voxels (must be exactly 0)",airleak);
+        free(mb.p);
         mc_codec_ctx_free(cx);
     }
 
