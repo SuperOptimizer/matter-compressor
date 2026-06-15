@@ -360,6 +360,8 @@ int main(int argc, char **argv) {
             char info[128];
             snprintf(info, sizeof(info), "vol %dx%dx%d  lods=%d", V.nx, V.ny, V.nz, V.nlods);
             nk_label(nk, info, NK_TEXT_LEFT);
+            snprintf(info, sizeof(info), "gpu: %s", mc_gpu_driver(V.gpu));
+            nk_label(nk, info, NK_TEXT_LEFT);
             snprintf(info, sizeof(info), "slice img %dx%d", V.img_w, V.img_h);
             nk_label(nk, info, NK_TEXT_LEFT);
             if (V.gpu_avail) {

@@ -59,6 +59,7 @@ bool mc_gpu_render(mc_gpu *g, float draw_w, float draw_h, float pan_x, float pan
  * are set. The caller then draws the slice into *swap (its own clear render
  * pass), and finishes with mc_gpu_frame_end_nuklear. */
 SDL_GPUDevice *mc_gpu_device(mc_gpu *g);
+const char    *mc_gpu_driver(mc_gpu *g);     // SDL_GPU backend name ("vulkan"/"metal"/...)
 bool mc_gpu_frame_begin(mc_gpu *g, SDL_GPUCommandBuffer **cmd,
                         SDL_GPUTexture **swap, Uint32 *ow, Uint32 *oh);
 /* Draw the Nuklear UI into a LOAD render pass on `swap` (preserving the slice
@@ -129,8 +130,18 @@ mc_gpu *mc_gpu_create(SDL_Window *win) {
     if (!g) return NULL;
     g->win = win; g->nearest = true;
 
-    g->dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, NULL);
+    // SDL_GPU picks the backend automatically (Vulkan / Metal / D3D12 per
+    // platform — there is no OpenGL GPU backend). MC_GPU_DRIVER forces a
+    // specific one by name (e.g. "vulkan", "metal", "direct3d12"); NULL = auto.
+    const char *want = SDL_getenv("MC_GPU_DRIVER");
+    g->dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, want);
+    if (!g->dev) {
+        if (want) fprintf(stderr, "mc_gpu: MC_GPU_DRIVER=%s unavailable; "
+                                  "retrying auto-select\n", want);
+        g->dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, NULL);
+    }
     if (!g->dev || !SDL_ClaimWindowForGPUDevice(g->dev, win)) goto fail;
+    fprintf(stderr, "mc_gpu: SDL_GPU backend = %s\n", SDL_GetGPUDeviceDriver(g->dev));
 
     SDL_GPUTextureFormat swfmt = SDL_GetGPUSwapchainTextureFormat(g->dev, win);
 
@@ -521,6 +532,7 @@ bool mc_gpu_render(mc_gpu *g, float draw_w, float draw_h, float pan_x, float pan
 }
 
 SDL_GPUDevice *mc_gpu_device(mc_gpu *g) { return g->dev; }
+const char    *mc_gpu_driver(mc_gpu *g) { return g->dev ? SDL_GetGPUDeviceDriver(g->dev) : "none"; }
 
 bool mc_gpu_frame_begin(mc_gpu *g, SDL_GPUCommandBuffer **out_cmd,
                         SDL_GPUTexture **out_swap, Uint32 *ow, Uint32 *oh) {
