@@ -1423,6 +1423,37 @@ static int c3g_recover_levels(mc_codec_ctx *C, const mc_u8 *vox,
     return 1;
 }
 
+// Air-mask RLE: the N3 air bits (raster order) are spatially coherent, so we
+// store alternating run lengths as LEB128 varints, always STARTING with a
+// not-air (material) run length (which may be 0 if voxel 0 is air). This is
+// GPU-trivial to expand (one serial pass) and tiny for coherent masks. Returns
+// the byte length written into `out` (caller-sized; <= N3 worst case).
+static int c3g_rle_air_enc(const mc_u8 *air, int n, uint8_t *out){
+    int o=0, i=0;
+    int cur=0;                              // 0 = material run first
+    while(i<n){
+        int run=0; while(i<n && (air[i]!=0)==cur){ run++; i++; }
+        uint32_t r=(uint32_t)run;           // LEB128
+        do{ out[o++]=(uint8_t)((r&0x7F)|(r>=0x80?0x80:0)); r>>=7; }while(r);
+        cur^=1;
+    }
+    return o;
+}
+// Expand RLE air runs back into a packed bitmask airbits[ceil(n/8)] (1=air).
+// Bounded: stops at n voxels and at `len` input bytes. GPU mirror reads the
+// same varint runs.
+static void c3g_rle_air_dec(const uint8_t *in, int len, int n, uint8_t *airbits){
+    memset(airbits,0,(size_t)((n+7)>>3));
+    int o=0, p=0, cur=0;
+    while(o<n && p<len){
+        uint32_t r=0; int sh=0; uint8_t b;
+        do{ b=in[p++]; r|=(uint32_t)(b&0x7F)<<sh; sh+=7; }while((b&0x80)&&p<len);
+        int end=o+(int)r; if(end>n)end=n;
+        if(cur) for(int i=o;i<end;++i) airbits[i>>3]|=(uint8_t)(1u<<(i&7));
+        o=end; cur^=1;
+    }
+}
+
 int mc_c3g_enc_block(mc_codec_ctx *C, const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     c3g_tables_build();
     step_tab_build(C);
@@ -1458,24 +1489,32 @@ int mc_c3g_enc_block(mc_codec_ctx *C, const mc_u8 *vox, mc_buf *out, uint32_t *l
     for(rc_u32 p=eob; p-->0;){ c3g_renc_put(&re,c3g_sym_of(ql[scan[p]])); }
     int rans_len=re.cap-re.pos; uint32_t init_state=re.x;
 
-    // assemble payload: header | [air mask] | rans stream | sign bytes | esc bytes
+    // air mask: choose the smaller of RLE (great on coherent masks) vs the flat
+    // 512B bitmask (bounded worst case on incoherent masks). flags bit1 = RLE.
     int has_air=0; for(int i=0;i<n;++i){ if(air[i]){has_air=1;break;} }
+    int flatbytes=(n+7)>>3;
+    uint8_t airrle[N3]; int rlebytes=0;
+    uint8_t airflat[N3/8];
+    int use_rle=0, airbytes=0;
+    if(has_air){
+        rlebytes=c3g_rle_air_enc(air,n,airrle);
+        memset(airflat,0,sizeof airflat);
+        for(int i=0;i<n;++i) if(air[i]) airflat[i>>3]|=(uint8_t)(1u<<(i&7));
+        use_rle = rlebytes < flatbytes;
+        airbytes = use_rle ? rlebytes : flatbytes;
+    }
+
+    // payload: header(12) | [air: RLE or flat bitmask] | rANS | signs | escapes
     int signbytes=(signbits+7)>>3;
-    uint8_t hdr[10];
-    hdr[0]=(uint8_t)(has_air?1:0);
+    uint8_t hdr[12];
+    hdr[0]=(uint8_t)((has_air?1:0)|(use_rle?2:0));
     hdr[1]=(uint8_t)dc;
     c3g_put_u16(hdr+2,(uint16_t)nsym);
     c3g_put_u16(hdr+4,(uint16_t)rans_len);
     c3g_put_u32(hdr+6,init_state);
-    // payload: header | [air bitmask: ceil(N3/8)=512 B] | rANS | signs | escapes
-    // (packed 1 bit/voxel — GPU reads bit (air[i>>3]>>(i&7))&1, still branchless,
-    // 8x smaller than a byte-per-voxel mask).
-    int airbytes = has_air ? ((n+7)>>3) : 0;
-    uint8_t airbits[N3/8];
-    if(has_air){ memset(airbits,0,sizeof airbits);
-        for(int i=0;i<n;++i) if(air[i]) airbits[i>>3]|=(uint8_t)(1u<<(i&7)); }
+    c3g_put_u16(hdr+10,(uint16_t)airbytes);     // air section byte length
     mc_buf_put(out,hdr,sizeof hdr);
-    if(has_air) mc_buf_put(out,airbits,(size_t)airbytes);
+    if(has_air) mc_buf_put(out, use_rle?airrle:airflat, (size_t)airbytes);
     mc_buf_put(out,ransbuf+re.pos,(size_t)rans_len);
     mc_buf_put(out,signbuf,(size_t)signbytes);
     mc_buf_put(out,escbuf,(size_t)esclen);
@@ -1488,14 +1527,22 @@ void mc_c3g_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst
     c3g_tables_build();
     step_tab_build(C);
     int n=N3;
-    if(plen<10){ memset(dst,0,n); return; }
-    int has_air=p[0]&1; int dc=p[1];
+    if(plen<12){ memset(dst,0,n); return; }
+    int has_air=p[0]&1; int air_rle=(p[0]>>1)&1; int dc=p[1];
     int nsym=c3g_get_u16(p+2);
     int rans_len=c3g_get_u16(p+4);
     uint32_t init_state=c3g_get_u32(p+6);
+    int airbytes=c3g_get_u16(p+10);
     if(nsym>n) nsym=n;
-    size_t off=10;
-    const uint8_t *air = has_air ? (p+off) : NULL; if(has_air) off+=(size_t)((n+7)>>3);
+    size_t off=12;
+    // air mask -> packed bitmask: either RLE-expand or copy the flat bitmask.
+    uint8_t airbits[N3/8];
+    if(has_air){
+        if(off+(size_t)airbytes>plen){ memset(dst,0,n); return; }
+        if(air_rle) c3g_rle_air_dec(p+off,airbytes,n,airbits);
+        else        memcpy(airbits,p+off,(size_t)((n+7)>>3));
+        off+=(size_t)airbytes;
+    }
     const uint8_t *rans=p+off; off+=rans_len;
     const uint8_t *signs=p+off;
     // bounds: sign bytes follow; escapes after. Clamp to plen for safety.
@@ -1530,7 +1577,7 @@ void mc_c3g_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst
     for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],C->step_tab[idx]);
     mc_dct3_inv(&C->dct,coef,blk);
     for(int i=0;i<n;++i){
-        int isair = has_air && ((air[i>>3]>>(i&7))&1);
+        int isair = has_air && ((airbits[i>>3]>>(i&7))&1);
         int v = isair ? 0 : (int)lrintf(blk[i])+dc;
         if(v<0)v=0; if(v>255)v=255; dst[i]=(mc_u8)v;
     }

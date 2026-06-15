@@ -32,17 +32,34 @@ cross-symbol or cross-block dependency, so one GPU invocation decodes one block.
 
 ```
 offset  size  field
-0       1     flags        bit0 = has air-mask, bit1 = (reserved: corrections)
+0       1     flags        bit0 = has air-mask, bit1 = air-mask is RLE (else flat)
 1       1     dc           block DC term (0..255)
 2       2     nsym         number of coded coefficient symbols (= eob in scan order)
 4       2     rans_len     length of the rANS byte stream
-6       4     init_state   rANS initial state x (decode reads stream backwards)
-10      ...   air bitmask  present iff flags bit0; ceil(N3/8) = 512 bytes
+6       4     init_state   rANS initial state x
+10      2     air_len      bytes of the air section (0 if no air)
+12      ...   air section  present iff flags bit0; air_len bytes (see below)
 ...     ...   rANS stream  rans_len bytes
+...     ...   sign bytes   ceil(nz/8), one bit per nonzero level (scan order)
+...     ...   esc bytes    LEB128 remainders for |level| >= MAXSYM-1
 ```
 
 A *constant* block (no air, no AC coefficients) is encoded as `nsym=0`,
 `rans_len=0`, `flags=0`; the decoder fills the block with `dc`.
+
+### Air mask
+
+The N3 air bits are spatially coherent in real data, so the encoder picks,
+per block, whichever is smaller:
+
+- **RLE** (flags bit1 set): alternating run lengths as LEB128 varints, starting
+  with a material (not-air) run. Tiny for coherent masks (a half-air slab is a
+  few bytes); one serial expand pass on the GPU.
+- **flat bitmask** (flags bit1 clear): `ceil(N3/8) = 512` bytes, 1 bit/voxel.
+  The bounded fallback for incoherent masks (RLE would blow up there).
+
+So the air section is `min(RLE, 512)` bytes — coherent masks compress, scattered
+masks never exceed the flat 512 + header.
 
 ## Symbol alphabet
 

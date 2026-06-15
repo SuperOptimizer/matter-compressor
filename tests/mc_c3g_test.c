@@ -76,6 +76,12 @@ int main(void){
 
     // all-air
     memset(blk,0,N3); run_block(C,blk,"all-air");
+    // coherent half-air slab (air RLE branch wins) + incoherent checkerboard
+    // air (flat-bitmask branch wins) — exercise both air encodings.
+    for(int i=0;i<N3;++i) blk[i]=(i<(N3/2))?0:160;          // bottom half air
+    run_block(C,blk,"half-air-slab");
+    for(int i=0;i<N3;++i) blk[i]=((i^(i>>4)^(i>>8))&1)?180:0; // scattered air
+    run_block(C,blk,"checkerboard-air");
     // constant (dc only, no air)
     memset(blk,128,N3); run_block(C,blk,"constant-128");
     // smooth blob (low-frequency + air)
