@@ -39,6 +39,35 @@ int main(void){
     float q3=mc_preset_quality(MC_PRESET_BALANCED);
     CHECK(q3>0, "preset_quality MC_PRESET_BALANCED=%g should be >0", q3);
 
+    // ---- block codec round-trip with a MAX-ERROR bound (tau) ----
+    // Exercises mc_enc_block's sparse-correction path (uncovered by the plain
+    // quality-only builds) + the preset ladder + ctx getters/setters.
+    {
+        mc_u8 vox[16*16*16];
+        for(int z=0;z<16;++z)for(int y=0;y<16;++y)for(int x=0;x<16;++x)
+            vox[(z*16+y)*16+x]=(mc_u8)(40+((x*7+y*3+z*5)%160));   // all-material block
+        mc_codec_ctx *cx=mc_codec_ctx_new();
+        int tau=3;
+        mc_codec_ctx_set_quality(cx,2.0f);
+        mc_codec_ctx_set_max_error(cx,tau);
+        CHECK(mc_codec_ctx_get_max_error(cx)==tau,"get_max_error != set");
+        CHECK(mc_codec_ctx_get_quality(cx)==2.0f,"get_quality != set");
+        mc_buf buf={0}; uint32_t plen=0;
+        int coded=mc_enc_block(cx,vox,&buf,&plen);
+        CHECK(coded==1&&plen>0,"enc_block coded=%d plen=%u",coded,plen);
+        mc_u8 dec[16*16*16];
+        mc_dec_block(cx,buf.p,plen,dec);
+        int maxe=0; for(int i=0;i<4096;++i){ int e=abs((int)dec[i]-(int)vox[i]); if(e>maxe)maxe=e; }
+        CHECK(maxe<=tau,"max-error bound violated: maxerr=%d > tau=%d",maxe,tau);
+        // preset ladder: every level applies without crashing and returns a q.
+        for(int lvl=MC_PRESET_ARCHIVAL;lvl<=MC_PRESET_PREVIEW;++lvl){
+            float pq=mc_apply_preset(cx,(mc_preset)lvl);
+            CHECK(pq>0,"apply_preset(%d) q=%g",lvl,pq);
+        }
+        free(buf.p);
+        mc_codec_ctx_free(cx);
+    }
+
     // ---- build an in-RAM archive ----
     mc_build_opts o={.dim=N,.quality=6.0f};
     size_t len=0; uint8_t *arc=mc_build(ball,NULL,&o,&len);
@@ -120,6 +149,18 @@ int main(void){
     CHECK(diff==0,"render_points_par != serial render_points (sum|diff|=%ld)",diff);
     long nzpix=0; for(int i=0;i<W*H;++i) if(im2[i]) nzpix++;
     CHECK(nzpix>0,"plane render produced an all-zero image");
+
+    // Composite SIMD 4-wide path: nsteps>=4 + TRILINEAR fills the vectorized
+    // ray loop in render_pixel. Drive MIN/MEAN/STDDEV (the render test covers
+    // these comps only at small step counts -> scalar tail). t0..t1/dt = 12 steps.
+    for(int ci=0; ci<3; ++ci){
+        mc_comp comps[3]={MC_COMP_MIN,MC_COMP_MEAN,MC_COMP_STDDEV};
+        mc_render_params wp={.filter=MC_FILTER_TRILINEAR,.comp=comps[ci],
+                             .t0=-6,.t1=6,.dt=1};
+        uint8_t *wim=calloc(W*H,1);
+        mc_render_points(s,gpts,gnrm,W,H,&wp,wim);   // gpts/gnrm still valid here
+        free(wim);
+    }
 
     // MC_COMP_INK: the papyrus ink-detection composite (transmission + cone SSS).
     // Shares the SHADED emission-absorption march; exercise it explicitly (the

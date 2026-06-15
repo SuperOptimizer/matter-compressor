@@ -75,7 +75,7 @@ int main(int argc,char**argv){
              x1=box? ((bx0+bnx+(1L<<lod)-1)>>lod):n;
         if(z1>n)z1=n; if(y1>n)y1=n; if(x1>n)x1=n;
         for(long cz=z0;cz<z1;++cz)for(long cy=y0;cy<y1;++cy)for(long cx=x0;cx<x1;++cx){
-            if(!mc_resolve_chunk(arc,roots[lod],(int)cz,(int)cy,(int)cx)) continue;
+            if(!mc_resolve_chunk(arc,roots[lod],(int)cz,(int)cy,(int)cx,(uint64_t)sb.st_size)) continue;
             ents[nent++]=(ent_t){morton3((uint32_t)cz,(uint32_t)cy,(uint32_t)cx),
                                  (uint16_t)cz,(uint16_t)cy,(uint16_t)cx,(uint8_t)lod};
         }
@@ -99,7 +99,7 @@ int main(int argc,char**argv){
         mc_archive_reserve_index(out,ents[i].lod,ents[i].cz,ents[i].cy,ents[i].cx);
     // pass 2: verbatim blob copy in (lod, morton) order
     for(size_t i=0;i<nent;++i){
-        uint64_t off=mc_resolve_chunk(arc,roots[ents[i].lod],ents[i].cz,ents[i].cy,ents[i].cx);
+        uint64_t off=mc_resolve_chunk(arc,roots[ents[i].lod],ents[i].cz,ents[i].cy,ents[i].cx,(uint64_t)sb.st_size);
         uint64_t blen=mc_chunk_blob_len(arc,off);
         if(mc_archive_append_chunk_compressed(out,ents[i].lod,ents[i].cz,ents[i].cy,ents[i].cx,
                                               arc+off,(size_t)blen)!=0){
