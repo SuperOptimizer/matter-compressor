@@ -165,6 +165,20 @@ int main(void){
     long nzpix=0; for(int i=0;i<W*H;++i) if(im2[i]) nzpix++;
     CHECK(nzpix>0,"plane render produced an all-zero image");
 
+    // slice fast path: comp==NONE (or NULL normals) -> the per-pixel SIMD slice
+    // sampler (4-wide mc_s_tri4 loop + per-lane fallback), both filters. This is
+    // VC3D's flat-slice view, distinct from the composite-along-normal path above.
+    {
+        mc_render_params slice={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_NONE};
+        uint8_t *sl=calloc(W*H,1);
+        mc_render_points(s,gpts,NULL,W,H,&slice,sl);          // NULL normals -> slice path
+        long snz=0; for(int i=0;i<W*H;++i) if(sl[i]) snz++;
+        CHECK(snz>0,"slice render (trilinear) all-zero");
+        mc_render_params sliceN={.filter=MC_FILTER_NEAREST,.comp=MC_COMP_NONE};
+        mc_render_points(s,gpts,gnrm,W,H,&sliceN,sl);         // comp==NONE -> slice path
+        free(sl);
+    }
+
     // dense source with NON-16-multiple dims -> the partial-edge block accessor
     // (dense_block memset+partial-copy path) when a sampled block overruns the
     // volume edge. Sample across the whole volume incl. the ragged edge.
