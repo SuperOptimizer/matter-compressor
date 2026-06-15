@@ -142,6 +142,14 @@ if(MC_STANDALONE)
   target_link_libraries(mc_archive_errpaths_test matter_compressor)
   add_test(NAME archive_errpaths COMMAND mc_archive_errpaths_test)
 
+  # REAL-S3 lane (anonymous Vesuvius open-data): covers mc_s3_*/s3_read + the
+  # remote batched download. Skips cleanly unless MC_S3_TEST=1, so it's safe in
+  # the offline gate; the s3-bench CI lane sets MC_S3_TEST=1. Labelled "s3".
+  add_executable(mc_s3_volume_test tests/mc_s3_volume_test.c)
+  target_link_libraries(mc_s3_volume_test matter_compressor)
+  add_test(NAME s3_volume COMMAND mc_s3_volume_test)
+  set_tests_properties(s3_volume PROPERTIES LABELS s3)
+
   add_executable(mc_stream_volume_test tests/mc_stream_volume_test.c)
   target_link_libraries(mc_stream_volume_test matter_compressor)
   add_test(NAME stream_volume COMMAND mc_stream_volume_test)

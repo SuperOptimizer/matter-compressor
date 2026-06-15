@@ -26,11 +26,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libzstd-dev
       - name: build
         run: cmake -B build -S . -DMC_NO_NATIVE=ON && cmake --build build -j
+      - name: real-S3 read-path test (anonymous; covers mc_s3_*/remote download)
+        run: MC_S3_TEST=1 ctest --test-dir build -L s3 --output-on-failure
       - name: fetch a real Vesuvius crop (anonymous S3) + mask
         run: |
           set -x
-          build/mc_fetch "${{ inputs.zarr || 's3://vesuvius-challenge-open-data/PHercParis4/volumes/20231027191953.zarr/0' }}" \
-            ${{ inputs.origin || '2048 2048 2048' }} ${{ inputs.dim || '512' }} /tmp/vol.bin
+          build/mc_fetch "${{ inputs.zarr || 's3://vesuvius-challenge-open-data/PHercParis4/volumes/20260323153942-2.400um-0.2m-137keV-masked.zarr/0' }}" \
+            ${{ inputs.origin || '3300 4200 4200' }} ${{ inputs.dim || '512' }} /tmp/vol.bin
           build/mc_mask /tmp/vol.bin ${{ inputs.dim || '512' }} /tmp/masked.bin 1.0
       - name: benchmarks on real data (log-only)
         run: |

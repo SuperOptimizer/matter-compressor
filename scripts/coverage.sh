@@ -105,6 +105,15 @@ if [ -x "$OUT/bin/mc_zarr_test" ]; then
       "$OUT/bin/mc_zarr_test" "$FIXTURE_BLOSC/zarr/0" >/dev/null 2>&1 || true
 fi
 
+# Optional real-S3 lane: when MC_S3_TEST=1 (network available), build + run the
+# anonymous-Vesuvius test to cover mc_s3_*/remote-download. Skipped otherwise.
+if [ "${MC_S3_TEST:-}" = "1" ] && \
+   "$CC" "${CFLAGS[@]}" tests/mc_s3_volume_test.c "${SRC[@]}" "${LIBS[@]}" -o "$OUT/bin/mc_s3_volume_test" 2>/dev/null; then
+  MC_S3_TEST=1 LLVM_PROFILE_FILE="$OUT/prof/s3_volume.profraw" \
+      "$OUT/bin/mc_s3_volume_test" >/dev/null 2>&1 || true
+  objs+=(-object "$OUT/bin/mc_s3_volume_test")
+fi
+
 llvm-profdata merge -sparse "$OUT"/prof/*.profraw -o "$OUT/merged.profdata"
 
 # Report scoped to matter_compressor.c only.
