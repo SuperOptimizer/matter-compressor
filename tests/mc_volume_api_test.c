@@ -31,9 +31,12 @@ int main(int argc,char**argv){
     // clear any stale derived .mca mirror (rebuildable; dims may differ across runs).
     { char mca[1280]; snprintf(mca,sizeof mca,"%s/zarr.mca",cache); remove(mca); }
 
-    // ---- mc_volume_open_ex (config path) + tunables ----
-    mc_volume *v = mc_volume_open_ex(root, cache, (size_t)256<<20, 6.0f, NULL);
-    CHECK(v!=NULL,"mc_volume_open_ex failed");
+    // ---- mc_volume_open_ex with an EXPLICIT config (covers the cfg-apply
+    //      branches: decoders / dl_threads / staging_bytes / request_stack). ----
+    mc_volume_config cfg = {.decoders=2, .dl_threads=2,
+                            .staging_bytes=(size_t)32<<20, .request_stack=4096};
+    mc_volume *v = mc_volume_open_ex(root, cache, (size_t)256<<20, 6.0f, &cfg);
+    CHECK(v!=NULL,"mc_volume_open_ex(cfg) failed");
     if(!v) return 1;
 
     int nl = mc_volume_nlods(v);
