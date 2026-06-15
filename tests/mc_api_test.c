@@ -137,6 +137,21 @@ int main(void){
     CHECK(u8out[0]==(uint8_t)(fout[0]+0.5f)||abs((int)u8out[0]-(int)fout[0])<=1,
           "sample_points_u8 disagrees with sample_points: %u vs %g",u8out[0],fout[0]);
 
+    // 12-point batch (>=4 so the SIMD 4-wide mc_s_tri4 lane loop runs) with some
+    // invalid (negative-coord) points mixed in -> exercises both the all-valid
+    // 4-wide fast path AND the per-lane fallback. NEAREST + TRILINEAR.
+    {
+        float b[3*12]; for(int i=0;i<12;++i){ b[3*i]=N/2.f+i; b[3*i+1]=N/2.f; b[3*i+2]=N/2.f; }
+        b[3*5]=-1; b[3*5+1]=-1; b[3*5+2]=-1;     // one invalid -> forces a fallback group
+        b[3*9]=-2;                                // partial-invalid in another group
+        float bo[12]; uint8_t bu[12];
+        mc_sample_points(s,b,12,MC_FILTER_TRILINEAR,bo);
+        mc_sample_points(s,b,12,MC_FILTER_NEAREST,bo);
+        mc_sample_points_u8(s,b,12,MC_FILTER_TRILINEAR,bu);
+        CHECK(bo[5]==0.0f,"invalid point must sample 0, got %g",bo[5]);
+        CHECK(bo[0]>0,"valid point in batch should be material");
+    }
+
     // ---- plane_gen: produce a point grid, render it serial + parallel ----
     mc_plane pl={.origin={N/2.f,N/2.f,N/2.f},.normal={1,0,0}}; mc_plane_basis(&pl);
     int W=64,H=64; float *gpts=malloc(sizeof(float)*3*W*H),*gnrm=malloc(sizeof(float)*3*W*H);

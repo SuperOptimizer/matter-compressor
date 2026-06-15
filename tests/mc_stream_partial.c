@@ -58,6 +58,16 @@ int main(void){
         mc_decode_block(rp,co,bz,by,bx,blkp);
         if(memcmp(blkf,blkp,sizeof blkf)!=0){ fprintf(stderr,"sweep mismatch %d %d %d\n",bz,by,bx); return 1; }
     }
+
+    // streaming-reader blob accessors (the sread() branch of these, distinct
+    // from the flat r->arc branch covered elsewhere): chunk_blob_len + read_blob.
+    uint64_t sblen = mc_reader_chunk_blob_len(rf, co);
+    if(sblen==0){ fprintf(stderr,"streaming chunk_blob_len==0\n"); return 1; }
+    uint8_t *sb = malloc(sblen);
+    if(mc_reader_read_blob(rf, co, sblen, sb)!=0){ fprintf(stderr,"streaming read_blob failed\n"); free(sb); return 1; }
+    free(sb);
+    printf("streaming blob: len=%llu read OK\n",(unsigned long long)sblen);
+
     mc_close(rf); mc_close(rp); fclose(f); remove(path);
     printf("mc_stream_partial: OK\n");
     return 0;
