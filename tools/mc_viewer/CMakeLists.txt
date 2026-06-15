@@ -42,7 +42,8 @@ FetchContent_MakeAvailable(SDL3)
 # .glsl sources take effect (a custom command per shader, fed into the target).
 set(MC_VIEWER_SHADERS
   blit.vert:vert blit.frag:frag ui.vert:vert ui.frag:frag
-  c3g_decode.comp:comp vol.vert:vert vol_slice.frag:frag)
+  c3g_decode.comp:comp vol.vert:vert vol_slice.frag:frag
+  c3g_decode3d.comp:comp raycast.vert:vert raycast.frag:frag)
 find_program(GLSLANG_VALIDATOR glslangValidator)
 set(_shader_hdrs "")
 if(GLSLANG_VALIDATOR)
@@ -106,3 +107,16 @@ target_include_directories(vol_gpu_check PRIVATE
 target_compile_options(vol_gpu_check PRIVATE -O2)
 target_link_libraries(vol_gpu_check PRIVATE matter_compressor SDL3::SDL3 m)
 set_property(TARGET vol_gpu_check PROPERTY C_STANDARD 11)
+
+# ray_gpu_check — validates (M1) c3g decode into a dense 3D texture and (M2) the
+# MIP raycaster, both vs a CPU reference. Headless.
+add_executable(ray_gpu_check
+  ${CMAKE_CURRENT_SOURCE_DIR}/ray_gpu_check.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/c3g_decode3d.comp.spv.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/raycast.vert.spv.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/raycast.frag.spv.h)
+target_include_directories(ray_gpu_check PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(ray_gpu_check PRIVATE -O2)
+target_link_libraries(ray_gpu_check PRIVATE matter_compressor SDL3::SDL3 m)
+set_property(TARGET ray_gpu_check PROPERTY C_STANDARD 11)
