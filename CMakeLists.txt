@@ -273,3 +273,11 @@ if(MC_STANDALONE)
   set_property(TARGET mc_stream_probe PROPERTY C_STANDARD 23)
   target_link_libraries(mc_stream_probe matter_compressor CURL::libcurl)
 endif()
+
+# Integrated slice viewer (SDL3 + Nuklear + SDL_GPU). Opt-in and standalone-only:
+# pulls SDL3 from git via FetchContent, so it stays out of the default build,
+# the test matrix, and CI unless explicitly requested with -DMC_BUILD_VIEWER=ON.
+option(MC_BUILD_VIEWER "Build the SDL3/Nuklear slice viewer (mc_viewer)" OFF)
+if(MC_STANDALONE AND MC_BUILD_VIEWER)
+  add_subdirectory(tools/mc_viewer)
+endif()

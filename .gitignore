@@ -57,6 +57,11 @@ dkms.conf
 # build dir
 /build/
 /build_native/
+/build_viewer/
 
 # coverage output (generated)
 /build_cov/
+
+# stray PGO/coverage profiles written to the tree
+default.profraw
+*.profraw
