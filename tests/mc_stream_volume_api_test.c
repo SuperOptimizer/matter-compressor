@@ -85,6 +85,41 @@ int main(void){
     CHECK(cv>0,"streaming center sample=%g should be material",cv);
     mc_sampler_free(smp);
 
+    // 4b) NON-blocking (interactive) sample source -> mc_volume_block_ptr (no-copy
+    //     arena pointer path). Render a small plane through the dense core after
+    //     pre-warming the cache with a blocking get, inside a frozen frame.
+    {
+        mc_sample_src iss=mc_volume_sample_src(v,0,0);   // blocking=0 -> block_ptr path
+        mc_volume_freeze(v);
+        mc_plane pl={.origin={nz/2.f,ny/2.f,nx/2.f},.normal={1,0,0}}; mc_plane_basis(&pl);
+        mc_render_params rp={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_MAX,.t0=-4,.t1=4,.dt=1};
+        uint8_t *im=calloc(48*48,1);
+        mc_render_plane(&iss,&pl,48,48,1.0f,&rp,im,0);
+        mc_volume_thaw(v);
+        free(im);
+    }
+
+    // 4c) SHADED + INK with the full lighting/SSS/curvature/ink-lock fields set,
+    //     rendered against the r=[90,110] sheet -> covers shade_ray's secondary
+    //     march, curvature, and the ink sheet-lock run detection.
+    {
+        mc_sample_src bs=mc_volume_sample_src(v,0,1);
+        // aim a plane tangent to the shell so the ray crosses the sheet.
+        mc_plane pl={.origin={nz/2.f,ny/2.f,nx/2.f-100.f},.normal={0,0,1}}; mc_plane_basis(&pl);
+        uint8_t *im=calloc(64*64,1);
+        mc_render_params sh={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_SHADED,
+            .t0=-30,.t1=30,.dt=1,.alpha_min=0.1f,.alpha_opacity=0.9f,
+            .light={1,0.3f,0.2f},.ambient=0.2f,.diffuse=0.8f,.specular=0.3f,
+            .shininess=20,.absorption=1.0f,.shadow=0.5f,.sss=0.4f,.curvature=0.5f,
+            .light_surface_rel=1};
+        mc_render_plane(&bs,&pl,64,64,1.0f,&sh,im,2);
+        mc_render_params ink={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_INK,
+            .t0=-30,.t1=30,.dt=1,.alpha_min=0.1f,.alpha_opacity=0.9f,
+            .sss=0.4f,.transmission=0.4f,.ink_lock=6.0f,.curvature=0.3f};
+        mc_render_plane(&bs,&pl,64,64,1.0f,&ink,im,2);
+        free(im);
+    }
+
     // 5) stats reflect activity.
     mc_volume_stats s={0}; mc_volume_get_stats(v,&s);
     printf("stats: net=%llu disk=%llu hits=%llu misses=%llu\n",

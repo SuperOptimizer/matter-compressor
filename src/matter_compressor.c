@@ -2234,14 +2234,26 @@ static void mc_archive_decode_block_ctx(mc_codec_ctx *C, mc_archive *a, uint64_t
     if(boff+bl>end){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     mc_dec_block(C,a->base+boff,bl,dst);
 }
+// Per-thread codec ctx for the hot decode_block path, freed on thread exit via a
+// pthread_key destructor. (A bare _Thread_local would leak ~400KB per render
+// worker thread when it joins — short-lived parallel-render thread teams churn,
+// so the leak is per-call, not bounded. The key keeps the per-thread caching
+// perf while plugging the leak; LSan-clean.)
+static pthread_key_t g_decblk_key;
+static pthread_once_t g_decblk_once = PTHREAD_ONCE_INIT;
+static void decblk_dtor(void *p){ if(p) mc_codec_ctx_free((mc_codec_ctx*)p); }
+static void decblk_key_init(void){ pthread_key_create(&g_decblk_key, decblk_dtor); }
+
 void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
     if(!a||chunk_off<=MC_SLOT_ZERO){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     // This is the HOT render-path read (mc_cache miss -> src_archive -> here, per
     // block). A fresh ctx per call would re-run step_tab_build's 4096-powf loop
     // every block (~4% of render CPU). Keep one ctx per thread; step_tab_build
     // caches on quality, so same-q blocks skip the rebuild.
-    static _Thread_local mc_codec_ctx *C = NULL;
-    if(!C){ C=mc_codec_ctx_new(); if(!C){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; } }
+    pthread_once(&g_decblk_once, decblk_key_init);
+    mc_codec_ctx *C = pthread_getspecific(g_decblk_key);
+    if(!C){ C=mc_codec_ctx_new(); if(!C){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+            pthread_setspecific(g_decblk_key, C); }
     mc_archive_decode_block_ctx(C,a,chunk_off,bz,by,bx,dst);
 }
 
