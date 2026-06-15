@@ -58,6 +58,12 @@ if "$CC" -O1 -w "${INC[@]}" tests/support/mc_make_fixture_v3.c "${SRC[@]}" "${LI
       -o "$OUT/bin/mc_make_fixture_v3" 2>/dev/null; then
   "$OUT/bin/mc_make_fixture_v3" "$FIXTURE_V3" || true
 fi
+# Build the v2 blosc+zstd fixture (covers blosc_decode).
+FIXTURE_BLOSC="$OUT/fixture_blosc"
+if "$CC" -O1 -w "${INC[@]}" tests/support/mc_make_fixture_blosc.c -lzstd \
+      -o "$OUT/bin/mc_make_fixture_blosc" 2>/dev/null; then
+  "$OUT/bin/mc_make_fixture_blosc" "$FIXTURE_BLOSC" || true
+fi
 
 built=()
 for t in "${OFFLINE_TESTS[@]}"; do
@@ -88,6 +94,15 @@ for t in "${built[@]}"; do
     echo "note: $t exited nonzero (profile still collected)"
   objs+=(-object "$OUT/bin/$t")
 done
+
+# Extra runs of the instrumented mc_zarr_test binary against the v3 (c3d) and
+# blosc fixtures (same source, different inner codec -> distinct branches).
+if [ -x "$OUT/bin/mc_zarr_test" ]; then
+  [ -d "$FIXTURE_V3/zarr/0" ] && LLVM_PROFILE_FILE="$OUT/prof/zarr_v3.profraw" \
+      "$OUT/bin/mc_zarr_test" "$FIXTURE_V3/zarr/0" >/dev/null 2>&1 || true
+  [ -d "$FIXTURE_BLOSC/zarr/0" ] && LLVM_PROFILE_FILE="$OUT/prof/zarr_blosc.profraw" \
+      "$OUT/bin/mc_zarr_test" "$FIXTURE_BLOSC/zarr/0" >/dev/null 2>&1 || true
+fi
 
 llvm-profdata merge -sparse "$OUT"/prof/*.profraw -o "$OUT/merged.profdata"
 

@@ -205,6 +205,20 @@ if(MC_STANDALONE)
   add_test(NAME zarr_v3 COMMAND mc_zarr_v3_test ${MC_FIXTURE_V3_DIR}/zarr/0)
   set_tests_properties(zarr_v3 PROPERTIES FIXTURES_REQUIRED zarr_v3_fixture)
 
+  # v2 blosc+zstd fixture -> the blosc_decode path (raw fixture is compressor:null).
+  add_executable(mc_make_fixture_blosc tests/support/mc_make_fixture_blosc.c)
+  target_link_libraries(mc_make_fixture_blosc ${ZSTD_LIB})
+  target_include_directories(mc_make_fixture_blosc PRIVATE ${ZSTD_INC})
+  set(MC_FIXTURE_BLOSC_DIR ${CMAKE_BINARY_DIR}/fixture_blosc)
+  add_test(NAME zarr_blosc_fixture_setup
+           COMMAND mc_make_fixture_blosc ${MC_FIXTURE_BLOSC_DIR})
+  set_tests_properties(zarr_blosc_fixture_setup PROPERTIES FIXTURES_SETUP zarr_blosc_fixture)
+  add_executable(mc_zarr_blosc_test tests/mc_zarr_test.c)
+  set_property(TARGET mc_zarr_blosc_test PROPERTY C_STANDARD 23)
+  target_link_libraries(mc_zarr_blosc_test matter_compressor)
+  add_test(NAME zarr_blosc COMMAND mc_zarr_blosc_test ${MC_FIXTURE_BLOSC_DIR}/zarr/0)
+  set_tests_properties(zarr_blosc PROPERTIES FIXTURES_REQUIRED zarr_blosc_fixture)
+
   # v3 volume c3d-transcode path (prefetch_shard full body, c3d decode pool).
   add_executable(mc_volume_v3_test tests/mc_volume_v3_test.c)
   target_link_libraries(mc_volume_v3_test matter_compressor)
