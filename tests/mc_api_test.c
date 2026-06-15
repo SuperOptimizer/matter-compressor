@@ -150,6 +150,19 @@ int main(void){
     long nzpix=0; for(int i=0;i<W*H;++i) if(im2[i]) nzpix++;
     CHECK(nzpix>0,"plane render produced an all-zero image");
 
+    // single-sample render path (t0==t1 -> one tap, no march loop) + a NON-unit
+    // normal so render_pixel renormalizes it. Covers the scalar early-outs.
+    {
+        mc_render_params one={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_MAX,.t0=0,.t1=0,.dt=1};
+        float *n2=malloc(sizeof(float)*3*W*H);
+        for(int i=0;i<W*H;++i){ n2[3*i]=2.0f; n2[3*i+1]=0; n2[3*i+2]=0; }  // |n|=2, not unit
+        uint8_t *oim=calloc(W*H,1);
+        mc_render_points(s,gpts,n2,W,H,&one,oim);
+        long onz=0; for(int i=0;i<W*H;++i) if(oim[i]) onz++;
+        CHECK(onz>0,"single-sample render all-zero");
+        free(n2); free(oim);
+    }
+
     // Composite SIMD 4-wide path: nsteps>=4 + TRILINEAR fills the vectorized
     // ray loop in render_pixel. Drive MIN/MEAN/STDDEV (the render test covers
     // these comps only at small step counts -> scalar tail). t0..t1/dt = 12 steps.

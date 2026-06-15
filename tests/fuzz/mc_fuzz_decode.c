@@ -30,8 +30,18 @@
 #include <string.h>
 #include <stdint.h>
 
+// streamed byte-source over the current fuzz input (set in exercise()).
+static struct { const uint8_t *buf; size_t len; } g_stream;
+static int stream_read_cb(void *ud, uint64_t off, uint32_t len, uint8_t *dst) {
+    (void)ud;
+    if (off + len > g_stream.len) return -1;     // short/OOB read -> transient error
+    memcpy(dst, g_stream.buf + off, len);
+    return 0;
+}
+
 static void exercise(const uint8_t *data, size_t size) {
     if (size < 16) return;                 // too short to be anything; skip cheaply
+    g_stream.buf = data; g_stream.len = size;   // back the streaming reader below
     // mc_open may mmap/scan the header; it must reject garbage without crashing.
     mc_reader *r = mc_open(data, size);
     if (!r) return;                        // cleanly rejected — good
@@ -74,6 +84,26 @@ static void exercise(const uint8_t *data, size_t size) {
     mc_close(r);
     // Integrity walk over the raw bytes (xxh64 per chunk) — its own bounds path.
     (void)mc_verify_archive(data, size, 0);
+
+    // Streaming-reader pass: drive mc_open_streaming over the SAME bytes via a
+    // ranged-read callback, in both full-fetch and partial-fetch modes. Exercises
+    // sresolve_chunk / sfetch_chunk / spartial_decode on corrupt streamed bytes
+    // (a distinct code path from the flat mmap reader above).
+    for (int partial = 0; partial < 2; ++partial) {
+        mc_reader *sr = mc_open_streaming(stream_read_cb, (void *)&g_stream, (uint64_t)size);
+        if (!sr) continue;
+        mc_reader_set_partial_fetch(sr, partial);
+        int snl = mc_reader_nlods(sr); if (snl < 0) snl = 0; if (snl > 8) snl = 8;
+        for (int lod = 0; lod < snl; ++lod)
+            for (int c = 0; c < 8; ++c) {
+                int cz = (c & 1) * 3, cy = ((c >> 1) & 1) * 5, cx = ((c >> 2) & 1) * 7;
+                uint64_t co = mc_chunk_offset(sr, lod, cz, cy, cx);
+                if (!co) continue;
+                for (int b = 0; b < 8; ++b)
+                    mc_decode_block(sr, co, (b & 1) * 15, ((b >> 1) & 1) * 15, ((b >> 2) & 1) * 15, blk);
+            }
+        mc_close(sr);
+    }
 }
 
 #ifdef MC_FUZZ_STANDALONE
