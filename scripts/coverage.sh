@@ -35,7 +35,7 @@ CFLAGS=(-O1 -g -fprofile-instr-generate -fcoverage-mapping -w "${INC[@]}")
 # (see RUN_ARGS below); mc_volume_test (the real-network probe) is excluded.
 OFFLINE_TESTS=(
   mc_roundtrip mc_append_roundtrip mc_stream_partial mc_v6_test
-  mc_cache_test mc_render_test mc_c3g_test mc_stream_volume_test mc_archive_concurrent_test
+  mc_cache_test mc_render_test mc_c3g_test mc_c3g_archive_test mc_stream_volume_test mc_archive_concurrent_test
   mc_volume_offline_test mc_volume_api_test mc_zarr_test mc_api_test
   mc_decode_robust_test mc_stream_volume_api_test mc_volume_v3_test
   mc_archive_errpaths_test

@@ -195,6 +195,18 @@ mc_archive *mc_archive_open(const char *path, int dim, float quality);
 // boundary. Chunk coordinates run over the padded grid per axis.
 mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float quality);
 
+// Block entropy codec for the archive (stamped in the header at MCH_BLOCKCODEC).
+//   MC_BLOCKCODEC_CABAC (0) = the original adaptive-binary-range-coded blocks.
+//   MC_BLOCKCODEC_C3G   (1) = GPU-decodable static-rANS blocks (docs/c3g_format.md).
+// Old archives have 0 and decode as CABAC, so this is backward compatible. The
+// decode path (reader + archive) dispatches on the stored codec automatically.
+#define MC_BLOCKCODEC_CABAC 0u
+#define MC_BLOCKCODEC_C3G   1u
+// Set the codec on a FRESH archive before appending chunks (stamps the header).
+// Returns 0 on success, <0 on unknown codec. Default (unset) is CABAC.
+int      mc_archive_set_block_codec(mc_archive *a, uint32_t codec);
+uint32_t mc_archive_block_codec(const mc_archive *a);
+
 // Append one 256^3 chunk of raw u8 voxels at chunk coords (cz,cy,cx) in `lod`. Encodes
 // via the mc codec, writes the compressed chunk blob contiguously at EOF, installs it
 // in the index. Returns 0 on success. An all-air chunk is a no-op (slot stays absent,

@@ -1583,6 +1583,15 @@ void mc_c3g_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst
     }
 }
 
+// Per-block decode dispatch by archive block codec. Same (payload,len) -> 16^3
+// contract as mc_dec_block; selects the c3g decoder when the archive's header
+// marks MC_BLOCKCODEC_C3G.
+static inline void mc_dec_block_codec(mc_codec_ctx *C, uint32_t codec,
+                                      const mc_u8 *p, uint32_t plen, mc_u8 *dst){
+    if(codec==MC_BLOCKCODEC_C3G) mc_c3g_dec_block(C,p,plen,dst);
+    else                          mc_dec_block(C,p,plen,dst);
+}
+
 // ============================================================================
 // mc_archive.h — matter-compressor on-disk archive format constants.
 //
@@ -1639,7 +1648,13 @@ void mc_c3g_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst
 #define MCH_METACAP 104             // u64 metadata region capacity (= MC_META_END - MC_HDR)
 #define MCH_METALEN 112             // u64 metadata bytes actually written
 #define MCH_QUALITY 120             // f32 quality the archive was built at (writer stamps it)
+#define MCH_BLOCKCODEC 124          // u32 block entropy codec: 0 = CABAC (default), 1 = c3g.
+                                    // Old archives have 0 here -> CABAC, so this is
+                                    // backward compatible. c3g blocks are GPU-decodable
+                                    // (see docs/c3g_format.md); the decode path dispatches
+                                    // on this field per archive.
 #define MCH_PRIOROFF 128            // u64 offset of an optional per-volume prior blob (0 = none)
+// MC_BLOCKCODEC_CABAC / MC_BLOCKCODEC_C3G come from matter_compressor.h.
 #define MC_PRIORS_MAGIC 0x53524950u // "PRIS"
 #define MC_PRIORS_BYTES (8 + 2*8*32*2)  // magic+ver, RC_PLO + RC_PHI as u16[8][32]
 #define MC_HDR      256u            // header size; metadata region begins here
@@ -1869,7 +1884,7 @@ static int gather_blk256(const u8 *chunk,int bz,int by,int bx,u8 *dst){
 // chunk's own quality; the hash covers bitmap+lens+payloads.
 typedef void (*out_put_fn)(void *out, const void *s, size_t n);
 
-static size_t encode_chunk_blob(mc_codec_ctx *C, const u8 *chunk256, out_put_fn put, void *out){
+static size_t encode_chunk_blob_codec(mc_codec_ctx *C, uint32_t codec, const u8 *chunk256, out_put_fn put, void *out){
     mc_buf *tmp=&C->chunk.tmp; tmp->len=0;
     uint8_t bm[MC_BITMAP_BYTES]; memset(bm,0,sizeof bm);
     uint16_t blen[MC_GRID3]; int npresent=0;
@@ -1882,7 +1897,10 @@ static size_t encode_chunk_blob(mc_codec_ctx *C, const u8 *chunk256, out_put_fn 
         int cnt=0; for(int i=0;i<MC_BLK*MC_BLK*MC_BLK;++i) cnt+=vox[i]!=0;
         frac[bi]=(uint8_t)((cnt*15+2048)/4096);              // nibble 0..15
         if(cnt&&!frac[bi]) frac[bi]=1;                        // any material -> >=1
-        uint32_t len=0; if(mc_enc_block(C,vox,tmp,&len)){ mc_bit_set(bm,bi); blen[bi]=(uint16_t)len; npresent++; }
+        uint32_t len=0;
+        int coded = (codec==MC_BLOCKCODEC_C3G) ? mc_c3g_enc_block(C,vox,tmp,&len)
+                                               : mc_enc_block(C,vox,tmp,&len);
+        if(coded){ mc_bit_set(bm,bi); blen[bi]=(uint16_t)len; npresent++; }
     }
     if(!npresent) return 0;   // all air -> no blob
     // v7 blob header: [f32 q][u64 xxh64][u16 fmaplen][fmap]
@@ -1902,6 +1920,10 @@ static size_t encode_chunk_blob(mc_codec_ctx *C, const u8 *chunk256, out_put_fn 
     put(out,lens16,(size_t)nl*2);
     put(out,tmp->p,tmp->len);
     return total;
+}
+// back-compat wrapper: CABAC blocks (the original behavior).
+static size_t encode_chunk_blob(mc_codec_ctx *C, const u8 *chunk256, out_put_fn put, void *out){
+    return encode_chunk_blob_codec(C,MC_BLOCKCODEC_CABAC,chunk256,put,out);
 }
 
 // recompute a chunk blob's hash from its bytes (mc_verify / verify-on-decode).
@@ -2100,6 +2122,7 @@ struct mc_archive {
     _Atomic uint64_t file_len; // current ftruncate'd file size
     int dim;
     float quality;
+    uint32_t block_codec;      // MC_BLOCKCODEC_* — which block decoder to use (header MCH_BLOCKCODEC)
     uint64_t reserve;          // mmap reservation size (dims-derived, <= MC_RESERVE)
     pthread_mutex_t grow_mu;   // serializes ftruncate only; decode is lock-free
     _Atomic uint64_t *cov;     // coverage memo slots (region key | flags), 0 = empty
@@ -2337,6 +2360,8 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
         memcpy(base+MCH_METAOFF,&metaoff,8); memcpy(base+MCH_METACAP,&metacap,8);
         memcpy(base+MCH_METALEN,&z,8); memcpy(base+MCH_TOTLEN,&totlen,8);
         memcpy(base+MCH_QUALITY,&quality,4);
+        { uint32_t bc=MC_BLOCKCODEC_CABAC; memcpy(base+MCH_BLOCKCODEC,&bc,4); }  // default
+        w->block_codec=MC_BLOCKCODEC_CABAC;
         atomic_store(&w->cursor, MC_META_END);
     } else {
         uint32_t magic; memcpy(&magic,base+MCH_MAGIC,4);
@@ -2351,6 +2376,9 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
         uint64_t totlen; memcpy(&totlen,base+MCH_TOTLEN,8);
         if(totlen < MC_META_END) totlen=MC_META_END;
         atomic_store(&w->cursor, totlen);
+        // block codec from the header (old archives have 0 here = CABAC).
+        memcpy(&w->block_codec,base+MCH_BLOCKCODEC,4);
+        if(w->block_codec!=MC_BLOCKCODEC_C3G) w->block_codec=MC_BLOCKCODEC_CABAC;
         priors_load(base);
     }
     return w;
@@ -2362,6 +2390,19 @@ int mc_archive_append_chunk_compressed(mc_archive *a, int lod, int cz,int cy,int
     return w_install_blob(a,lod,cz,cy,cx,blob,len);
 }
 
+// Select the block entropy codec for an archive being WRITTEN (call on a fresh
+// archive before appending chunks). Stamps the header so the reader/decode path
+// dispatches correctly. MC_BLOCKCODEC_C3G makes blocks GPU-decodable (c3g).
+// Returns 0 on success, <0 if the codec is unknown.
+int mc_archive_set_block_codec(mc_archive *a, uint32_t codec){
+    if(!a) return -1;
+    if(codec!=MC_BLOCKCODEC_CABAC && codec!=MC_BLOCKCODEC_C3G) return -1;
+    a->block_codec=codec;
+    memcpy(a->base+MCH_BLOCKCODEC,&codec,4);
+    return 0;
+}
+uint32_t mc_archive_block_codec(const mc_archive *a){ return a?a->block_codec:MC_BLOCKCODEC_CABAC; }
+
 int mc_archive_reserve_index(mc_archive *a, int lod, int cz,int cy,int cx){
     if(!a||lod<0||lod>7) return -1;
     return w_ensure_shard_slot(a,lod,cz,cy,cx)==~0ull ? -1 : 0;
@@ -2372,7 +2413,7 @@ int mc_archive_append_chunk_ctx(mc_archive *a, mc_codec_ctx *C,
                                 const mc_u8 vox[256*256*256]){
     if(!a||!C||lod<0||lod>7||!vox) return -1;
     stage_t st={0};
-    size_t blen = encode_chunk_blob(C, vox, stage_put, &st);
+    size_t blen = encode_chunk_blob_codec(C, a->block_codec, vox, stage_put, &st);
     int rc = 0;
     if(blen) rc = w_install_blob(a,lod,cz,cy,cx,st.p,st.len);
     else     rc = w_mark_zero(a,lod,cz,cy,cx);   // air, but record it as VISITED
@@ -2516,7 +2557,7 @@ static void mc_archive_decode_block_ctx(mc_codec_ctx *C, mc_archive *a, uint64_t
     // the per-chunk xxh64 covers bitmap+lens+payloads.)
     uint64_t end=atomic_load_explicit(&a->cursor,memory_order_acquire);
     if(boff+bl>end){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    mc_dec_block(C,a->base+boff,bl,dst);
+    mc_dec_block_codec(C,a->block_codec,a->base+boff,bl,dst);
 }
 // Per-thread codec ctx for the hot decode_block path, freed on thread exit via a
 // pthread_key destructor. (A bare _Thread_local would leak ~400KB per render
@@ -2894,6 +2935,7 @@ struct mc_reader {
     uint64_t roots[8];
     int nx, ny, nz;            // LOD0 dims from the header
     float quality;             // quality the archive was built at
+    uint32_t block_codec;      // MC_BLOCKCODEC_* (header MCH_BLOCKCODEC; 0=CABAC)
     u8 priors[MC_PRIORS_BYTES]; int has_priors;   // raw per-volume prior blob
     mc_read_fn read; void *read_ud;   // streaming mode
     // streaming scratch: a fetched window of the current chunk blob.
@@ -2919,6 +2961,8 @@ static void reader_hdr_load(mc_reader *r, const u8 *hdr){
     memcpy(&ux,hdr+MCH_NX,4); memcpy(&uy,hdr+MCH_NY,4); memcpy(&uz,hdr+MCH_NZ,4);
     r->nx=(int)ux; r->ny=(int)uy; r->nz=(int)uz;
     memcpy(&r->quality,hdr+MCH_QUALITY,4);
+    memcpy(&r->block_codec,hdr+MCH_BLOCKCODEC,4);   // 0 = CABAC (old archives)
+    if(r->block_codec!=MC_BLOCKCODEC_C3G) r->block_codec=MC_BLOCKCODEC_CABAC;
 }
 
 mc_reader *mc_open(const uint8_t *arc, size_t len){
@@ -3135,7 +3179,7 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
     uint64_t pay=chunk_off+MC_BLOB_HDR+r->hdr_fml+MC_BITMAP_BYTES+(uint64_t)r->hdr_np*2+cum;
     if(r->pbuf_cap<mylen){ void *tmp=realloc(r->pbuf,mylen); if(!tmp) return -1; r->pbuf=tmp; r->pbuf_cap=mylen; }
     if(sread(r,pay,mylen,r->pbuf)!=0) return -1;
-    mc_dec_block(r->codec,r->pbuf,mylen,dst);
+    mc_dec_block_codec(r->codec,r->block_codec,r->pbuf,mylen,dst);
     return 0;
 }
 
@@ -3170,7 +3214,7 @@ void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_
     mc_codec_ctx_set_quality(r->codec,cq);
     uint64_t boff; uint32_t blen;
     if(!mc_block_range(blob_base,chunk_off,bz,by,bx,&boff,&blen)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
-    mc_dec_block(r->codec,blob_base+boff,blen,dst);
+    mc_dec_block_codec(r->codec,r->block_codec,blob_base+boff,blen,dst);
 }
 
 // ============================================================================

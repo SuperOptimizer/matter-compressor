@@ -123,6 +123,11 @@ if(MC_STANDALONE)
   target_link_libraries(mc_c3g_test matter_compressor)
   add_test(NAME c3g COMMAND mc_c3g_test)
 
+  # c3g in the .mca archive: header codec field, round-trip == CABAC, back-compat.
+  add_executable(mc_c3g_archive_test tests/mc_c3g_archive_test.c)
+  target_link_libraries(mc_c3g_archive_test matter_compressor)
+  add_test(NAME c3g_archive COMMAND mc_c3g_archive_test)
+
   # public-API surface coverage: introspection getters, codec/quality extras,
   # colormap + image filters, plane/quad/LOD samplers + parallel renderers.
   add_executable(mc_api_test tests/mc_api_test.c)
