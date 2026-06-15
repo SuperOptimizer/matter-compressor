@@ -445,6 +445,46 @@ int main(void) {
     }
     printf("stddev + shaded + percentile + depth + ssao + curvature OK\n");
 
+    // ---- dense source block() callback ---------------------------------
+    // mc_sample_src_dense sets a direct `dense` pointer, so normal sampling
+    // short-circuits and never calls src.block(). The callback is still public
+    // (it is a struct field) and is the path a blocked consumer would take, so
+    // exercise it directly: full interior block, partial-edge block (memset
+    // path), and an out-of-range block (NULL return).
+    {
+        uint8_t tmp[MC_BLK * MC_BLK * MC_BLK];
+
+        // (a) full interior block from the N^3 dense volume.
+        mc_sample_src f = mc_sample_src_dense(vol, N, N, N);
+        memset(tmp, 0xAB, sizeof(tmp));
+        const uint8_t *bp = f.block(&f, 1, 2, 3, tmp);   // block (z,y,x)=(1,2,3)
+        CHECK(bp == tmp);
+        // spot-check a few voxels against the source layout.
+        CHECK(tmp[0] == V(1 * MC_BLK, 2 * MC_BLK, 3 * MC_BLK));
+        CHECK(tmp[((5) << 8) | ((6) << 4) | 7] ==
+              V(1 * MC_BLK + 5, 2 * MC_BLK + 6, 3 * MC_BLK + 7));
+
+        // (b) partial-edge block: a dense source whose dims are NOT multiples
+        // of 16 forces the dz/dy/dx < BLK clamp + the leading memset(tmp,0).
+        int en = MC_BLK + 5;                              // 21: one full + 5
+        uint8_t *evol = malloc((size_t)en * en * en);
+        for (int i = 0; i < en * en * en; i++) evol[i] = (uint8_t)(i & 0xFF);
+        mc_sample_src e = mc_sample_src_dense(evol, en, en, en);
+        memset(tmp, 0xCD, sizeof(tmp));
+        const uint8_t *ep = e.block(&e, 1, 1, 1, tmp);    // last (partial) block
+        CHECK(ep == tmp);
+        // voxels beyond the 5-wide edge must have been zeroed by the memset.
+        CHECK(tmp[((5) << 8) | ((5) << 4) | 5] == 0);
+        // an in-range edge voxel matches the source.
+        int z = MC_BLK, y = MC_BLK, x = MC_BLK;           // first voxel of blk(1,1,1)
+        CHECK(tmp[0] == evol[((size_t)z * en + y) * en + x]);
+        free(evol);
+
+        // (c) out-of-range block index -> NULL.
+        CHECK(f.block(&f, 999, 0, 0, tmp) == NULL);
+    }
+    printf("dense_block callback (full/partial/oob) OK\n");
+
     mc_sampler_free(s);
     free(grid); free(pa); free(pb); free(ca); free(cb); free(dec); free(vol);
     printf(fails ? "mc_render_test: %d FAILED\n" : "mc_render_test: OK\n", fails);

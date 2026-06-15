@@ -6275,6 +6275,21 @@ mc_zarr *mc_zarr_open(mc_zarr_read_fn read, void *ud) {
         free(z);
         return NULL;
     }
+    // The transcode pipeline groups source inner-chunks into a fixed 256^3
+    // region whose sub-chunk arrays (decode_item.raw/oz/oy/ox) are sized [8],
+    // i.e. at most 2x2x2 = sub^3 sub-chunks. That bounds the inner edge to a
+    // divisor of the 256 region giving sub = 256/edge in {1,2}: edge 128 or
+    // 256. A smaller edge (e.g. 64 -> sub 4 -> 64 sub-chunks) would overflow
+    // those [8] arrays (heap/stack smash) in mc_volume_prefetch_region /
+    // prefetch_shard. Reject such zarrs at open rather than overflow later.
+    // (256 is the MC_VOLUME region edge; see CHUNK in the volume section.)
+    if (256 % z->inner_edge != 0 || (256 / z->inner_edge) > 2) {
+        fprintf(stderr, "mc_zarr: inner edge %d unsupported "
+                "(must be 128 or 256; the transcode region is 256^3 with <=2 "
+                "sub-chunks per axis)\n", z->inner_edge);
+        free(z);
+        return NULL;
+    }
     z->per = z->shard_edge / z->inner_edge;
     for (int d = 0; d < 3; ++d)
         z->inner_grid[d] = (z->shape[d] + z->inner_edge - 1) / z->inner_edge;

@@ -39,7 +39,57 @@ static int fs_read(void *ud, const char *key, uint64_t off, uint64_t len,
     return 0;
 }
 
+// In-memory byte source serving a synthetic v2 `.zarray` with a chosen chunk
+// edge — used to prove the inner-edge validation in mc_zarr_open.
+static int g_edge;
+static int mem_zarray_read(void *ud, const char *key, uint64_t off, uint64_t len,
+                           uint8_t **out, size_t *out_len) {
+    (void)ud; (void)off; (void)len;
+    // No zarr.json -> mc_zarr_open falls back to .zarray (the v2 path).
+    if (strcmp(key, ".zarray") != 0) { *out = NULL; *out_len = 0; return 0; }
+    char j[256];
+    int n = snprintf(j, sizeof j,
+        "{\"zarr_format\":2,\"shape\":[512,512,512],\"chunks\":[%d,%d,%d],"
+        "\"dtype\":\"|u1\",\"compressor\":null,\"fill_value\":0,\"order\":\"C\","
+        "\"dimension_separator\":\".\"}", g_edge, g_edge, g_edge);
+    *out = malloc((size_t)n);
+    memcpy(*out, j, (size_t)n);
+    *out_len = (size_t)n;
+    return 0;
+}
+
+// REGRESSION: a too-small inner edge made sub = 256/edge exceed 2, so the
+// transcode region's [8] sub-chunk arrays (decode_item.raw/oz/...) overflowed
+// in mc_volume_prefetch_region (edge 64 -> sub 4 -> 64 sub-chunks). mc_zarr_open
+// must now REJECT any edge that is not a divisor of the 256 region with sub<=2,
+// i.e. accept only 128 and 256.
+static int test_inner_edge_guard(void) {
+    int bad = 0;
+    struct { int edge, want_ok; } cases[] = {
+        { 256, 1 }, { 128, 1 },   // valid: sub = 1, 2
+        {  64, 0 },               // sub 4 -> would overflow [8] -> reject
+        {  32, 0 },               // sub 8 -> reject
+        {  96, 0 },               // not a divisor of 256 -> reject
+        { 512, 0 },               // sub 0 (edge > region) -> reject
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        g_edge = cases[i].edge;
+        mc_zarr *z = mc_zarr_open(mem_zarray_read, NULL);
+        int ok = (z != NULL);
+        if (z) mc_zarr_free(z);
+        if (ok != cases[i].want_ok) {
+            fprintf(stderr, "FAIL inner-edge guard: edge=%d opened=%d want=%d\n",
+                    cases[i].edge, ok, cases[i].want_ok);
+            bad++;
+        }
+    }
+    if (!bad) printf("inner-edge guard (128/256 ok; 64/32/96/512 rejected) OK\n");
+    return bad;
+}
+
 int main(int argc, char **argv) {
+    if (test_inner_edge_guard()) return 1;
+
     g_root = argc > 1 ? argv[1] : getenv("MC_ZARR_ROOT");
     if (!g_root) { fprintf(stderr, "usage: %s <level-dir>\n", argv[0]); return 2; }
 
