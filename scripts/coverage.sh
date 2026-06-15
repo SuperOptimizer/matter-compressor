@@ -37,7 +37,7 @@ OFFLINE_TESTS=(
   mc_roundtrip mc_append_roundtrip mc_stream_partial mc_v6_test
   mc_cache_test mc_render_test mc_stream_volume_test mc_archive_concurrent_test
   mc_volume_offline_test mc_volume_api_test mc_zarr_test mc_api_test
-  mc_decode_robust_test mc_stream_volume_api_test
+  mc_decode_robust_test mc_stream_volume_api_test mc_volume_v3_test
 )
 
 rm -rf "$OUT"; mkdir -p "$OUT/prof" "$OUT/bin"
@@ -51,6 +51,13 @@ if [ -x "$OUT/bin/mc_make_fixture" ] || "$CC" -O1 -w "${INC[@]}" \
 fi
 export MC_ZARR_ROOT="$FIXTURE/zarr/0"
 export MC_VOLUME_URL="$FIXTURE/zarr"
+
+# Build the v3 / c3d-sharded fixture (uses the c3d encoder -> link the lib).
+FIXTURE_V3="$OUT/fixture_v3"
+if "$CC" -O1 -w "${INC[@]}" tests/support/mc_make_fixture_v3.c "${SRC[@]}" "${LIBS[@]}" \
+      -o "$OUT/bin/mc_make_fixture_v3" 2>/dev/null; then
+  "$OUT/bin/mc_make_fixture_v3" "$FIXTURE_V3" || true
+fi
 
 built=()
 for t in "${OFFLINE_TESTS[@]}"; do
@@ -67,6 +74,7 @@ run_args() {
     mc_zarr_test)          echo "$FIXTURE/zarr/0";;
     mc_volume_offline_test) echo "$FIXTURE/zarr $OUT";;
     mc_volume_api_test)     echo "$FIXTURE/zarr $OUT";;
+    mc_volume_v3_test)      echo "$FIXTURE_V3/zarr $OUT";;
     *) echo "";;
   esac
 }

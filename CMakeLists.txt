@@ -189,6 +189,29 @@ if(MC_STANDALONE)
            COMMAND mc_make_fixture ${MC_FIXTURE_DIR})
   set_tests_properties(zarr_fixture_setup PROPERTIES FIXTURES_SETUP zarr_fixture)
 
+  # v3 / c3d-sharded fixture (the v2/raw fixture can't reach the c3d inner-codec
+  # branches). Generator links the lib (it uses the c3d encoder).
+  add_executable(mc_make_fixture_v3 tests/support/mc_make_fixture_v3.c)
+  target_link_libraries(mc_make_fixture_v3 matter_compressor)
+  set(MC_FIXTURE_V3_DIR ${CMAKE_BINARY_DIR}/fixture_v3)
+  add_test(NAME zarr_v3_fixture_setup
+           COMMAND mc_make_fixture_v3 ${MC_FIXTURE_V3_DIR})
+  set_tests_properties(zarr_v3_fixture_setup PROPERTIES FIXTURES_SETUP zarr_v3_fixture)
+
+  # v3 zarr read path against the c3d fixture (footer index, read_inner/shard).
+  add_executable(mc_zarr_v3_test tests/mc_zarr_test.c)
+  set_property(TARGET mc_zarr_v3_test PROPERTY C_STANDARD 23)
+  target_link_libraries(mc_zarr_v3_test matter_compressor)
+  add_test(NAME zarr_v3 COMMAND mc_zarr_v3_test ${MC_FIXTURE_V3_DIR}/zarr/0)
+  set_tests_properties(zarr_v3 PROPERTIES FIXTURES_REQUIRED zarr_v3_fixture)
+
+  # v3 volume c3d-transcode path (prefetch_shard full body, c3d decode pool).
+  add_executable(mc_volume_v3_test tests/mc_volume_v3_test.c)
+  target_link_libraries(mc_volume_v3_test matter_compressor)
+  add_test(NAME volume_v3
+           COMMAND mc_volume_v3_test ${MC_FIXTURE_V3_DIR}/zarr ${CMAKE_BINARY_DIR})
+  set_tests_properties(volume_v3 PROPERTIES FIXTURES_REQUIRED zarr_v3_fixture)
+
   add_executable(mc_zarr_test tests/mc_zarr_test.c)
   set_property(TARGET mc_zarr_test PROPERTY C_STANDARD 23)
   target_link_libraries(mc_zarr_test matter_compressor)
