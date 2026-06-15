@@ -45,6 +45,28 @@ int main(void){
     CHECK(a3!=NULL,"archive damaged by rejected mismatch open");
     if(a3) mc_archive_close(a3);
 
+    // 4b) per-volume priors: set them, reopen, and confirm priors_load reads the
+    //     populated blob back (the non-NULL branch) + mc_reader_priors exposes it.
+    {
+        mc_archive *ap=mc_archive_open_dims(p,256,256,256,6.0f);
+        if(ap){
+            static uint16_t plo[8][32],phi[8][32];
+            for(int c=0;c<8;++c)for(int s=0;s<32;++s){ plo[c][s]=900; phi[c][s]=3100; }
+            CHECK(mc_archive_set_priors(ap,plo,phi)==0,"set_priors failed");
+            mc_archive_close(ap);
+        }
+        // reopen via flat reader -> priors_load with a valid prior blob.
+        size_t ml=0; FILE*pf=fopen(p,"rb"); fseek(pf,0,SEEK_END); long pl=ftell(pf); fseek(pf,0,SEEK_SET);
+        uint8_t *pm=malloc(pl); if(fread(pm,1,pl,pf)!=(size_t)pl){return 1;} fclose(pf);
+        mc_reader *pr=mc_open(pm,pl);
+        CHECK(pr!=NULL,"reopen after set_priors failed");
+        if(pr){ const uint16_t *qlo=NULL,*qhi=NULL;
+            int hp=mc_reader_priors(pr,&qlo,&qhi);
+            CHECK(hp==1&&qlo&&qhi,"reader_priors should report stored priors (got %d)",hp);
+            mc_close(pr); }
+        free(pm);
+    }
+
     // 5) mc_mca_probe: valid file reports dims; missing/garbage file fails cleanly.
     { int nx,ny,nz,nl; float q;
       CHECK(mc_mca_probe(p,&nx,&ny,&nz,&nl,&q)==0,"mca_probe valid failed");
