@@ -99,6 +99,29 @@ int main(void){
         free(im);
     }
 
+    // 4b2) tick-phase loop that DRIVES mc_volume_thaw's miss-drain: render a
+    //      large frozen frame across the whole volume via the non-blocking source
+    //      (touches present-but-uncached blocks -> records misses), then thaw
+    //      (drains misses -> mc_cache_update fill + region-mark + change_gen).
+    //      Repeat until the frame stops generating new fills.
+    {
+        mc_sample_src iss=mc_volume_sample_src(v,0,0);
+        mc_plane pl={.origin={nz/2.f,ny/2.f,nx/2.f},.normal={0,0,1}}; mc_plane_basis(&pl);
+        mc_render_params rp={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_MEAN,.t0=-40,.t1=40,.dt=2};
+        uint8_t *im=calloc(256*256,1);
+        uint64_t g_prev=0; int stable=0;
+        for(int it=0; it<60 && stable<3; ++it){
+            mc_volume_freeze(v);
+            mc_render_plane(&iss,&pl,256,256,2.0f,&rp,im,2);   // wide frame -> many misses
+            uint64_t g=mc_volume_region_gen(v,0,nz/2/16/16,ny/2/16/16,nx/2/16/16);
+            mc_volume_thaw(v);
+            if(g==g_prev) stable++; else { stable=0; g_prev=g; }
+            nap(3);
+        }
+        free(im);
+        printf("tick-phase: settled (change_gen stable)\n");
+    }
+
     // 4c) SHADED + INK with the full lighting/SSS/curvature/ink-lock fields set,
     //     rendered against the r=[90,110] sheet -> covers shade_ray's secondary
     //     march, curvature, and the ink sheet-lock run detection.
