@@ -74,6 +74,18 @@ system SDL3 install needed. Nuklear is the vendored single header in `vendor/`.
 | panel `win low/high` | window/level (display range) |
 | panel colormap combo | gray / viridis / magma / fire / r/g/b/c/m |
 | right-drag | pan |
+| `G` | toggle CPU render vs GPU decode (c3g archives only) |
+
+### GPU decode mode
+
+When the volume's local archive uses the **c3g** block codec, the viewer can
+decode on the GPU instead of the CPU. Open the volume with `MC_BLOCK_CODEC=c3g`
+so the stream→transcode→`.mca` pipeline writes GPU-decodable blocks, then press
+`G` (or set `MC_VIEWER_GPU=1` to start in GPU mode). In GPU mode the viewer
+reads the visible slab's **compressed** c3g blocks straight from the `.mca`
+(`mc_archive_block_blob`, no CPU decode), uploads them to a VRAM cache, and the
+GPU compute-decodes + samples the slice (see `mc_gpu_vol.h`). The panel shows
+which path is active. CPU mode (the default) is always available as a fallback.
 
 ### Headless verification
 
@@ -82,4 +94,9 @@ system SDL3 install needed. Nuklear is the vendored single header in `vendor/`.
   swapchain needed.
 - `MC_VIEWER_FRAMES=N` — render N full GPU frames (device, pipelines, swapchain
   acquire, slice quad + Nuklear draws, submit) then exit. With
-  `SDL_VIDEODRIVER=offscreen` this is a headless GPU smoke test.
+  `SDL_VIDEODRIVER=offscreen` this is a headless GPU smoke test. Combine with
+  `MC_BLOCK_CODEC=c3g MC_VIEWER_GPU=1` to smoke-test the GPU decode path.
+
+The standalone `c3g_gpu_check` and `vol_gpu_check` (built alongside the viewer)
+validate the GPU compute decoder and the full decode→sample pipeline against the
+CPU reference — both match exactly.

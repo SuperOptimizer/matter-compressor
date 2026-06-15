@@ -30,6 +30,7 @@
 #define NK_INCLUDE_DEFAULT_FONT
 #include "nuklear.h"
 #include "mc_gpu.h"
+#include "mc_gpu_vol.h"
 
 #include "matter_compressor.h"
 
@@ -57,6 +58,9 @@ typedef struct {
     uint32_t  lut[256];
 
     mc_gpu      *gpu;                 /* SDL_GPU frontend (slice + Nuklear) */
+    mc_gpu_vol  *gvol;                /* GPU c3g decode+sample path (c3g archives) */
+    int          gpu_mode;            /* 0 = CPU render+blit, 1 = GPU decode+sample */
+    int          gpu_avail;           /* 1 if the volume archive is c3g (gvol usable) */
 
     atomic_int   dirty;              /* set by ready_cb -> repaint slice */
 } viewer;
@@ -149,6 +153,59 @@ static void render_slice(viewer *v) {
     if (v->gpu) mc_gpu_upload_slice(v->gpu, v->argb, iw, ih);
 }
 
+/* GPU decode path: gather the visible slab's COMPRESSED c3g block blobs from the
+ * volume's local archive and upload them to the GPU vol cache. The slab is the
+ * single block-row (16 voxels thick) containing the current slice along the
+ * axis, over a bounded in-plane block window anchored at the volume origin
+ * (LOD0). Each chunk is ensured present via a blocking get_block (the transcode
+ * pipeline writes c3g into the archive), then mc_archive_block_blob reads the
+ * compressed bytes with NO decode. Returns 1 if a slab was uploaded.
+ *
+ * Window cap keeps VRAM + the readback bounded; MCV-side cap is MCV_MAX_BLOCKS.
+ * Returns the slab geometry in *gz/*gy/*gx (block dims) + *ez/*ey/*ex (voxels)
+ * and the within-slab slice index in *sidx. */
+#define MC_VOL_WIN 16   /* in-plane block window (16 blocks = 256 voxels) */
+static int gather_slab(viewer *v, int *out_gz,int *out_gy,int *out_gx,
+                       int *out_ez,int *out_ey,int *out_ex,int *out_sidx,
+                       const uint8_t **blobs, uint32_t *lens, uint8_t *scratch4096){
+    mc_archive *arc = mc_volume_archive(v->vol);
+    if(!arc) return 0;
+    // LOD0 block grid extent.
+    int bgz,bgy,bgx; mc_volume_block_grid(v->vol, 0, &bgz,&bgy,&bgx);
+    // the block-row containing the slice along the axis; full in-plane (capped).
+    int srow = v->slice >> 4;                 // block index along the axis
+    int gz,gy,gx;                             // slab block dims (z,y,x)
+    if(v->axis==AXIS_Z){ gz=1; gy=bgy<MC_VOL_WIN?bgy:MC_VOL_WIN; gx=bgx<MC_VOL_WIN?bgx:MC_VOL_WIN; }
+    else if(v->axis==AXIS_Y){ gy=1; gz=bgz<MC_VOL_WIN?bgz:MC_VOL_WIN; gx=bgx<MC_VOL_WIN?bgx:MC_VOL_WIN; }
+    else { gx=1; gz=bgz<MC_VOL_WIN?bgz:MC_VOL_WIN; gy=bgy<MC_VOL_WIN?bgy:MC_VOL_WIN; }
+    int nb = gz*gy*gx;
+    if(nb<=0) return 0;
+
+    // map slab block (sz,sy,sx) -> global LOD0 block coords. The slice-axis
+    // block is fixed at srow; the in-plane axes start at 0.
+    for(int sz=0; sz<gz; ++sz) for(int sy=0; sy<gy; ++sy) for(int sx=0; sx<gx; ++sx){
+        int Bz, By, Bx;
+        if(v->axis==AXIS_Z){ Bz=srow; By=sy; Bx=sx; }
+        else if(v->axis==AXIS_Y){ By=srow; Bz=sz; Bx=sx; }
+        else { Bx=srow; Bz=sz; By=sy; }
+        int slabi = (sz*gy + sy)*gx + sx;
+        blobs[slabi]=NULL; lens[slabi]=0;
+        if(Bz>=bgz||By>=bgy||Bx>=bgx) continue;
+        // chunk = 256^3 = 16^3 blocks; ensure present (blocking transcode), then
+        // read the compressed block blob.
+        int cz=Bz>>4, cy=By>>4, cx=Bx>>4;
+        mc_volume_get_block(v->vol, 0, Bz,By,Bx, scratch4096);   // ensure chunk transcoded
+        uint64_t co = mc_archive_chunk_offset(arc, 0, cz,cy,cx);
+        if(!co) continue;
+        const uint8_t *p=NULL; uint32_t l=0;
+        if(mc_archive_block_blob(arc, co, Bz&15,By&15,Bx&15, &p, &l)){ blobs[slabi]=p; lens[slabi]=l; }
+    }
+    *out_gz=gz; *out_gy=gy; *out_gx=gx;
+    *out_ez=gz*16; *out_ey=gy*16; *out_ex=gx*16;
+    *out_sidx = v->slice & 15;          // slice index within the slab's 16-thick row
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -207,6 +264,21 @@ int main(int argc, char **argv) {
     }
     struct nk_context *nk = mc_gpu_nk(V.gpu);
 
+    // GPU c3g decode+sample path is available only when the volume's local
+    // archive uses the c3g block codec (MC_BLOCK_CODEC=c3g). Then 'G' toggles
+    // between the CPU render+blit and reading compressed blocks -> GPU decode.
+    {
+        mc_archive *arc = mc_volume_archive(V.vol);
+        if (arc && mc_archive_block_codec(arc) == MC_BLOCKCODEC_C3G) {
+            V.gvol = mc_gpu_vol_create(mc_gpu_device(V.gpu),
+                                       SDL_GetGPUSwapchainTextureFormat(mc_gpu_device(V.gpu), win),
+                                       6.0f);
+            V.gpu_avail = (V.gvol != NULL);
+        }
+    }
+    // MC_VIEWER_GPU=1 starts in GPU decode mode (headless testing / default-on).
+    if (V.gpu_avail && SDL_getenv("MC_VIEWER_GPU")) V.gpu_mode = 1;
+
     int running = 1;
     int dragging = 0;
     static const char *cmap_names[] = {
@@ -223,6 +295,11 @@ int main(int argc, char **argv) {
         mc_gpu_nk_input_begin(V.gpu);
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) running = 0;
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_G && V.gpu_avail) {
+                V.gpu_mode = !V.gpu_mode;
+                atomic_store(&V.dirty, 1);
+                fprintf(stderr, "GPU decode mode: %s\n", V.gpu_mode ? "ON" : "OFF");
+            }
             if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                 e.button.button == SDL_BUTTON_RIGHT) dragging = 1;
             if (e.type == SDL_EVENT_MOUSE_BUTTON_UP &&
@@ -285,6 +362,13 @@ int main(int argc, char **argv) {
             nk_label(nk, info, NK_TEXT_LEFT);
             snprintf(info, sizeof(info), "slice img %dx%d", V.img_w, V.img_h);
             nk_label(nk, info, NK_TEXT_LEFT);
+            if (V.gpu_avail) {
+                snprintf(info, sizeof(info), "decode: %s  ('G' toggles)",
+                         V.gpu_mode ? "GPU (c3g)" : "CPU");
+                nk_label(nk, info, NK_TEXT_LEFT);
+            } else {
+                nk_label(nk, "decode: CPU (c3g archive: MC_BLOCK_CODEC=c3g)", NK_TEXT_LEFT);
+            }
         }
         nk_end(nk);
 
@@ -323,11 +407,31 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* --- draw the GPU frame (slice quad + Nuklear), centered + panned --- */
+        /* --- draw the frame --- */
         mc_gpu_set_nearest(V.gpu, V.zoom >= 1.0f);
-        {
-            /* On screen the whole slice spans (slice voxels * zoom) px,
-             * independent of the texture's rendered pixel count. */
+        if (V.gpu_mode && V.gvol) {
+            /* GPU decode+sample path: gather the visible slab's COMPRESSED c3g
+             * blocks, upload, and let the GPU decode + sample the slice, then
+             * draw Nuklear over it in a second (LOAD) pass. */
+            static const uint8_t *blobs[16*16*16];
+            static uint32_t       lens[16*16*16];
+            static uint8_t        scratch[4096];
+            int gz,gy,gx,ez,ey,ex,sidx;
+            int ok = gather_slab(&V,&gz,&gy,&gx,&ez,&ey,&ex,&sidx,blobs,lens,scratch);
+            if (ok) mc_gpu_vol_upload_slab(V.gvol,gz,gy,gx,ez,ey,ex,blobs,lens);
+            mc_gpu_vol_set_lut(V.gvol, V.lut);
+
+            SDL_GPUCommandBuffer *cmd; SDL_GPUTexture *swap; Uint32 ow, oh;
+            if (ok && mc_gpu_frame_begin(V.gpu, &cmd, &swap, &ow, &oh)) {
+                int al2, vw, vh; axis_extent(&V, &al2, &vw, &vh);
+                mc_gpu_vol_render(V.gvol, cmd, swap, V.axis, sidx,
+                                  vw * V.zoom, vh * V.zoom, V.pan_x, V.pan_y,
+                                  (int)ow, (int)oh);
+                mc_gpu_frame_end_nuklear(V.gpu, cmd, swap, ow, oh);
+            }
+        } else {
+            /* CPU render + GPU blit path (default). On screen the whole slice
+             * spans (slice voxels * zoom) px, independent of the texture res. */
             int al2, vw, vh; axis_extent(&V, &al2, &vw, &vh);
             mc_gpu_render(V.gpu, vw * V.zoom, vh * V.zoom, V.pan_x, V.pan_y,
                           /*gain=*/1.0f, /*bias=*/0.0f);
@@ -339,6 +443,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (V.gvol) mc_gpu_vol_destroy(V.gvol);
     mc_gpu_destroy(V.gpu);
     SDL_DestroyWindow(win);
     mc_volume_free(V.vol);

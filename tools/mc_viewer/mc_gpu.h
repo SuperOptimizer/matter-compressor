@@ -51,6 +51,21 @@ bool mc_gpu_upload_slice(mc_gpu *g, const uint32_t *argb, int w, int h);
 bool mc_gpu_render(mc_gpu *g, float draw_w, float draw_h, float pan_x, float pan_y,
                    float gain, float bias);
 
+/* --- split frame, for compositing an externally-drawn slice (e.g. mc_gpu_vol)
+ * with the Nuklear UI in one command buffer ---
+ * begin: acquire a command buffer + swapchain texture and upload the current
+ * Nuklear geometry (copy pass, before any render pass). Returns false if no
+ * swapchain (minimized) — nothing to do this frame. On success *cmd/*swap/*ow/*oh
+ * are set. The caller then draws the slice into *swap (its own clear render
+ * pass), and finishes with mc_gpu_frame_end_nuklear. */
+SDL_GPUDevice *mc_gpu_device(mc_gpu *g);
+bool mc_gpu_frame_begin(mc_gpu *g, SDL_GPUCommandBuffer **cmd,
+                        SDL_GPUTexture **swap, Uint32 *ow, Uint32 *oh);
+/* Draw the Nuklear UI into a LOAD render pass on `swap` (preserving the slice
+ * already drawn there), submit `cmd`, and clear the Nuklear command list. */
+void mc_gpu_frame_end_nuklear(mc_gpu *g, SDL_GPUCommandBuffer *cmd,
+                              SDL_GPUTexture *swap, Uint32 ow, Uint32 oh);
+
 void mc_gpu_output_size(const mc_gpu *g, int *w, int *h);
 void mc_gpu_set_nearest(mc_gpu *g, bool nearest);
 
@@ -93,6 +108,10 @@ struct mc_gpu {
     struct nk_font_atlas      atlas;
     struct nk_buffer          cmds;
     struct nk_draw_null_texture tex_null;
+
+    /* split-frame scratch (mc_gpu_frame_begin / mc_gpu_frame_end_nuklear) */
+    struct nk_buffer fr_vbuf, fr_ebuf;
+    Uint32           fr_vbytes, fr_ibytes;
 };
 
 static SDL_GPUShader *mc_gpu_shader(SDL_GPUDevice *dev, SDL_GPUShaderStage stage,
@@ -395,6 +414,57 @@ static void mc_gpu_ui_convert(mc_gpu *g, SDL_GPUCommandBuffer *cmd,
     SDL_ReleaseGPUTransferBuffer(g->dev, tb);   /* freed after submit completes */
 }
 
+// Draw the converted Nuklear command list into an OPEN render pass `rp` (the UI
+// vbuf/ibuf must already be uploaded). Used by both the CPU-blit frame and the
+// GPU-vol frame (where the slice was drawn by mc_gpu_vol in a prior pass).
+static void mc_gpu_draw_nuklear(mc_gpu *g, SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *rp,
+                                Uint32 vbytes, Uint32 ibytes, Uint32 ow, Uint32 oh) {
+    if (!(vbytes && ibytes && ow && oh)) return;
+    SDL_BindGPUGraphicsPipeline(rp, g->ui_pipe);
+    SDL_GPUBufferBinding vb = {0}; vb.buffer = g->ui_vbuf;
+    SDL_BindGPUVertexBuffers(rp, 0, &vb, 1);
+    SDL_GPUBufferBinding ib = {0}; ib.buffer = g->ui_ibuf;
+    SDL_BindGPUIndexBuffer(rp, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+
+    /* ortho(0,w,0,h) with +Y down, column-major for GLSL mat4. */
+    int ww, wh; SDL_GetWindowSize(g->win, &ww, &wh);
+    float L = 0, R = (float)ww, T = 0, B = (float)wh;
+    float proj[16] = {
+        2.0f/(R-L), 0, 0, 0,
+        0, 2.0f/(T-B), 0, 0,
+        0, 0, -1, 0,
+        (R+L)/(L-R), (T+B)/(B-T), 0, 1,
+    };
+    SDL_PushGPUVertexUniformData(cmd, 0, proj, sizeof proj);
+
+    float sx = ww ? (float)ow / (float)ww : 1.0f;
+    float sy = wh ? (float)oh / (float)wh : 1.0f;
+
+    const struct nk_draw_command *c;
+    Uint32 ioff = 0;
+    nk_draw_foreach(c, &g->nk, &g->cmds) {
+        if (!c->elem_count) continue;
+        SDL_Rect sc;
+        sc.x = (int)(c->clip_rect.x * sx);
+        sc.y = (int)(c->clip_rect.y * sy);
+        sc.w = (int)(c->clip_rect.w * sx);
+        sc.h = (int)(c->clip_rect.h * sy);
+        if (sc.x < 0) { sc.w += sc.x; sc.x = 0; }
+        if (sc.y < 0) { sc.h += sc.y; sc.y = 0; }
+        if (sc.w < 0) sc.w = 0;
+        if (sc.h < 0) sc.h = 0;
+        SDL_SetGPUScissor(rp, &sc);
+
+        SDL_GPUTextureSamplerBinding tsb = {0};
+        tsb.texture = c->texture.ptr ? (SDL_GPUTexture *)c->texture.ptr : g->font_tex;
+        tsb.sampler = g->ui_samp;
+        SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
+
+        SDL_DrawGPUIndexedPrimitives(rp, c->elem_count, 1, ioff, 0, 0);
+        ioff += c->elem_count;
+    }
+}
+
 bool mc_gpu_render(mc_gpu *g, float draw_w, float draw_h, float pan_x, float pan_y,
                    float gain, float bias) {
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(g->dev);
@@ -439,52 +509,7 @@ bool mc_gpu_render(mc_gpu *g, float draw_w, float draw_h, float pan_x, float pan
     }
 
     /* ---- nuklear ---- */
-    if (vbytes && ibytes && ow && oh) {
-        SDL_BindGPUGraphicsPipeline(rp, g->ui_pipe);
-        SDL_GPUBufferBinding vb = {0}; vb.buffer = g->ui_vbuf;
-        SDL_BindGPUVertexBuffers(rp, 0, &vb, 1);
-        SDL_GPUBufferBinding ib = {0}; ib.buffer = g->ui_ibuf;
-        SDL_BindGPUIndexBuffer(rp, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
-
-        /* ortho(0,w,0,h) with +Y down, column-major for GLSL mat4. */
-        int ww, wh; SDL_GetWindowSize(g->win, &ww, &wh);
-        float L = 0, R = (float)ww, T = 0, B = (float)wh;
-        float proj[16] = {
-            2.0f/(R-L), 0, 0, 0,
-            0, 2.0f/(T-B), 0, 0,
-            0, 0, -1, 0,
-            (R+L)/(L-R), (T+B)/(B-T), 0, 1,
-        };
-        SDL_PushGPUVertexUniformData(cmd, 0, proj, sizeof proj);
-
-        /* window->framebuffer scale for scissor in pixels. */
-        float sx = ww ? (float)ow / (float)ww : 1.0f;
-        float sy = wh ? (float)oh / (float)wh : 1.0f;
-
-        const struct nk_draw_command *c;
-        Uint32 ioff = 0;
-        nk_draw_foreach(c, &g->nk, &g->cmds) {
-            if (!c->elem_count) continue;
-            SDL_Rect sc;
-            sc.x = (int)(c->clip_rect.x * sx);
-            sc.y = (int)(c->clip_rect.y * sy);
-            sc.w = (int)(c->clip_rect.w * sx);
-            sc.h = (int)(c->clip_rect.h * sy);
-            if (sc.x < 0) { sc.w += sc.x; sc.x = 0; }
-            if (sc.y < 0) { sc.h += sc.y; sc.y = 0; }
-            if (sc.w < 0) sc.w = 0;
-            if (sc.h < 0) sc.h = 0;
-            SDL_SetGPUScissor(rp, &sc);
-
-            SDL_GPUTextureSamplerBinding tsb = {0};
-            tsb.texture = c->texture.ptr ? (SDL_GPUTexture *)c->texture.ptr : g->font_tex;
-            tsb.sampler = g->ui_samp;
-            SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
-
-            SDL_DrawGPUIndexedPrimitives(rp, c->elem_count, 1, ioff, 0, 0);
-            ioff += c->elem_count;
-        }
-    }
+    mc_gpu_draw_nuklear(g, cmd, rp, vbytes, ibytes, ow, oh);
     (void)uverts;
 
     SDL_EndGPURenderPass(rp);
@@ -493,6 +518,39 @@ bool mc_gpu_render(mc_gpu *g, float draw_w, float draw_h, float pan_x, float pan
     nk_buffer_free(&vbuf); nk_buffer_free(&ebuf);
     nk_clear(&g->nk); nk_buffer_clear(&g->cmds);
     return true;
+}
+
+SDL_GPUDevice *mc_gpu_device(mc_gpu *g) { return g->dev; }
+
+bool mc_gpu_frame_begin(mc_gpu *g, SDL_GPUCommandBuffer **out_cmd,
+                        SDL_GPUTexture **out_swap, Uint32 *ow, Uint32 *oh) {
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(g->dev);
+    if (!cmd) return false;
+    // Convert + upload Nuklear geometry BEFORE any render pass (copy passes
+    // can't be nested in a render pass). Stash buffers for frame_end.
+    mc_gpu_ui_convert(g, cmd, &g->fr_vbuf, &g->fr_ebuf, &g->fr_vbytes, &g->fr_ibytes);
+    SDL_GPUTexture *swap = NULL; Uint32 w = 0, h = 0;
+    if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, g->win, &swap, &w, &h) || !swap) {
+        SDL_SubmitGPUCommandBuffer(cmd);
+        nk_buffer_free(&g->fr_vbuf); nk_buffer_free(&g->fr_ebuf);
+        nk_clear(&g->nk); nk_buffer_clear(&g->cmds);
+        return false;
+    }
+    *out_cmd = cmd; *out_swap = swap; *ow = w; *oh = h;
+    return true;
+}
+
+void mc_gpu_frame_end_nuklear(mc_gpu *g, SDL_GPUCommandBuffer *cmd,
+                              SDL_GPUTexture *swap, Uint32 ow, Uint32 oh) {
+    // LOAD (don't clear) so the slice already drawn into `swap` is preserved.
+    SDL_GPUColorTargetInfo cti = {0};
+    cti.texture = swap; cti.load_op = SDL_GPU_LOADOP_LOAD; cti.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &cti, 1, NULL);
+    mc_gpu_draw_nuklear(g, cmd, rp, g->fr_vbytes, g->fr_ibytes, ow, oh);
+    SDL_EndGPURenderPass(rp);
+    SDL_SubmitGPUCommandBuffer(cmd);
+    nk_buffer_free(&g->fr_vbuf); nk_buffer_free(&g->fr_ebuf);
+    nk_clear(&g->nk); nk_buffer_clear(&g->cmds);
 }
 
 #endif /* MC_GPU_IMPLEMENTATION */
