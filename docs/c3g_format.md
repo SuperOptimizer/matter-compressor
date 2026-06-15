@@ -92,6 +92,28 @@ shipped once per archive (header), not per block.
 These constants are fixed in `c3g.h` and shared by the CPU reference and the GPU
 shader so the two are bit-exact.
 
+## GPU compute decoder
+
+`tools/mc_viewer/shaders/c3g_decode.comp.glsl` is the GPU mirror of
+`mc_c3g_dec_block`: **one workgroup decodes one block**. Invocation 0 does the
+serial rANS + sign/escape + dequant into shared memory and expands the air mask;
+all 256 invocations then cooperate on the separable inverse DCT-16 (float,
+ping-ponging two shared buffers) and pack the u8 output. Constant tables (rANS
+freq/cdf/slot, dequant `step_tab`, scan order, the inverse DCT cosine basis) are
+uploaded once as read-only storage buffers, so the shader does no `powf`/`cos`.
+
+Shared-memory budget matters: three 16 KB float buffers + the air mask would
+exceed the 48 KB limit and silently alias, so the iDCT uses exactly two float
+buffers (32 KB) plus a 512-byte packed air mask.
+
+`tools/mc_viewer/c3g_gpu_check` validates it: it builds c3g payloads on the CPU,
+decodes them with both `mc_c3g_dec_block` (oracle) and the compute shader, and
+compares. Result: **100% of voxels match exactly** (0 differ) across random /
+smooth-sphere / constant / half-air-slab blocks — the float GPU iDCT rounds to
+the same u8 as the CPU's integer iDCT. (A subtle bug found here: the shader's
+section offsets must be added to the block's `base` byte offset in the packed
+buffer; block 0 worked at base 0 but all others read garbage until fixed.)
+
 ## Validation
 
 `tests/mc_c3g_test.c`: round-trip random + structured 16³ blocks through the c3g

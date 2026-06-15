@@ -41,7 +41,8 @@ FetchContent_MakeAvailable(SDL3)
 # glslangValidator IS present, regenerate them at build time so edits to the
 # .glsl sources take effect (a custom command per shader, fed into the target).
 set(MC_VIEWER_SHADERS
-  blit.vert:vert blit.frag:frag ui.vert:vert ui.frag:frag)
+  blit.vert:vert blit.frag:frag ui.vert:vert ui.frag:frag
+  c3g_decode.comp:comp)
 find_program(GLSLANG_VALIDATOR glslangValidator)
 set(_shader_hdrs "")
 if(GLSLANG_VALIDATOR)
@@ -80,3 +81,15 @@ target_link_libraries(mc_viewer PRIVATE matter_compressor SDL3::SDL3)
 
 # Nuklear + the viewer's own immediate-mode UI pull in <math.h>; nothing else.
 set_property(TARGET mc_viewer PROPERTY C_STANDARD 11)
+
+# c3g_gpu_check — validates the GPU compute decoder against the CPU oracle
+# (mc_c3g_dec_block). Headless (SDL_VIDEODRIVER=offscreen). Built with the
+# viewer so it shares the SDL3 dependency.
+add_executable(c3g_gpu_check
+  ${CMAKE_CURRENT_SOURCE_DIR}/c3g_gpu_check.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/c3g_decode.comp.spv.h)
+target_include_directories(c3g_gpu_check PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(c3g_gpu_check PRIVATE -O2)
+target_link_libraries(c3g_gpu_check PRIVATE matter_compressor SDL3::SDL3 m)
+set_property(TARGET c3g_gpu_check PROPERTY C_STANDARD 11)
