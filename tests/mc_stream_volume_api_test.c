@@ -122,6 +122,28 @@ int main(void){
         printf("tick-phase: settled (change_gen stable)\n");
     }
 
+    // 4b3) LOD-fallback render over the volume's pyramid (non-blocking), in a
+    //      FRESH frozen frame BEFORE the fine level is fully cached -> the
+    //      fine-level residency check (vol_block_resident) returns 0 for
+    //      present-but-uncached blocks and the renderer falls to a coarser level.
+    if(nl>1){
+        mc_volume_thaw(v);                  // ensure not frozen
+        // a brand-new volume to guarantee a cold fine level.
+        mc_volume *v2=mc_volume_open_streaming(path,"/tmp",(size_t)64<<20);
+        if(v2){
+            mc_sample_lods ls=mc_volume_sample_lods(v2,0);   // blocking=0 -> resident checks
+            mc_plane pl={.origin={nz/2.f,ny/2.f,nx/2.f},.normal={1,0,0}}; mc_plane_basis(&pl);
+            mc_render_params rp={.filter=MC_FILTER_TRILINEAR,.comp=MC_COMP_MAX,.t0=-4,.t1=4,.dt=1};
+            uint8_t *im=calloc(96*96,1);
+            mc_volume_freeze(v2);
+            mc_render_plane_lod(&ls,&pl,96,96,2.0f,&rp,im,2);   // scale=2 -> may pick L1
+            mc_volume_thaw(v2);
+            free(im);
+            mc_volume_free(v2);
+            printf("lod-fallback render: OK\n");
+        }
+    }
+
     // 4c) SHADED + INK with the full lighting/SSS/curvature/ink-lock fields set,
     //     rendered against the r=[90,110] sheet -> covers shade_ray's secondary
     //     march, curvature, and the ink sheet-lock run detection.
