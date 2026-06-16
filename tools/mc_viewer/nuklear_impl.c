@@ -22,3 +22,6 @@
 
 #define MC_GPU_RAY_IMPLEMENTATION
 #include "mc_gpu_ray.h"
+
+#define MC_GPU_BRICK_IMPLEMENTATION
+#include "mc_gpu_brick.h"

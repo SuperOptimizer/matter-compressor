@@ -32,6 +32,7 @@
 #include "mc_gpu.h"
 #include "mc_gpu_vol.h"
 #include "mc_gpu_ray.h"
+#include "mc_gpu_brick.h"
 
 #include "matter_compressor.h"
 
@@ -64,9 +65,10 @@ typedef struct {
     int          gpu_avail;           /* 1 if the volume archive is c3g (gvol usable) */
 
     /* 3D raycast mode (c3g archives) */
-    mc_gpu_ray  *gray;                /* GPU volume raycaster */
+    mc_gpu_ray  *gray;                /* GPU raycaster (owns the decode pipeline) */
+    mc_gpu_brick *gbrick;             /* out-of-core brick cache (live 3D path) */
     int          ray_mode;            /* 1 = 3D raycast active (else slice modes) */
-    int          ray_loaded;          /* a region is uploaded to the 3D volume */
+    int          ray_loaded;          /* a region is paged into the brick cache */
     int          rgz, rgy, rgx;       /* loaded region block-grid dims */
     float        cam_az, cam_el;      /* orbit camera azimuth/elevation (radians) */
     float        cam_dist;            /* camera distance (in voxel units) */
@@ -352,11 +354,12 @@ int main(int argc, char **argv) {
                                        SDL_GetGPUSwapchainTextureFormat(mc_gpu_device(V.gpu), win),
                                        6.0f);
             V.gpu_avail = (V.gvol != NULL);
-            // 3D raycaster (also c3g-only).
+            // 3D raycaster (also c3g-only). gray owns the decode pipeline +
+            // constant tables; gbrick (out-of-core brick cache) borrows them.
             if (V.gpu_avail) {
-                V.gray = mc_gpu_ray_create(mc_gpu_device(V.gpu),
-                                           SDL_GetGPUSwapchainTextureFormat(mc_gpu_device(V.gpu), win),
-                                           6.0f);
+                SDL_GPUTextureFormat sf = SDL_GetGPUSwapchainTextureFormat(mc_gpu_device(V.gpu), win);
+                V.gray = mc_gpu_ray_create(mc_gpu_device(V.gpu), sf, 6.0f);
+                if (V.gray) V.gbrick = mc_gpu_brick_create(V.gray, sf, /*atlas slots/axis=*/8);
             }
         }
     }
@@ -364,7 +367,7 @@ int main(int argc, char **argv) {
     if (V.gpu_avail && SDL_getenv("MC_VIEWER_GPU")) V.gpu_mode = 1;
     // 3D orbit camera defaults.
     V.cam_az = 0.7f; V.cam_el = 0.5f; V.cam_dist = 200.0f; V.ray_comp = MC_RAY_EA;
-    if (V.gray && SDL_getenv("MC_VIEWER_3D")) V.ray_mode = 1;   // headless 3D test
+    if (V.gbrick && SDL_getenv("MC_VIEWER_3D")) V.ray_mode = 1;   // headless 3D test
 
     int running = 1;
     int dragging = 0;
@@ -387,7 +390,7 @@ int main(int argc, char **argv) {
                 atomic_store(&V.dirty, 1);
                 fprintf(stderr, "GPU decode mode: %s\n", V.gpu_mode ? "ON" : "OFF");
             }
-            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_3 && V.gray) {
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_3 && V.gbrick) {
                 V.ray_mode = !V.ray_mode;
                 atomic_store(&V.dirty, 1);
                 fprintf(stderr, "3D raycast mode: %s\n", V.ray_mode ? "ON" : "OFF");
@@ -480,7 +483,7 @@ int main(int argc, char **argv) {
             } else {
                 nk_label(nk, "decode: CPU (c3g archive: MC_BLOCK_CODEC=c3g)", NK_TEXT_LEFT);
             }
-            if (V.gray) {
+            if (V.gbrick) {
                 if (V.ray_mode) {
                     snprintf(info, sizeof(info), "3D raycast: %s ('3' off, 'M' mode, drag/wheel)",
                              V.ray_comp==MC_RAY_MIP ? "MIP" : "emission-absorption");
@@ -529,33 +532,33 @@ int main(int argc, char **argv) {
 
         /* --- draw the frame --- */
         mc_gpu_set_nearest(V.gpu, V.zoom >= 1.0f);
-        if (V.ray_mode && V.gray) {
-            /* 3D raycast: gather a region of compressed c3g blocks into the
-             * dense 3D volume (once, when dirty), then raycast it from the orbit
-             * camera and draw Nuklear over it. */
+        if (V.ray_mode && V.gbrick) {
+            /* 3D raycast via the OUT-OF-CORE BRICK CACHE: gather a region of
+             * compressed c3g blocks (once, when dirty), page in the resident
+             * (non-air) bricks to the atlas, then raycast walking the page table
+             * (air bricks skipped). Composite with Nuklear. */
             if (atomic_exchange(&V.dirty, 0) || !V.ray_loaded) {
                 static const uint8_t *rblobs[MC_RAY_WIN*MC_RAY_WIN*MC_RAY_WIN];
                 static uint32_t       rlens[MC_RAY_WIN*MC_RAY_WIN*MC_RAY_WIN];
                 static uint8_t        rscratch[4096];
-                int gz,gy,gx;
+                int gz,gy,gx, nres=0;
                 if (gather_region(&V,&gz,&gy,&gx,rblobs,rlens,rscratch) &&
-                    mc_gpu_ray_upload(V.gray,gz,gy,gx,rblobs,rlens)) {
+                    mc_gpu_brick_page(V.gbrick,gz,gy,gx,rblobs,rlens,&nres)) {
                     V.rgz=gz; V.rgy=gy; V.rgx=gx; V.ray_loaded=1;
                 }
             }
-            mc_gpu_ray_set_lut(V.gray, V.lut);
+            mc_gpu_brick_set_lut(V.gbrick, V.lut);
             float ldir[3] = { 1.0f, 1.0f, 0.5f };   // raking light
-            mc_gpu_ray_set_lighting(V.gray, 1, ldir, 0.2f, 0.8f, 0.25f, 24.0f, 8.0f);
+            mc_gpu_brick_set_lighting(V.gbrick, 1, ldir, 0.2f, 0.8f, 0.25f, 24.0f, 8.0f);
 
             int vx=V.rgx*16, vy=V.rgy*16, vz=V.rgz*16;
             float ivp[16]; build_orbit_ivp(vx,vy,vz, V.cam_az,V.cam_el,V.cam_dist, ivp);
-            float campos[3] = {0,0,0};   // frag derives origin from ivp near plane
 
             SDL_GPUCommandBuffer *cmd; SDL_GPUTexture *swap; Uint32 ow, oh;
             if (V.ray_loaded && mc_gpu_frame_begin(V.gpu, &cmd, &swap, &ow, &oh)) {
-                mc_gpu_ray_render(V.gray, cmd, swap, ivp, campos,
-                                  /*step=*/0.5f, /*gain=*/1.0f,
-                                  V.ray_comp, /*alpha_min=*/0.08f, /*absorption=*/3.0f);
+                mc_gpu_brick_render(V.gbrick, cmd, swap, ivp,
+                                    /*step=*/0.5f, /*gain=*/1.0f,
+                                    V.ray_comp, /*alpha_min=*/0.08f, /*absorption=*/3.0f);
                 mc_gpu_frame_end_nuklear(V.gpu, cmd, swap, ow, oh);
             }
         } else if (V.gpu_mode && V.gvol) {
@@ -592,6 +595,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (V.gbrick) mc_gpu_brick_destroy(V.gbrick);   // borrows gray's decode pipeline
     if (V.gray) mc_gpu_ray_destroy(V.gray);
     if (V.gvol) mc_gpu_vol_destroy(V.gvol);
     mc_gpu_destroy(V.gpu);
