@@ -358,3 +358,70 @@ int mc_seg_fill_cavities(uint8_t *mask, int nz, int ny, int nx){
     free(bg); free(stack);
     return (int)(filled>0);
 }
+
+// ---- exact Euclidean distance transform (Felzenszwalb-Huttenlocher) ---------
+// 1D squared-distance transform of `f` (sampled function) over `n` samples at
+// `stride`, in place, using the lower envelope of parabolas. f[i] is the seed
+// cost at i (0 where the feature is, +INF elsewhere); on return f[i] is
+// min_j (f[j] + (i-j)^2). O(n). v/z/work are caller scratch of length >= n+1.
+static void edt_1d(float *f, int n, size_t stride, int *v, float *z, float *work){
+    const float INF = 1e20f;
+    for(int i=0;i<n;++i) work[i]=f[(size_t)i*stride];
+    int k=0; v[0]=0; z[0]=-INF; z[1]=INF;
+    for(int q=1;q<n;++q){
+        float s;
+        for(;;){
+            int p=v[k];
+            s = ((work[q]+(float)q*q) - (work[p]+(float)p*p)) / (2.0f*(q-p));
+            if(s<=z[k]){ if(k>0){ k--; continue; } }
+            break;
+        }
+        k++; v[k]=q; z[k]=s; z[k+1]=INF;
+    }
+    k=0;
+    for(int q=0;q<n;++q){
+        while(z[k+1]<q) k++;
+        int p=v[k];
+        float d=(float)(q-p);
+        f[(size_t)q*stride] = d*d + work[p];
+    }
+}
+
+int mc_seg_edt(const uint8_t *mask, int nz, int ny, int nx, float *out){
+    if(nz<1||ny<1||nx<1||!mask||!out) return -1;
+    size_t n=(size_t)nz*ny*nx;
+    const float INF=1e20f;
+    for(size_t i=0;i<n;++i) out[i] = mask[i] ? 0.0f : INF;   // seed: 0 at feature
+    int maxlen = nz>ny?(nz>nx?nz:nx):(ny>nx?ny:nx);
+    int   *v = malloc((size_t)(maxlen+1)*sizeof(int));
+    float *z = malloc((size_t)(maxlen+2)*sizeof(float));
+    float *w = malloc((size_t)maxlen*sizeof(float));
+    if(!v||!z||!w){ free(v);free(z);free(w); return -1; }
+    size_t plane=(size_t)ny*nx;
+    // along x (stride 1)
+    for(int zc=0;zc<nz;++zc)for(int y=0;y<ny;++y) edt_1d(out+(size_t)zc*plane+(size_t)y*nx, nx, 1, v,z,w);
+    // along y (stride nx)
+    for(int zc=0;zc<nz;++zc)for(int x=0;x<nx;++x) edt_1d(out+(size_t)zc*plane+x, ny, nx, v,z,w);
+    // along z (stride plane)
+    for(int y=0;y<ny;++y)for(int x=0;x<nx;++x) edt_1d(out+(size_t)y*nx+x, nz, plane, v,z,w);
+    free(v);free(z);free(w);
+    for(size_t i=0;i<n;++i) out[i]=sqrtf(out[i]);            // squared -> distance
+    return 0;
+}
+
+int mc_seg_sdt(const uint8_t *mask, int nz, int ny, int nx, float *out){
+    if(nz<1||ny<1||nx<1||!mask||!out) return -1;
+    size_t n=(size_t)nz*ny*nx;
+    // distance from background voxels to the nearest foreground (outside, >=0)
+    if(mc_seg_edt(mask,nz,ny,nx,out)!=0) return -1;
+    // inside distance: invert the mask, EDT it, subtract. Inside cells get a
+    // negative value = -distance to the boundary; outside cells keep +distance.
+    uint8_t *inv = malloc(n);
+    float   *din = malloc(n*sizeof(float));
+    if(!inv||!din){ free(inv);free(din); return -1; }
+    for(size_t i=0;i<n;++i) inv[i] = mask[i] ? 0 : 1;
+    if(mc_seg_edt(inv,nz,ny,nx,din)!=0){ free(inv);free(din); return -1; }
+    for(size_t i=0;i<n;++i) if(mask[i]) out[i] = -din[i];    // inside -> negative
+    free(inv); free(din);
+    return 0;
+}

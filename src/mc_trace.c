@@ -352,6 +352,49 @@ int mc_trace_grow(mc_surf_grid *g, const mc_grow_opts *opts, mc_grow_report *rep
     return 0;
 }
 
+// ---- volume term: trilinear signed-distance field sampler -------------------
+// Returns the trilinearly-interpolated SDF value at (x,y,z) and the analytic
+// gradient of that trilinear interpolant w.r.t. (x,y,z). Grid point is (x,y,z),
+// the field is indexed (z,y,x). Out of bounds -> 0 residual, 0 gradient.
+int mc_trace_sdf_vol(void *user, const double *xyz, double *resid, double *grad){
+    const mc_sdf_field *F=user;
+    int nx=F->nx, ny=F->ny, nz=F->nz;
+    double x=xyz[0], y=xyz[1], z=xyz[2];
+    if(x<0||y<0||z<0 || x>nx-1 || y>ny-1 || z>nz-1){
+        *resid=0; if(grad){ grad[0]=grad[1]=grad[2]=0; } return 0;
+    }
+    int x0=(int)x, y0=(int)y, z0=(int)z;
+    if(x0>=nx-1) x0=nx-2; if(y0>=ny-1) y0=ny-2; if(z0>=nz-1) z0=nz-2;
+    if(x0<0)x0=0; if(y0<0)y0=0; if(z0<0)z0=0;
+    double fx=x-x0, fy=y-y0, fz=z-z0;
+    const float *S=F->sdf; size_t plane=(size_t)ny*nx;
+    #define V(zz,yy,xx) ((double)S[(size_t)(zz)*plane+(size_t)(yy)*nx+(xx)])
+    double c000=V(z0,y0,x0),   c001=V(z0,y0,x0+1);
+    double c010=V(z0,y0+1,x0), c011=V(z0,y0+1,x0+1);
+    double c100=V(z0+1,y0,x0), c101=V(z0+1,y0,x0+1);
+    double c110=V(z0+1,y0+1,x0), c111=V(z0+1,y0+1,x0+1);
+    #undef V
+    // interpolate along x
+    double c00=c000+(c001-c000)*fx, c01=c010+(c011-c010)*fx;
+    double c10=c100+(c101-c100)*fx, c11=c110+(c111-c110)*fx;
+    // along y
+    double c0=c00+(c01-c00)*fy, c1=c10+(c11-c10)*fy;
+    // along z
+    double val=c0+(c1-c0)*fz;
+    *resid=val;
+    if(grad){
+        // d/dz = c1-c0
+        grad[2]=c1-c0;
+        // d/dy = (c01-c00)*(1-fz) + (c11-c10)*fz
+        grad[1]=(c01-c00)*(1.0-fz)+(c11-c10)*fz;
+        // d/dx = differences along x propagated through y,z weights
+        double d00=c001-c000, d01=c011-c010, d10=c101-c100, d11=c111-c110;
+        double dx0=d00+(d01-d00)*fy, dx1=d10+(d11-d10)*fy;
+        grad[0]=dx0+(dx1-dx0)*fz;
+    }
+    return 0;
+}
+
 // ---- test hooks (mc_trace_test): expose the residual evals + a ctx builder so
 // the jacobians can be checked directly against finite differences. -----------
 int mc_trace__dist_eval(void *u,const double*const*pr,double*r,double*const*j){ return dist_eval(u,pr,r,j); }

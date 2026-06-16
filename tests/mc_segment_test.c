@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define NZ 40
 #define NY 40
@@ -117,6 +118,31 @@ int main(void){
     CHECK(mc_seg_detect(vol,NZ,0,NX,&P,mask)==-1);
     CHECK(mc_seg_detect(vol,NZ,NY,0,&P,mask)==-1);
     printf("detect rejects degenerate dims\n");
+
+    // ---- EDT: exact Euclidean distance to nearest foreground voxel. Single
+    // seed at the center -> each cell's EDT equals its grid distance to it. ----
+    {
+        memset(mask,0,n);
+        int sz=NZ/2, sy=NY/2, sx=NX/2;
+        mask[IDX(sz,sy,sx)]=255;
+        float *d=malloc(n*sizeof(float));
+        CHECK(mc_seg_edt(mask,NZ,NY,NX,d)==0);
+        CHECK(d[IDX(sz,sy,sx)]==0.0f);
+        double maxerr=0;
+        for(int z=0;z<NZ;++z)for(int y=0;y<NY;++y)for(int x=0;x<NX;++x){
+            double exp=sqrt((double)(z-sz)*(z-sz)+(double)(y-sy)*(y-sy)+(double)(x-sx)*(x-sx));
+            double e=fabs(d[IDX(z,y,x)]-exp); if(e>maxerr)maxerr=e;
+        }
+        CHECK(maxerr<1e-4);
+        // SDT: a solid z-slab -> inside negative, outside positive.
+        memset(mask,0,n);
+        for(int z=15;z<=20;++z)for(int y=0;y<NY;++y)for(int x=0;x<NX;++x) mask[IDX(z,y,x)]=255;
+        CHECK(mc_seg_sdt(mask,NZ,NY,NX,d)==0);
+        CHECK(d[IDX(17,20,20)] < 0);     // deep inside the slab
+        CHECK(d[IDX(0,20,20)]  > 0);     // far outside
+        printf("edt: max err %.2e vs brute; sdt inside<0 outside>0 OK\n", maxerr);
+        free(d);
+    }
 
     free(vol); free(mask); free(lab);
     printf(fails ? "mc_segment_test: %d FAILED\n" : "mc_segment_test: OK\n", fails);

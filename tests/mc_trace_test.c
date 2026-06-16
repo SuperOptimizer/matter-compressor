@@ -167,6 +167,43 @@ int main(void){
         mc_surf_grid_free(g);
     }
 
+    // ===== E. volume term: grow on a curved cylinder's signed-distance field.
+    // Geometry-only growth drifts off the arc (~tangent); adding the SDF term
+    // pulls the surface onto the cylinder, cutting the radius error sharply. =====
+    {
+        int VN=160; double Rc=60.0, cx=VN/2.0, cz=VN/2.0;
+        float *sdf=malloc((size_t)VN*VN*VN*sizeof(float));
+        CHECK(sdf!=NULL);
+        for(int z=0;z<VN;++z)for(int y=0;y<VN;++y)for(int x=0;x<VN;++x){
+            double dx=x-cx, dz=z-cz; sdf[((size_t)z*VN+y)*VN+x]=(float)(sqrt(dx*dx+dz*dz)-Rc); }
+        mc_sdf_field F={sdf,VN,VN,VN};
+        int G=17; double U=8.0; int c0=G/2;
+        // identical seed for both runs
+        mc_surf_grid *gg=mc_surf_grid_create(G,G,U), *gv=mc_surf_grid_create(G,G,U);
+        for(int dr=-1;dr<=1;++dr)for(int dc=-1;dc<=1;++dc){
+            int rr=c0+dr, cc=c0+dc; double t=(cc-c0)*U/Rc;
+            double X=cx+Rc*cos(t), Z=cz+Rc*sin(t), Y=VN/2.0+(rr-c0)*U;
+            mc_surf_cell_set(gg,rr,cc,X,Y,Z); mc_surf_cell_set(gv,rr,cc,X,Y,Z);
+        }
+        mc_grow_opts o; mc_grow_opts_default(&o); o.max_gen=30; o.accept_resid=0;
+        mc_grow_report rg; mc_trace_grow(gg,&o,&rg);                       // geometry only
+        o.vol_fn=mc_trace_sdf_vol; o.vol_user=&F; o.vol_weight=4.0;
+        mc_grow_report rv; mc_trace_grow(gv,&o,&rv);                       // + SDF term
+        double eg=0,ev=0; int ng=0,nv=0;
+        for(int r=0;r<G;++r)for(int c=0;c<G;++c){
+            if(mc_surf_cell_valid(gg,r,c)){ double*p=gg->p+((size_t)r*G+c)*3;
+                eg+=fabs(sqrt((p[0]-cx)*(p[0]-cx)+(p[2]-cz)*(p[2]-cz))-Rc); ng++; }
+            if(mc_surf_cell_valid(gv,r,c)){ double*p=gv->p+((size_t)r*G+c)*3;
+                ev+=fabs(sqrt((p[0]-cx)*(p[0]-cx)+(p[2]-cz)*(p[2]-cz))-Rc); nv++; }
+        }
+        double mg=ng?eg/ng:0, mv=nv?ev/nv:0;
+        CHECK(mv < mg*0.5);          // SDF term at least halves the radius error
+        CHECK(mv < 3.0);             // and tracks the cylinder reasonably tightly
+        printf("E. cyl volume term: geom err %.2f -> SDF err %.2f (cut %.0f%%)\n",
+               mg, mv, 100.0*(1.0-mv/mg));
+        free(sdf); mc_surf_grid_free(gg); mc_surf_grid_free(gv);
+    }
+
     printf(fails ? "mc_trace_test: %d FAILED\n" : "mc_trace_test: OK\n", fails);
     return fails?1:0;
 }

@@ -102,4 +102,22 @@ typedef struct {
 // Grow `g` in place. Returns 0 on success, <0 on a hard error.
 int mc_trace_grow(mc_surf_grid *g, const mc_grow_opts *opts, mc_grow_report *rep);
 
+// ---- volume-data term: pull cells onto a sheet's signed-distance zero set ----
+// Wraps a dense float signed-distance field (e.g. mc_seg_sdt output, indexed
+// (z,y,x) at sdf[(z*ny+y)*nx+x]) as a vol_fn for mc_grow_opts. The residual at
+// a point is the trilinearly-sampled SDF value (0 on the sheet surface) and the
+// gradient is the SDF's spatial gradient, so the solver drives cells onto the
+// zero level set. Points are in grid (x,y,z) order; the sampler maps to the
+// volume's (z,y,x). Out-of-bounds points yield a 0 residual + 0 gradient (no
+// pull) so growth can still extrapolate past the sampled region.
+//
+// Usage: set opts.vol_fn = mc_trace_sdf_vol, opts.vol_user = &your mc_sdf_field,
+// opts.vol_weight = e.g. 1.0.
+typedef struct {
+    const float *sdf;     // nz*ny*nx, (z,y,x) row-major (not owned)
+    int nz, ny, nx;
+} mc_sdf_field;
+
+int mc_trace_sdf_vol(void *user, const double *xyz, double *resid, double *grad);
+
 #endif /* MC_TRACE_H */

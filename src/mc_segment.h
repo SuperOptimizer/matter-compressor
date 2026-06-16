@@ -57,4 +57,17 @@ int  mc_seg_fill_cavities(uint8_t *mask, int nz, int ny, int nx);
 // background, 1..n = components). Returns the component count.
 int  mc_seg_label(const uint8_t *mask, int nz, int ny, int nx, int32_t *labels);
 
+// Exact Euclidean distance transform (Felzenszwalb-Huttenlocher separable
+// parabola method). For each voxel, `out` receives the Euclidean distance (in
+// voxel units) to the nearest FOREGROUND voxel (mask != 0). Foreground voxels
+// get 0. If the mask is all-background, every cell gets a large finite value.
+// `out` is nz*ny*nx floats supplied by the caller. Returns 0 on success.
+int  mc_seg_edt(const uint8_t *mask, int nz, int ny, int nx, float *out);
+
+// Signed distance transform: negative inside the foreground region, positive
+// outside, |value| = distance to the foreground boundary (the zero level set is
+// the sheet surface). out = EDT(background-as-seed) - EDT(foreground-as-seed),
+// giving the standard signed field the tracer's volume term pulls toward 0.
+int  mc_seg_sdt(const uint8_t *mask, int nz, int ny, int nx, float *out);
+
 #endif /* MC_SEGMENT_H */
