@@ -194,14 +194,11 @@ int mc_seg_detect(const uint8_t *vol, int nz, int ny, int nx,
 
 // ---- connected components (26-connectivity), union-find over a label pass ----
 static int label26(const uint8_t *mask, int nz,int ny,int nx, int32_t *lab){
-    size_t n=(size_t)nz*ny*nx;
-    int32_t *parent=malloc((n+1)*sizeof(int32_t)); // 1-based provisional labels
-    if(!parent) return -1;
+    size_t n=(size_t)nz*ny*nx, plane=(size_t)ny*nx;
     int32_t next=1;
     for(size_t i=0;i<n;++i) lab[i]=0;
     // simple BFS flood per seed (avoids union-find bookkeeping; n is chunk-sized).
-    int32_t *stack=malloc(n*sizeof(int32_t)); if(!stack){ free(parent); return -1; }
-    (void)parent;
+    int32_t *stack=malloc(n*sizeof(int32_t)); if(!stack) return -1;
     int ncomp=0;
     for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){
         size_t s=IDX(z,y,x);
@@ -209,18 +206,28 @@ static int label26(const uint8_t *mask, int nz,int ny,int nx, int32_t *lab){
         ncomp++; int32_t id=next++;
         int top=0; stack[top++]=(int32_t)s; lab[s]=id;
         while(top){
-            int32_t cur=stack[--top];
-            int cz=cur/((int)ny*nx), rem=cur%((int)ny*nx), cy=rem/nx, cx=rem%nx;
-            for(int dz=-1;dz<=1;++dz)for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx){
-                if(!dz&&!dy&&!dx) continue;
-                int nz2=cz+dz,ny2=cy+dy,nx2=cx+dx;
-                if(nz2<0||ny2<0||nx2<0||nz2>=nz||ny2>=ny||nx2>=nx) continue;
-                size_t ni=IDX(nz2,ny2,nx2);
-                if(mask[ni] && !lab[ni]){ lab[ni]=id; stack[top++]=(int32_t)ni; }
+            size_t cur=(size_t)stack[--top];
+            // decode once; visit the (up to) 26 neighbors as flat offsets gated
+            // by per-axis edge flags — no per-tap 3-way coordinate rebuild.
+            size_t r=cur%plane; int cx=(int)(r%nx), cy=(int)(r/nx), cz=(int)(cur/plane);
+            int x0=cx>0, x1=cx<nx-1, y0=cy>0, y1=cy<ny-1, z0=cz>0, z1=cz<nz-1;
+            for(int dz=-1;dz<=1;++dz){
+                if((dz<0&&!z0)||(dz>0&&!z1)) continue;
+                size_t bz=cur+(size_t)dz*plane;
+                for(int dy=-1;dy<=1;++dy){
+                    if((dy<0&&!y0)||(dy>0&&!y1)) continue;
+                    size_t by=bz+(size_t)dy*nx;
+                    for(int dx=-1;dx<=1;++dx){
+                        if((dx<0&&!x0)||(dx>0&&!x1)) continue;
+                        if(!dz&&!dy&&!dx) continue;
+                        size_t ni=by+dx;
+                        if(mask[ni] && !lab[ni]){ lab[ni]=id; stack[top++]=(int32_t)ni; }
+                    }
+                }
             }
         }
     }
-    free(parent); free(stack);
+    free(stack);
     return ncomp;
 }
 
