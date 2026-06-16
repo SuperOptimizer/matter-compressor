@@ -201,10 +201,9 @@ int main(int argc, char **argv){
 
     sview S; memset(&S,0,sizeof S);
     S.win_low=0; S.win_high=255; S.cmap=0; S.nthreads=0; S.maxed=-1;
-    /* ortho panels default to 2 vox/px (-> the LOD-matched renderer picks a
-     * coarser, cheaper-to-stream level than LOD0), so a fresh remote view fills
-     * fast across the whole focus neighbourhood; wheel-zoom drops to LOD0. */
-    for (int p=0;p<4;++p){ S.pv[p].scale=2.0f; S.pv[p].pan_u=S.pv[p].pan_v=0; }
+    /* ortho panels default to 1 vox/px (native LOD0 detail at the focus); wheel
+     * zooms out (coarser LOD, more context) or in. */
+    for (int p=0;p<4;++p){ S.pv[p].scale=1.0f; S.pv[p].pan_u=S.pv[p].pan_v=0; }
     S.pv[PANEL_SURF].scale=1.0f;
 
     if (surf_path){
