@@ -133,12 +133,17 @@ typedef struct { const float *Txx,*Tyy,*Tzz,*Txy,*Txz,*Tyz;
                  const uint8_t *vol; uint8_t *mask; float sheetness; int val_lo; } sheet_args;
 static void sheet_mask(void *vp, int lo, int hi){
     sheet_args *a=vp;
+    int val_lo=a->val_lo; float thr=a->sheetness;
     for(int i=lo;i<hi;++i){
+        // the intensity gate is cheap and rejects most (background) voxels; do it
+        // first so the expensive eigenvalue solve (acos/cos) only runs where the
+        // result can actually become foreground.
+        if(a->vol[i] < val_lo){ a->mask[i]=0; continue; }
         double ev[3];
         eig3sym(a->Txx[i],a->Tyy[i],a->Tzz[i],a->Txy[i],a->Txz[i],a->Tyz[i],ev);
         double l0=ev[0],l1=ev[1];
         double sheet = (l0>1e-6) ? (l0-l1)/(l0+1e-6) : 0.0;
-        a->mask[i] = (a->vol[i] >= a->val_lo && sheet >= a->sheetness) ? 255 : 0;
+        a->mask[i] = (sheet >= thr) ? 255 : 0;
     }
 }
 
