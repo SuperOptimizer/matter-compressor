@@ -6,6 +6,8 @@
 *.ko
 *.obj
 *.elf
+# ...but fuzz crash reproducers are Wavefront-OBJ test fixtures, not build output.
+!tests/fuzz/crashes/**/*.obj
 
 # Linker output
 *.ilk
