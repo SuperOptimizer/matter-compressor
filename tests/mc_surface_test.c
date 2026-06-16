@@ -83,6 +83,53 @@ int main(void){
       printf("PPM write (rgb + gray) OK\n");
     }
 
+    // ---- general OBJ mesh (real-world: interleaved v/vn, f a/b/c) ----
+    {
+        // write a VolCart-style OBJ (interleaved v/vn, f with v/vt/vn indices).
+        FILE *f=fopen("/tmp/mc_mesh.obj","wb");
+        fprintf(f,"# VolCart OBJ\n");
+        fprintf(f,"v 1 2 3\nvn 0 0 1\nv 4 5 6\nvn 0 1 0\nv 7 8 9\nvn 1 0 0\nv 1 1 1\nvn 0 0 1\n");
+        fprintf(f,"f 1/1/1 2/2/2 3/3/3\n");          // tri
+        fprintf(f,"f 1/1/1 2/2/2 3/3/3 4/4/4\n");    // quad -> fan into 2 tris
+        fclose(f);
+        mc_mesh m;
+        CHECK(mc_mesh_load_obj("/tmp/mc_mesh.obj",&m)==0);
+        CHECK(m.nv==4); CHECK(m.nt==3);              // 1 + 2 (quad fan)
+        CHECK(m.vn!=NULL);
+        CHECK(m.v[0]==1&&m.v[1]==2&&m.v[2]==3);
+        CHECK(m.tri[0]==0&&m.tri[1]==1&&m.tri[2]==2);
+        // round-trip
+        CHECK(mc_mesh_save_obj("/tmp/mc_mesh_rt.obj",&m)==0);
+        mc_mesh m2; CHECK(mc_mesh_load_obj("/tmp/mc_mesh_rt.obj",&m2)==0);
+        CHECK(m2.nv==m.nv && m2.nt==m.nt);
+        printf("OBJ mesh load (interleaved v/vn, quad fan): nv=%d nt=%d OK\n", m.nv, m.nt);
+        mc_mesh_free(&m); mc_mesh_free(&m2);
+    }
+
+    // ---- VC per-pixel map (.ppm ordered map, dim=6 = xyz+normal) ----
+    {
+        int W=5,H=3,D=6;
+        FILE *f=fopen("/tmp/mc_vc.ppm","wb");
+        fprintf(f,"width: %d\nheight: %d\ndim: %d\nordered: true\ntype: double\nversion: 1\n<>\n",W,H,D);
+        for(int i=0;i<W*H;++i){
+            double row[6];
+            if(i==4){ for(int k=0;k<6;++k) row[k]=0; }   // off-surface (0,0,0)
+            else { row[0]=100+i; row[1]=200+i; row[2]=10+i; row[3]=0; row[4]=0; row[5]=1; }
+            fwrite(row,sizeof(double),6,f);
+        }
+        fclose(f);
+        mc_surface vs;
+        CHECK(mc_surface_load_vcps_ppm("/tmp/mc_vc.ppm",&vs,7.0f)==0);
+        CHECK(vs.gw==W && vs.gh==H);
+        // point 0: xyz (100,200,10) -> grid (z,y,x)=(10,200,100), depth 7.
+        CHECK(vs.grid[0]==10 && vs.grid[1]==200 && vs.grid[2]==100);
+        CHECK(vs.depth[0]==7.0f);
+        // point 4: off-surface -> invalid.
+        CHECK(vs.grid[4*3]==-1 && vs.grid[4*3+1]==-1 && vs.grid[4*3+2]==-1);
+        printf("VC ppm load (dim=6 xyz+normal -> grid+depth): %dx%d OK\n", vs.gw, vs.gh);
+        mc_surface_free(&vs);
+    }
+
     mc_surface_free(&s); mc_surface_free(&r); mc_surface_free(&o);
     printf(fails ? "mc_surface_test: %d FAILED\n" : "mc_surface_test: OK\n", fails);
     return fails?1:0;

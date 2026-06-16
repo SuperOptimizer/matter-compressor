@@ -215,6 +215,10 @@ if(MC_STANDALONE)
   add_executable(mc_surface_render tools/mc_surface_render.c)
   target_link_libraries(mc_surface_render matter_compressor)
 
+  # convert surfaces (OBJ mesh / VC per-pixel map / TIFF) to/from .grid.
+  add_executable(mc_grid tools/mc_grid.c)
+  target_link_libraries(mc_grid matter_compressor)
+
   add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
   target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})
   set_property(TARGET mc_fetch PROPERTY C_STANDARD 23)

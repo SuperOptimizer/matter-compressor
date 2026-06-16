@@ -58,4 +58,44 @@ int  mc_surface_load_obj(const char *path, mc_surface *s);
 // expanded to RGB). Simple, dependency-free render output. Returns 0 on success.
 int  mc_ppm_write(const char *path, int w, int h, int channels, const uint8_t *pix);
 
+// ---- general triangle mesh (real-world OBJ: arbitrary v/vn/vt/f) ----
+// A loaded OBJ that isn't a regular grid (e.g. Vesuvius VolCart segment OBJs):
+// vertices (x,y,z), optional per-vertex normals, and triangle faces (0-based
+// vertex indices; polygons are fan-triangulated). Coordinates are kept in the
+// file's order (x,y,z), i.e. volume coords.
+typedef struct {
+    int    nv, nt;        // vertex count, triangle count
+    float *v;             // nv*3 (x,y,z)   (owned)
+    float *vn;            // nv*3 normals or NULL  (owned)
+    int   *tri;           // nt*3 vertex indices (0-based)  (owned)
+} mc_mesh;
+
+// Load any Wavefront OBJ as a triangle mesh (handles f a, a/b, a//c, a/b/c and
+// negative indices; polygons fan-triangulated). Returns 0 on success.
+int  mc_mesh_load_obj(const char *path, mc_mesh *m);
+// Save a mesh as OBJ (v, optional vn, triangle f). Returns 0 on success.
+int  mc_mesh_save_obj(const char *path, const mc_mesh *m);
+void mc_mesh_free(mc_mesh *m);
+
+// ---- VC per-pixel map (.ppm "ordered map"): the QuadSurface storage ----
+// VC's segment .ppm is NOT a P6 image: a text header
+//   width: W \n height: H \n dim: D \n ordered: true \n type: double \n
+//   version: 1 \n <> \n  then W*H * D doubles, row-major. D=6 is xyz + normal.
+// Load it into mc_surface: the xyz becomes the grid (z,y,x); depth is set to
+// `default_depth` (their map stores a normal, not a thickness). A (0,0,0) map
+// entry (no surface) becomes an invalid (-1,-1,-1) grid point. Returns 0 on
+// success, <0 on parse error / unsupported header.
+int  mc_surface_load_vcps_ppm(const char *path, mc_surface *s, float default_depth);
+
+// ---- mesh -> grid resampling ----
+// Resample an arbitrary triangle mesh (a sheet-like segment) onto a regular
+// gw x gh control grid: fit the best plane through the vertices (PCA), project
+// them to the plane's (u,v), then for each grid cell over the (u,v) bounding
+// box take the nearest vertex's (x,y,z) (cells with no nearby vertex are
+// invalid). Approximate — a folded sheet won't map perfectly to one grid — but
+// good for the near-planar VolCart segment OBJs. depth is set to `default_depth`.
+// gw/gh <= 0 picks a resolution from the vertex count. Returns 0 on success.
+int  mc_grid_from_mesh(const mc_mesh *m, int gw, int gh, float default_depth,
+                       mc_surface *s);
+
 #endif /* MC_SURFACE_H */
