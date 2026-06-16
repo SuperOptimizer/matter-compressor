@@ -543,7 +543,7 @@ int main(int argc, char **argv) {
                 static uint8_t        rscratch[4096];
                 int gz,gy,gx, nres=0;
                 if (gather_region(&V,&gz,&gy,&gx,rblobs,rlens,rscratch) &&
-                    mc_gpu_brick_page(V.gbrick,gz,gy,gx,rblobs,rlens,&nres)) {
+                    mc_gpu_brick_page(V.gbrick,0,0,0,gz,gy,gx,rblobs,rlens,&nres)) {
                     V.rgz=gz; V.rgy=gy; V.rgx=gx; V.ray_loaded=1;
                 }
             }

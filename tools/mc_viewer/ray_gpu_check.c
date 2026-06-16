@@ -273,7 +273,7 @@ int main(void){
                 if(bb[i]) want_resident++;
             }
             int nres=0;
-            mc_gpu_brick_page(B, GZ,GY,GX, bb, bl, &nres);
+            mc_gpu_brick_page(B, 0,0,0, GZ,GY,GX, bb, bl, &nres);
             mc_gpu_brick_set_lut(B, lut);           // gray LUT from M2
 
             // render MIP from the same ortho camera into rt.
@@ -301,11 +301,49 @@ int main(void){
         }
     }
 
-    int allok = m1ok && m2ok && m3ok && m4ok && m5ok;
+    // ---- M6: LRU eviction (1-slot atlas, distinct bricks evict each other) ----
+    int m6ok=0;
+    {
+        mc_gpu_brick *B = mc_gpu_brick_create(R, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, 1); // 1 slot
+        // two constant bricks with distinct values.
+        mc_buf pa={0},pb={0}; uint32_t la=0,lb=0;
+        uint8_t va[N3],vb[N3];
+        for(int i=0;i<N3;++i){ va[i]=120; vb[i]=200; }
+        mc_c3g_enc_block(C,va,&pa,&la); mc_c3g_enc_block(C,vb,&pb,&lb);
+        const uint8_t *ba[1]={pa.p}; uint32_t lna[1]={la};
+        const uint8_t *bb2[1]={pb.p}; uint32_t lnb[1]={lb};
+
+        // read atlas slot 0 center voxel after a page.
+        int aedge; SDL_GPUTexture *atl=mc_gpu_brick_atlas(B,&aedge);
+        SDL_GPUTransferBufferCreateInfo atc={0}; atc.usage=SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD; atc.size=(uint32_t)aedge*aedge*aedge;
+        #define ATLAS_CENTER(outv) do{ \
+            SDL_GPUTransferBuffer *_tb=SDL_CreateGPUTransferBuffer(dev,&atc); \
+            SDL_GPUCommandBuffer *_cb=SDL_AcquireGPUCommandBuffer(dev); \
+            SDL_GPUCopyPass *_cp=SDL_BeginGPUCopyPass(_cb); \
+            SDL_GPUTextureRegion _r={0}; _r.texture=atl; _r.w=aedge; _r.h=aedge; _r.d=aedge; \
+            SDL_GPUTextureTransferInfo _ti={0}; _ti.transfer_buffer=_tb; _ti.pixels_per_row=aedge; _ti.rows_per_layer=aedge; \
+            SDL_DownloadFromGPUTexture(_cp,&_r,&_ti); SDL_EndGPUCopyPass(_cp); \
+            SDL_GPUFence *_f=SDL_SubmitGPUCommandBufferAndAcquireFence(_cb); SDL_WaitForGPUFences(dev,true,&_f,1); SDL_ReleaseGPUFence(dev,_f); \
+            uint8_t *_m=SDL_MapGPUTransferBuffer(dev,_tb,false); \
+            (outv)=_m[(8*aedge+8)*aedge+8]; SDL_UnmapGPUTransferBuffer(dev,_tb); SDL_ReleaseGPUTransferBuffer(dev,_tb); }while(0)
+
+        int nA=0,nB=0,nA2=0, cA=0,cB=0,cA2=0;
+        mc_gpu_brick_page(B,0,0,0, 1,1,1, ba, lna, &nA);   ATLAS_CENTER(cA);   // brick A
+        mc_gpu_brick_page(B,5,5,5, 1,1,1, bb2,lnb, &nB);   ATLAS_CENTER(cB);   // brick B evicts A
+        mc_gpu_brick_page(B,0,0,0, 1,1,1, ba, lna, &nA2);  ATLAS_CENTER(cA2);  // A evicts B again
+        printf("M6 (LRU eviction): A=%d(slot~120) B=%d(slot~200) A2=%d(slot~120)\n", cA,cB,cA2);
+        // each page with a distinct brick must replace the single slot's content.
+        m6ok = (abs(cA-120)<=2) && (abs(cB-200)<=2) && (abs(cA2-120)<=2) && nA==1 && nB==1 && nA2==1;
+        free(pa.p); free(pb.p);
+        mc_gpu_brick_destroy(B);
+    }
+
+    int allok = m1ok && m2ok && m3ok && m4ok && m5ok && m6ok;
     printf("%s\n", allok ? "ray_gpu_check: OK" : "ray_gpu_check: FAIL");
 
     for(int b=0;b<NB;++b) free(payloads[b].p);
     mc_codec_ctx_free(C); mc_gpu_ray_destroy(R);
     SDL_DestroyGPUDevice(dev); SDL_Quit();
+    (void)allok;
     return allok ? 0 : 1;
 }
