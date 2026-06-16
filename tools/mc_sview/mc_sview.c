@@ -48,6 +48,7 @@ typedef struct {
     panel_view     pv[4];
     int            maxed;             /* -1 = 2x2 grid, else PANEL_* fills window */
     int            win_low, win_high, cmap, nthreads;
+    int            want_autowin;      /* 1 -> next XY render sets window from data */
 
     mc_surface     surf;
     int            surf_loaded;
@@ -101,6 +102,21 @@ static void draw_ortho(sview *s, int panel, int px, int py, int pw, int ph){
     rp.filter = MC_FILTER_TRILINEAR; rp.comp = MC_COMP_NONE;
     mc_render_plane_lod(&s->lods, &pl, iw, ih, scale, &rp, s->scratch, s->nthreads);
 
+    /* auto-window: on request, set the display range from this panel's actual
+     * value distribution (2nd..98th percentile of nonzero voxels) so bright/
+     * narrow-band data shows contrast instead of a flat white. */
+    if (s->want_autowin && panel==PANEL_XY){
+        long hist[256]={0}, tot=0;
+        for (size_t i=0;i<(size_t)iw*ih;++i){ int g=s->scratch[i]; if(g){ hist[g]++; tot++; } }
+        if (tot>0){
+            long lo_t=tot*2/100, hi_t=tot*98/100, acc=0; int lo=1, hi=255;
+            for (int g=1; g<256; ++g){ acc+=hist[g]; if(acc>=lo_t){ lo=g; break; } }
+            acc=0; for (int g=1; g<256; ++g){ acc+=hist[g]; if(acc>=hi_t){ hi=g; break; } }
+            if (hi<=lo) hi=lo+1;
+            s->win_low=lo; s->win_high=hi; s->want_autowin=0;
+            fprintf(stderr,"auto-window -> [%d,%d]\n", lo, hi);
+        }
+    }
     mc_colormap_lut(s->lut, s->win_low/255.0f, s->win_high/255.0f, s->cmap);
     for (int y=0;y<ih;++y)
         mc_colormap_apply(s->scratch+(size_t)y*iw, iw, 1, s->lut,
@@ -200,7 +216,7 @@ int main(int argc, char **argv){
     SDL_CreateDirectory(cache);
 
     sview S; memset(&S,0,sizeof S);
-    S.win_low=0; S.win_high=255; S.cmap=0; S.nthreads=0; S.maxed=-1;
+    S.win_low=0; S.win_high=255; S.cmap=0; S.nthreads=0; S.maxed=-1; S.want_autowin=1;
     /* ortho panels default to 1 vox/px (native LOD0 detail at the focus); wheel
      * zooms out (coarser LOD, more context) or in. */
     for (int p=0;p<4;++p){ S.pv[p].scale=1.0f; S.pv[p].pan_u=S.pv[p].pan_v=0; }
@@ -229,7 +245,9 @@ int main(int argc, char **argv){
     if (dump){
         S.win_w=dump_w; S.win_h=dump_h;
         S.fb=malloc((size_t)S.win_w*S.win_h*4);
+        mc_volume_freeze(S.vol);     /* lock-free, race-free reads during render */
         render_all(&S);
+        mc_volume_thaw(S.vol);
         FILE *f=fopen(dump,"wb");
         if(f){ fprintf(f,"P6\n%d %d\n255\n",S.win_w,S.win_h);
             for(size_t i=0;i<(size_t)S.win_w*S.win_h;++i){ uint32_t p=S.fb[i];
@@ -279,6 +297,9 @@ int main(int argc, char **argv){
                 else if (k==SDLK_RIGHT)    S.fx+=step;
                 else if (k==SDLK_LEFTBRACKET)  { S.win_high-=8; if(S.win_high<=S.win_low)S.win_high=S.win_low+1; }
                 else if (k==SDLK_RIGHTBRACKET) { S.win_high+=8; if(S.win_high>255)S.win_high=255; }
+                else if (k==SDLK_MINUS)        { S.win_low-=8; if(S.win_low<0)S.win_low=0; }
+                else if (k==SDLK_EQUALS)       { S.win_low+=8; if(S.win_low>=S.win_high)S.win_low=S.win_high-1; }
+                else if (k==SDLK_A)            { S.want_autowin=1; }   /* auto-contrast */
                 if(S.fz<0)S.fz=0; if(S.fz>=S.nz)S.fz=S.nz-1;
                 if(S.fy<0)S.fy=0; if(S.fy>=S.ny)S.fy=S.ny-1;
                 if(S.fx<0)S.fx=0; if(S.fx>=S.nx)S.fx=S.nx-1;
@@ -322,7 +343,13 @@ int main(int argc, char **argv){
             atomic_store(&S.dirty,1);
         }
         if (atomic_exchange(&S.dirty,0) && S.fb && tex){
+            /* Freeze the cache for the frame: get/get_copy then read LOCK-FREE,
+             * so the render threads can't race a streaming write (that race is a
+             * SIGBUS in the decoder on a torn mmap read). thaw() after lets newly
+             * streamed regions land before the next frame. */
+            mc_volume_freeze(S.vol);
             render_all(&S);
+            mc_volume_thaw(S.vol);
             SDL_UpdateTexture(tex, NULL, S.fb, S.win_w*4);
         }
         SDL_RenderClear(ren);
