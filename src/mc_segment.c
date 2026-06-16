@@ -324,17 +324,23 @@ int mc_seg_fill_cavities(uint8_t *mask, int nz, int ny, int nx){
     for(int z=0;z<nz;++z)for(int x=0;x<nx;++x){ SEED(z,0,x); if(ny>1) SEED(z,ny-1,x); }
     for(int z=0;z<nz;++z)for(int y=0;y<ny;++y){ SEED(z,y,0); if(nx>1) SEED(z,y,nx-1); }
     #undef SEED
+    // flood on FLAT indices: neighbor offsets are +/-1 (x), +/-nx (y),
+    // +/-plane (z). Guard each direction with one cheap residue instead of a
+    // full div+3*mod coordinate decode per pop.
+    size_t plane=(size_t)ny*nx;
+    #define PUSH(ni) do{ if(!mask[(ni)] && !bg[(ni)]){ bg[(ni)]=1; stack[top++]=(int32_t)(ni); } }while(0)
     while(top){
-        int32_t cur=stack[--top];
-        int cz=cur/((int)ny*nx), rem=cur%((int)ny*nx), cy=rem/nx, cx=rem%nx;
-        const int d6[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
-        for(int k=0;k<6;++k){
-            int zz=cz+d6[k][0],yy=cy+d6[k][1],xx=cx+d6[k][2];
-            if(zz<0||yy<0||xx<0||zz>=nz||yy>=ny||xx>=nx) continue;
-            size_t ni=IDX(zz,yy,xx);
-            if(!mask[ni] && !bg[ni]){ bg[ni]=1; stack[top++]=(int32_t)ni; }
-        }
+        size_t cur=(size_t)stack[--top];
+        size_t r=cur%plane; int cx=(int)(r%nx), cy=(int)(r/nx);
+        size_t cz=cur/plane;
+        if(cx>0)        PUSH(cur-1);
+        if(cx<nx-1)     PUSH(cur+1);
+        if(cy>0)        PUSH(cur-nx);
+        if(cy<ny-1)     PUSH(cur+nx);
+        if(cz>0)        PUSH(cur-plane);
+        if(cz<(size_t)nz-1) PUSH(cur+plane);
     }
+    #undef PUSH
     long filled=0;
     for(size_t i=0;i<n;++i) if(!mask[i] && !bg[i]){ mask[i]=255; filled++; }
     free(bg); free(stack);
