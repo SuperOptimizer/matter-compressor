@@ -152,3 +152,32 @@ clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
 Crash reproducers: `tests/fuzz/crashes/surface/`. `tests/mc_surface_robust_test.c`
 is the permanent guard — it leaks + fails the tri-index assertion on the pre-fix
 loaders (verified tripwire) and passes clean on the fix.
+
+---
+
+# Fuzzing findings — segment detector (`mc_segment.c`)
+
+> **STATUS: CLEAN + hardened.** A ~2 min libFuzzer+ASan/UBSan campaign over
+> adversarial dims/data/params found no crashes/leaks/UB (coverage plateaus at
+> the detector's full extent; mc_segment.c is at 100% line coverage). One latent
+> robustness gap the harness masked — `mc_seg_detect` had no `nz/ny/nx<1` guard
+> (the harness clamps dims to 1..24) — was closed defensively anyway.
+
+Harness: `tests/fuzz/mc_fuzz_segment.c` (libFuzzer; AFL++ via
+`scripts/fuzz.sh segment`). Seeds: `tests/fuzz/mc_fuzz_segment_seed.c`. The
+detector + topology post-proc are pure in-memory compute (separable gaussian
+blur, central-difference gradient + structure tensor, closed-form eigenvalues,
+26-conn flood label, 2x2x2 hole LUT, spherical morphology, border flood) — lots
+of index arithmetic that must stay in bounds for any shape/data. The harness
+derives small bounded dims + params from the header bytes, allocates buffers
+sized to match, fills the volume from the rest, and runs detect + every
+post-proc op + label.
+
+## Hardening
+
+- `mc_seg_detect`: reject `nz<1||ny<1||nx<1` up front. The gradient stencil
+  indexes neighbors, so a 0-length axis would index OOB if a caller passed
+  degenerate dims directly. Guarded + regression-tested (`mc_segment_test`).
+
+The other ops (`remove_small`/`plug_holes`/`close`/`fill_cavities`/`label`)
+compute `n=nz*ny*nx` and loop `i<n`, so they no-op safely on a 0-voxel volume.

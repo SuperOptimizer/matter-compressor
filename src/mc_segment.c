@@ -65,6 +65,8 @@ static void eig3sym(double a,double b,double c,double d,double e,double f,
 
 int mc_seg_detect(const uint8_t *vol, int nz, int ny, int nx,
                   const mc_seg_params *params, uint8_t *mask){
+    if(nz<1||ny<1||nx<1) return -1;     // degenerate volume (the gradient stencil
+                                        // indexes neighbors; 0 dims would go OOB)
     mc_seg_params P = { 1.0f, 2.0f, 0.5f, 1 };
     if(params) P=*params;
     if(P.sigma_grad<=0) P.sigma_grad=1.0f;

@@ -35,7 +35,9 @@ case "$TARGET" in
           SRC=(src/mc_tiff.c); LIBS=(-lm);;   # self-contained reader, no archive/libs3 deps
   surface) HARNESS=tests/fuzz/mc_fuzz_surface.c; SEEDGEN=tests/fuzz/mc_fuzz_surface_seed.c
           SRC=(src/mc_surface.c src/mc_tiff.c); LIBS=(-lm);;   # surface loaders + their tiff dep
-  *) echo "unknown target '$TARGET' (decode|block|tiff|surface)"; exit 2;;
+  segment) HARNESS=tests/fuzz/mc_fuzz_segment.c; SEEDGEN=tests/fuzz/mc_fuzz_segment_seed.c
+          SRC=(src/mc_segment.c); LIBS=(-lm);;   # self-contained detector + post-proc
+  *) echo "unknown target '$TARGET' (decode|block|tiff|surface|segment)"; exit 2;;
 esac
 
 rm -rf "$OUT"; mkdir -p "$OUT/corpus" "$OUT/findings"

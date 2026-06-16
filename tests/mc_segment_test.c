@@ -112,6 +112,12 @@ int main(void){
     CHECK(mask[IDX(13,13,13)]==255);                       // notch closed
     printf("close: notch filled\n");
 
+    // ---- degenerate dims: detect must reject (not OOB on the gradient stencil). ----
+    CHECK(mc_seg_detect(vol,0,NY,NX,&P,mask)==-1);
+    CHECK(mc_seg_detect(vol,NZ,0,NX,&P,mask)==-1);
+    CHECK(mc_seg_detect(vol,NZ,NY,0,&P,mask)==-1);
+    printf("detect rejects degenerate dims\n");
+
     free(vol); free(mask); free(lab);
     printf(fails ? "mc_segment_test: %d FAILED\n" : "mc_segment_test: OK\n", fails);
     return fails?1:0;
