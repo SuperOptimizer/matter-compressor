@@ -93,12 +93,15 @@ which path is active. CPU mode (the default) is always available as a fallback.
 ### 3D volume raycast mode
 
 On a c3g volume, press `3` (or `MC_VIEWER_3D=1`) for real-time 3D volume
-rendering: a region of compressed c3g blocks is decoded into a dense 3D texture
-and raycast from an orbit camera (right-drag rotates, wheel dollies). `M`
-switches between MIP and transfer-function emission-absorption (with gradient
-lighting). See `mc_gpu_ray.h`; the standalone `ray_gpu_check` validates the
-decode + MIP + EA + lighting against a CPU reference. Currently renders a
-bounded region (no out-of-core paging yet — that's the next milestone).
+rendering: compressed c3g bricks are paged into a GPU brick cache (atlas + page
+table) and raycast from an orbit camera (right-drag rotates, wheel dollies). `M`
+switches MIP vs transfer-function emission-absorption (gradient-lit). The brick
+cache (`mc_gpu_brick.h`) is **out-of-core**: only resident (non-air) bricks
+occupy the VRAM atlas, the page table skips empty bricks (empty-space skipping),
+an LRU evicts when the slot budget is exceeded, and the LOD coarsens as the
+camera dollies out. The standalone `ray_gpu_check` validates the whole chain
+against a CPU reference: 3D-texture decode (exact), MIP, emission-absorption,
+gradient lighting, brick-cache empty-space skip, and LRU eviction.
 
 ### Headless verification
 
