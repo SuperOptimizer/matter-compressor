@@ -130,6 +130,57 @@ int main(void){
         mc_surface_free(&vs);
     }
 
+    // ---- mc_grid_from_mesh: PCA plane-fit + nearest-vertex resample. Build a
+    // near-planar mesh (a tilted plane sampled on a 5x5 lattice, fan-triangulated)
+    // and resample it to a grid; the fit should recover plane points (exercises
+    // jacobi3 eigendecomposition + the in-plane projection + nearest-vertex fill).
+    {
+        mc_mesh m; memset(&m,0,sizeof m);
+        int N=5; m.nv=N*N;
+        m.v=malloc((size_t)m.nv*3*sizeof(float));
+        // plane: x,y span the lattice; z = small tilt -> dominant normal ~ +z.
+        for(int j=0;j<N;++j)for(int i=0;i<N;++i){
+            int vi=j*N+i;
+            m.v[vi*3]  =10.f + i*2.f;            // x
+            m.v[vi*3+1]=20.f + j*2.f;            // y
+            m.v[vi*3+2]=5.f + 0.1f*i + 0.05f*j;  // z (gentle tilt)
+        }
+        // fan-triangulate each lattice quad (a realistic mesh; the fit uses
+        // vertices, but this keeps the mesh well-formed for any tri consumer).
+        m.nt=(N-1)*(N-1)*2; m.tri=malloc((size_t)m.nt*3*sizeof(int)); int t=0;
+        for(int j=0;j<N-1;++j)for(int i=0;i<N-1;++i){
+            int a=j*N+i,b=j*N+i+1,c=(j+1)*N+i,d=(j+1)*N+i+1;
+            m.tri[t*3]=a;m.tri[t*3+1]=b;m.tri[t*3+2]=d;t++;
+            m.tri[t*3]=a;m.tri[t*3+1]=d;m.tri[t*3+2]=c;t++;
+        }
+        mc_surface g;
+        CHECK(mc_grid_from_mesh(&m, 8, 8, 3.0f, &g)==0);
+        CHECK(g.gw==8 && g.gh==8);
+        // every filled grid point should match SOME mesh vertex (nearest fill),
+        // and a dense planar lattice should fill most cells.
+        int filled=0;
+        for(int k=0;k<g.gw*g.gh;++k){
+            float vz=g.grid[k*3], vy=g.grid[k*3+1], vx=g.grid[k*3+2];
+            if(vz<0&&vy<0&&vx<0) continue;        // invalid cell
+            filled++;
+            int match=0;
+            for(int vi=0;vi<m.nv;++vi)
+                if(fabsf(vx-m.v[vi*3])<1e-3f && fabsf(vy-m.v[vi*3+1])<1e-3f && fabsf(vz-m.v[vi*3+2])<1e-3f){ match=1; break; }
+            CHECK(match);                          // filled point is a real vertex
+            CHECK(g.depth[k]==3.0f);
+        }
+        CHECK(filled > g.gw*g.gh/2);               // dense plane -> mostly filled
+        printf("grid_from_mesh: %d verts -> %dx%d grid, %d/%d cells filled\n",
+               m.nv, g.gw, g.gh, filled, g.gw*g.gh);
+
+        // auto-resolution path (gw/gh<=0 -> pick from vertex count).
+        mc_surface g2;
+        CHECK(mc_grid_from_mesh(&m, 0, 0, 2.0f, &g2)==0);
+        CHECK(g2.gw>0 && g2.gh>0);
+        printf("grid_from_mesh auto-res: %d verts -> %dx%d grid\n", m.nv, g2.gw, g2.gh);
+        mc_surface_free(&g); mc_surface_free(&g2); mc_mesh_free(&m);
+    }
+
     mc_surface_free(&s); mc_surface_free(&r); mc_surface_free(&o);
     printf(fails ? "mc_surface_test: %d FAILED\n" : "mc_surface_test: OK\n", fails);
     return fails?1:0;
