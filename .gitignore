@@ -58,6 +58,7 @@ dkms.conf
 /build/
 /build_native/
 /build_viewer/
+/build-asan/
 
 # coverage output (generated)
 /build_cov/

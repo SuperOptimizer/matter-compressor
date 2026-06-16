@@ -69,6 +69,7 @@ add_library(matter_compressor STATIC
   src/c3d.c
   src/mc_tiff.c
   src/mc_surface.c
+  src/mc_segment.c
   tools/vendor/libs3/libs3.c)
 target_include_directories(matter_compressor
   PUBLIC src PRIVATE tools/vendor/libs3 ${ZSTD_INC})
@@ -134,6 +135,11 @@ if(MC_STANDALONE)
   add_executable(mc_surface_test tests/mc_surface_test.c)
   target_link_libraries(mc_surface_test matter_compressor)
   add_test(NAME surface COMMAND mc_surface_test)
+
+  # classical sheet detector (structure tensor) + topology post-processing.
+  add_executable(mc_segment_test tests/mc_segment_test.c)
+  target_link_libraries(mc_segment_test matter_compressor)
+  add_test(NAME segment COMMAND mc_segment_test)
 
   # c3g in the .mca archive: header codec field, round-trip == CABAC, back-compat.
   add_executable(mc_c3g_archive_test tests/mc_c3g_archive_test.c)
@@ -218,6 +224,10 @@ if(MC_STANDALONE)
   # convert surfaces (OBJ mesh / VC per-pixel map / TIFF) to/from .grid.
   add_executable(mc_grid tools/mc_grid.c)
   target_link_libraries(mc_grid matter_compressor)
+
+  # classical sheet detector over a live volume chunk (mc_volume + mc_sample_box).
+  add_executable(mc_detect tools/mc_detect.c)
+  target_link_libraries(mc_detect matter_compressor)
 
   add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
   target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})
