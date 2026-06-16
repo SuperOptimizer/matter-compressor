@@ -100,7 +100,10 @@ int mc_surface_load_obj(const char *path, mc_surface *s){
         if(line[0]=='#'){ int a,b; if(sscanf(line,"# grid %d %d",&a,&b)==2){ gw=a; gh=b; } continue; }
         if(line[0]=='v'&&line[1]==' '){ if(vpos<0) vpos=ftell(f)-(long)strlen(line); }
     }
-    if(gw<1||gh<1){ fclose(f); return -2; }   // need the grid hint
+    // need the grid hint, positive and bounded — gw/gh come from the file and a
+    // huge product would overflow the n*3*sizeof(float) alloc into an under-
+    // allocation the fill loop then writes past. Cap each axis at 1<<20.
+    if(gw<1||gh<1||gw>(1<<20)||gh>(1<<20)){ fclose(f); return -2; }
     size_t n=(size_t)gw*gh;
     float *grid=malloc(n*3*sizeof(float));
     float *depth=calloc(n,sizeof(float));
@@ -158,26 +161,35 @@ int mc_mesh_load_obj(const char *path, mc_mesh *m){
     int   *tri=malloc(tcap*3*sizeof(int)); int nt=0;
     if(!v||!vn||!tri){ free(v);free(vn);free(tri);fclose(f); return -1; }
     char line[1024];
-    while(fgets(line,sizeof line,f)){
+    int oom=0;
+    // grow *arr (a void* by ref) to hold `need` elements of `esz`; checked.
+    #define GROW(arr,cap,need,esz) do{ \
+        if((size_t)(need) > (cap)){ size_t _nc=(cap)?(cap):1; while(_nc<(size_t)(need)) _nc*=2; \
+            void *_p=realloc((arr),_nc*(esz)); if(!_p){ oom=1; break; } (arr)=_p; (cap)=_nc; } }while(0)
+    while(!oom && fgets(line,sizeof line,f)){
         if(line[0]=='v'&&line[1]==' '){
             float a,b,c; if(sscanf(line+2,"%f %f %f",&a,&b,&c)==3){
-                if((size_t)nv>=vcap){ vcap*=2; v=realloc(v,vcap*3*sizeof(float)); }
+                GROW(v,vcap,(size_t)(nv+1)*3,sizeof(float)); if(oom) break;
                 v[nv*3]=a; v[nv*3+1]=b; v[nv*3+2]=c; nv++; }
         } else if(line[0]=='v'&&line[1]=='n'&&line[2]==' '){
             float a,b,c; if(sscanf(line+3,"%f %f %f",&a,&b,&c)==3){
-                if((size_t)nvn>=ncap){ ncap*=2; vn=realloc(vn,ncap*3*sizeof(float)); }
+                GROW(vn,ncap,(size_t)(nvn+1)*3,sizeof(float)); if(oom) break;
                 vn[nvn*3]=a; vn[nvn*3+1]=b; vn[nvn*3+2]=c; nvn++; }
         } else if(line[0]=='f'&&line[1]==' '){
-            // collect this face's vertex indices, fan-triangulate.
+            // collect this face's vertex indices, fan-triangulate. Each index is
+            // validated to a real (already-seen) vertex: 1-based in [1,nv], or a
+            // negative relative ref resolving into the same range. OBJ vertices
+            // must precede the faces that use them, so nv is the live count.
             long idx[64]; int ni=0;
             char *p=line+1, *tok;
             while(ni<64 && (tok=strtok(p," \t\r\n"))){ p=NULL;
                 long fv=obj_face_v(tok); if(fv==0) continue;
                 if(fv<0) fv = nv + fv + 1;          // negative = relative
+                if(fv<1 || fv>nv) continue;         // out-of-range index -> drop the vertex
                 idx[ni++]=fv;
             }
             for(int k=1;k+1<ni;++k){
-                if((size_t)nt>=tcap){ tcap*=2; tri=realloc(tri,tcap*3*sizeof(int)); }
+                GROW(tri,tcap,(size_t)(nt+1)*3,sizeof(int)); if(oom) break;
                 tri[nt*3]  =(int)idx[0]-1;
                 tri[nt*3+1]=(int)idx[k]-1;
                 tri[nt*3+2]=(int)idx[k+1]-1;
@@ -185,11 +197,15 @@ int mc_mesh_load_obj(const char *path, mc_mesh *m){
             }
         }
     }
+    #undef GROW
     fclose(f);
+    if(oom){ free(v); free(vn); free(tri); memset(m,0,sizeof *m); return -1; }
+    // no vertices -> not a usable mesh; free the buffers (don't leak them).
+    if(nv<=0){ free(v); free(vn); free(tri); memset(m,0,sizeof *m); return -2; }
     // normals are usable only if there's one per vertex.
     if(nvn != nv){ free(vn); vn=NULL; }
     m->nv=nv; m->nt=nt; m->v=v; m->vn=vn; m->tri=tri;
-    return (nv>0) ? 0 : -2;
+    return 0;
 }
 
 int mc_mesh_save_obj(const char *path, const mc_mesh *m){
@@ -221,7 +237,10 @@ int mc_surface_load_vcps_ppm(const char *path, mc_surface *s, float default_dept
         else if(sscanf(line,"dim: %d",&iv)==1) D=iv;
         else if(sscanf(line,"type: %63s",sv)==1) strncpy(typ,sv,sizeof typ-1);
     }
+    // header must terminate ("<>"), be double-typed, and have positive, bounded
+    // dims (W/H cap the W*H*3 grid alloc; D caps the per-row double buffer).
     if(!saw_term || W<1 || H<1 || D<3 || strcmp(typ,"double")!=0){ fclose(f); return -2; }
+    if(W>(1<<20) || H>(1<<20) || D>4096){ fclose(f); return -2; }
     size_t n=(size_t)W*H;
     double *row=malloc((size_t)D*sizeof(double));
     float *grid=malloc(n*3*sizeof(float));

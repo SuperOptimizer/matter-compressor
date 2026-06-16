@@ -147,6 +147,12 @@ if(MC_STANDALONE)
   target_link_libraries(mc_tiff_robust_test matter_compressor)
   add_test(NAME tiff_robust COMMAND mc_tiff_robust_test)
 
+  # surface-loader untrusted-input hardening regression (4 fuzz-found bugs: leak,
+  # unchecked realloc, OOB face index, dim overflow; tests/fuzz/mc_fuzz_surface.c).
+  add_executable(mc_surface_robust_test tests/mc_surface_robust_test.c)
+  target_link_libraries(mc_surface_robust_test matter_compressor)
+  add_test(NAME surface_robust COMMAND mc_surface_robust_test)
+
   # c3g in the .mca archive: header codec field, round-trip == CABAC, back-compat.
   add_executable(mc_c3g_archive_test tests/mc_c3g_archive_test.c)
   target_link_libraries(mc_c3g_archive_test matter_compressor)

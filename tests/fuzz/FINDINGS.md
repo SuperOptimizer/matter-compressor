@@ -107,3 +107,48 @@ clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
 Crash reproducers: `tests/fuzz/crashes/tiff/{ifd_off_overflow,zero_width}.tif`.
 `tests/mc_tiff_robust_test.c` is the permanent guard — it SEGVs under ASan on
 the pre-fix reader (verified tripwire) and passes on the fixed one.
+
+---
+
+# Fuzzing findings — surface loaders (`mc_surface.c`)
+
+> **STATUS: FIXED.** All four bugs are fixed in `src/mc_surface.c` and guarded by
+> `tests/mc_surface_robust_test` (hard ctest gate `surface_robust`, ASan/UBSan +
+> leak detection). A ~60 s libFuzzer run from valid seeds finds no crashes/leaks
+> (coverage plateaus, only corpus-reducing events).
+
+Harness: `tests/fuzz/mc_fuzz_surface.c` (libFuzzer; AFL++ via
+`scripts/fuzz.sh surface`). Seeds: `tests/fuzz/mc_fuzz_surface_seed.c` (grid
+OBJ, mesh OBJ, VC per-pixel map). Built with ASan+UBSan+leak detection. The
+three loaders parse external Vesuvius segment files and allocate from
+attacker-controlled header fields.
+
+| # | Site | Bug | Trigger |
+|---|------|-----|---------|
+| 1 | `mc_mesh_load_obj` end | memory leak | a file with no `v ` lines returns `-2` but never freed the v/vn/tri buffers allocated up front (49 KB leaked / call) |
+| 2 | `mc_mesh_load_obj` face loop | OOB triangle index | `f 1 2 999999` (or negative-relative / `0`) stored an index outside `[0,nv)` into `tri` — an OOB read for any consumer of `m->tri` |
+| 3 | `mc_surface_load_obj` | dimension-product overflow | `# grid 2000000000 2000000000` → `gw*gh*3*sizeof(float)` overflows `size_t` into an under-alloc the fill loop writes past |
+| 4 | `mc_surface_load_vcps_ppm` | dimension overflow | huge `width:`/`height:` header → same under-alloc class on the `W*H*3` grid |
+
+## The fix
+
+- bug 1: free `v`/`vn`/`tri` (and zero `*m`) on the `nv<=0` failure path.
+- bug 2: validate each face index to `[1,nv]` (1-based; negative-relative
+  resolved first) and drop out-of-range refs before emitting a triangle. Also
+  made all three `realloc` sites checked (NULL → free + bail, was a latent
+  dangling-pointer write on OOM).
+- bugs 3,4: reject non-positive / absurd dims (`> 1<<20` per axis; `dim > 4096`).
+
+## Reproduce
+
+```sh
+scripts/fuzz.sh 60 build_fuzz_surface surface   # AFL++ (seeds + crash reproducers)
+# or the deterministic regression test:
+clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+  tests/mc_surface_robust_test.c src/mc_surface.c src/mc_tiff.c -Isrc -lm \
+  -o t && ASAN_OPTIONS=detect_leaks=1 ./t
+```
+
+Crash reproducers: `tests/fuzz/crashes/surface/`. `tests/mc_surface_robust_test.c`
+is the permanent guard — it leaks + fails the tri-index assertion on the pre-fix
+loaders (verified tripwire) and passes clean on the fix.
