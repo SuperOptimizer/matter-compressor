@@ -67,6 +67,8 @@ find_path(ZSTD_INC zstd.h REQUIRED HINTS /opt/homebrew/include /usr/local/includ
 add_library(matter_compressor STATIC
   src/matter_compressor.c
   src/c3d.c
+  src/mc_tiff.c
+  src/mc_surface.c
   tools/vendor/libs3/libs3.c)
 target_include_directories(matter_compressor
   PUBLIC src PRIVATE tools/vendor/libs3 ${ZSTD_INC})
@@ -122,6 +124,16 @@ if(MC_STANDALONE)
   add_executable(mc_c3g_test tests/mc_c3g_test.c)
   target_link_libraries(mc_c3g_test matter_compressor)
   add_test(NAME c3g COMMAND mc_c3g_test)
+
+  # minimal TIFF reader/writer (all sample types + mmap-into-struct).
+  add_executable(mc_tiff_test tests/mc_tiff_test.c)
+  target_link_libraries(mc_tiff_test matter_compressor)
+  add_test(NAME tiff COMMAND mc_tiff_test)
+
+  # parametric surface I/O: 4x-f32 grid TIFF (x,y,z,depth) + OBJ + PPM.
+  add_executable(mc_surface_test tests/mc_surface_test.c)
+  target_link_libraries(mc_surface_test matter_compressor)
+  add_test(NAME surface COMMAND mc_surface_test)
 
   # c3g in the .mca archive: header codec field, round-trip == CABAC, back-compat.
   add_executable(mc_c3g_archive_test tests/mc_c3g_archive_test.c)
@@ -198,6 +210,10 @@ if(MC_STANDALONE)
 
   add_executable(mc_verify tools/mc_verify.c)
   target_link_libraries(mc_verify matter_compressor)
+
+  # render a parametric surface (4x-f32 grid TIFF) against a volume -> PPM.
+  add_executable(mc_surface_render tools/mc_surface_render.c)
+  target_link_libraries(mc_surface_render matter_compressor)
 
   add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
   target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})
