@@ -141,6 +141,12 @@ if(MC_STANDALONE)
   target_link_libraries(mc_segment_test matter_compressor)
   add_test(NAME segment COMMAND mc_segment_test)
 
+  # TIFF reader untrusted-input hardening regression (2 fuzz-found OOB/degenerate
+  # bugs; see tests/fuzz/mc_fuzz_tiff.c + tests/fuzz/FINDINGS.md).
+  add_executable(mc_tiff_robust_test tests/mc_tiff_robust_test.c)
+  target_link_libraries(mc_tiff_robust_test matter_compressor)
+  add_test(NAME tiff_robust COMMAND mc_tiff_robust_test)
+
   # c3g in the .mca archive: header codec field, round-trip == CABAC, back-compat.
   add_executable(mc_c3g_archive_test tests/mc_c3g_archive_test.c)
   target_link_libraries(mc_c3g_archive_test matter_compressor)

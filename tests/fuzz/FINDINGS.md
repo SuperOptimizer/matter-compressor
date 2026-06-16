@@ -59,3 +59,51 @@ lands, then promoted to a hard gate.
   `MCH_METAOFF+METALEN`) lies within `[MC_HDR, len]` before use.
 - `mc_resolve_chunk`: bound each `node`/`childoff` to `node + MC_GRID3*8 <= len`.
 - `mc_verify_archive`: use its `len` argument to bound the walk and each blob.
+
+---
+
+# Fuzzing findings — TIFF reader (`mc_tiff_open`)
+
+> **STATUS: FIXED.** Both bugs are fixed in `src/mc_tiff.c` and guarded by
+> `tests/mc_tiff_robust_test` (hard ctest gate `tiff_robust`, run under
+> ASan/UBSan). A fresh ~45 s libFuzzer run from valid seeds finds no crashes
+> (coverage plateaus, only corpus-reducing events).
+
+Harness: `tests/fuzz/mc_fuzz_tiff.c` (libFuzzer entrypoint; also driven by
+AFL++ via `scripts/fuzz.sh tiff`). Seeds: `tests/fuzz/mc_fuzz_tiff_seed.c`
+(one valid TIFF per supported sample type/count). Built with ASan+UBSan.
+
+`mc_tiff_open` parses an **untrusted file**: it mmaps the bytes, walks the IFD,
+and on success hands back `out->pixels` as a raw pointer INTO the mmap that
+callers cast to typed structs (`const float (*)[4]`, etc.). The contract: for
+ANY bytes it must reject cleanly or return a view fully inside the mapping. A
+~45 s libFuzzer run from valid seeds found two violations within ~1600 execs.
+
+| # | Site | Bug | Trigger |
+|---|------|-----|---------|
+| 1 | `mc_tiff.c:67,69` | 32-bit integer overflow in the IFD-offset bounds check | `ifd_off` near `UINT32_MAX`: `ifd_off+2 > len` is computed in `uint32_t`, wraps to a small value, **passes** the check, then `rd16(b+ifd_off)` reads ~4 GB past the mmap base → SEGV / OOB read |
+| 2 | `mc_tiff.c:85` | no positive-dimension check | `ImageWidth` or `ImageLength` = 0 was accepted; the reader returns a zero-length-strip view a consumer (`mc_surface_load_tiff`) divides by / indexes past |
+
+**Root cause:** mixed-width arithmetic in offset bounds checks (`uint32_t` file
+offset `+` small constant, compared to `size_t len`, without promoting the LHS),
+and validating sample/strip geometry but not the image dimensions themselves.
+
+## The fix
+
+- Promote the offset before the add: `if((size_t)ifd_off+2 > len) ...` (and the
+  same for the `ifd_off + 2 + n*12 + 4` IFD-extent check). The other offset
+  checks (`(size_t)off+2`, `(size_t)soff + pixbytes`) already cast the LHS.
+- Reject non-positive / absurd dimensions: `if(w==0||h==0||w>(1<<20)||h>(1<<20)) goto done;`.
+
+## Reproduce
+
+```sh
+scripts/fuzz.sh 60 build_fuzz_tiff tiff      # AFL++ campaign (seeds + crash reproducers)
+# or the deterministic regression test (constructs both malformed files directly):
+clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+  tests/mc_tiff_robust_test.c src/mc_tiff.c -Isrc -o t && ./t
+```
+
+Crash reproducers: `tests/fuzz/crashes/tiff/{ifd_off_overflow,zero_width}.tif`.
+`tests/mc_tiff_robust_test.c` is the permanent guard — it SEGVs under ASan on
+the pre-fix reader (verified tripwire) and passes on the fixed one.

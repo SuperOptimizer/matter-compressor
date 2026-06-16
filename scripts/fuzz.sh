@@ -27,10 +27,13 @@ CC="$AFL_DIR/afl-clang-fast"
 SRC=(src/matter_compressor.c src/c3d.c tools/vendor/libs3/libs3.c)
 INC=(-Isrc -Itools/vendor/libs3)
 LIBS=(-lm -lpthread -lzstd -lcurl)
+SEEDGEN=""
 case "$TARGET" in
   decode) HARNESS=tests/fuzz/mc_fuzz_decode.c; SEEDGEN=tests/fuzz/mc_fuzz_seed.c;;
   block)  HARNESS=tests/fuzz/mc_fuzz_block.c;  SEEDGEN=tests/fuzz/mc_fuzz_block_seed.c;;
-  *) echo "unknown target '$TARGET' (decode|block)"; exit 2;;
+  tiff)   HARNESS=tests/fuzz/mc_fuzz_tiff.c;   SEEDGEN=tests/fuzz/mc_fuzz_tiff_seed.c
+          SRC=(src/mc_tiff.c); LIBS=(-lm);;   # self-contained reader, no archive/libs3 deps
+  *) echo "unknown target '$TARGET' (decode|block|tiff)"; exit 2;;
 esac
 
 rm -rf "$OUT"; mkdir -p "$OUT/corpus" "$OUT/findings"
@@ -39,6 +42,10 @@ cd "$ROOT"
 # 1. seed generator (plain clang — emits valid inputs for the chosen target).
 clang -O1 -w "${INC[@]}" "$SEEDGEN" "${SRC[@]}" "${LIBS[@]}" -o "$OUT/seedgen"
 "$OUT/seedgen" "$OUT/corpus"
+# carry the known crash reproducers into the corpus so regressions stay covered.
+if [ -d "tests/fuzz/crashes/$TARGET" ]; then
+  cp tests/fuzz/crashes/"$TARGET"/* "$OUT/corpus/" 2>/dev/null || true
+fi
 
 # 2. AFL++-instrumented harness, ASan+UBSan. afl-clang-fast intercepts
 #    -fsanitize=fuzzer and links its own driver (libAFLDriver.a) around the

@@ -64,9 +64,9 @@ int mc_tiff_open(const char *path, mc_tiff *out){
     // header: "II" 0x2A <ifd_off>. We only read little-endian classic TIFF.
     if(!(b[0]=='I' && b[1]=='I' && rd16(b+2)==42)) goto done;
     uint32_t ifd_off = rd32(b+4);
-    if(ifd_off+2 > len) goto done;
+    if((size_t)ifd_off+2 > len) goto done;        // size_t add: ifd_off is u32, +2 must not wrap
     int n = rd16(b+ifd_off);
-    if(ifd_off + 2 + (size_t)n*12 + 4 > len) goto done;
+    if((size_t)ifd_off + 2 + (size_t)n*12 + 4 > len) goto done;
     const uint8_t *ifd = b + ifd_off;
 
     int f;
@@ -81,8 +81,12 @@ int mc_tiff_open(const char *path, mc_tiff *out){
     uint32_t pc  = ifd_get(b,ifd,n,len,T_PLANARCONFIG,&f); if(!f) pc=1;
 
     // we only support: uncompressed, single strip (rows_per_strip >= height),
-    // chunky (planar==1), 1..4 samples, supported (bps,sampleformat).
+    // chunky (planar==1), 1..4 samples, supported (bps,sampleformat). Dimensions
+    // must be positive and bounded — a 0-width/height image is degenerate (empty
+    // strip a consumer would divide by / index past), and INT_MAX-scale dims
+    // would overflow the int fields of mc_tiff. Cap at a generous 1<<20 per axis.
     if(comp!=1 || pc!=1 || spp<1 || spp>4 || rps<h) goto done;
+    if(w==0 || h==0 || w>(1u<<20) || h>(1u<<20)) goto done;
     mc_tiff_type ty;
     if      (bps==8  && sf==SF_UINT)   ty=MC_TIFF_U8;
     else if (bps==16 && sf==SF_UINT)   ty=MC_TIFF_U16;
