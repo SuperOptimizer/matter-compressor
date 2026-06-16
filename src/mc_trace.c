@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 // ---- grid container; also owns the small per-term context allocations -------
 typedef struct { void **ptr; int n, cap; } ctx_arena;
@@ -186,6 +187,169 @@ int mc_trace_add_sdir(mc_problem *prob, mc_surf_grid *g, int bP,int bU,int bV, d
     // Cauchy-robustify (VC3D uses CauchyLoss(1.0) on SDIR) to tolerate the
     // occasional badly-stretched cell during growth.
     return mc_problem_add(prob,sdir_eval,C,1,3,(int[]){bP,bU,bV},1.0);
+}
+
+// ---- growth orchestration ---------------------------------------------------
+void mc_grow_opts_default(mc_grow_opts *o){
+    o->w_dist=1.0; o->w_straight=0.5; o->w_sdir=1.0;
+    o->radius=3; o->max_gen=100000; o->accept_resid=0.5; o->verbose=0;
+    o->vol_fn=NULL; o->vol_user=NULL; o->vol_weight=1.0;
+}
+
+// single-block volume residual adapter (wraps the caller's vol_fn).
+typedef struct { int (*fn)(void*,const double*,double*,double*); void *user; double w; } vol_ctx;
+static int vol_eval(void *u, const double *const *pr, double *res, double *const *jac){
+    vol_ctx *C=u; const double *x=pr[0];
+    double r=0, g[3]={0,0,0};
+    if(C->fn(C->user,x,&r,(jac&&jac[0])?g:NULL)!=0) return 1;
+    res[0]=C->w*r;
+    if(jac&&jac[0]){ jac[0][0]=C->w*g[0]; jac[0][1]=C->w*g[1]; jac[0][2]=C->w*g[2]; }
+    return 0;
+}
+
+#define CGV(g,r,c) ((r)>=0&&(c)>=0&&(r)<(g)->gh&&(c)<(g)->gw && !isnan((g)->p[((size_t)(r)*(g)->gw+(c))*3]))
+#define CP(g,r,c) ((g)->p+((size_t)(r)*(g)->gw+(c))*3)
+
+// Initialize an invalid cell (r,c) from valid neighbors: prefer linear
+// extrapolation across a valid pair (c-1,c-2 / c+1,c+2 / rows), else mirror a
+// single neighbor by one grid step along the perpendicular tangent. Returns 1
+// if it produced an estimate, 0 if no usable neighbor.
+static int init_candidate(const mc_surf_grid *g, int r, int c, double out[3]){
+    // try linear extrapolation along each of the 4 axes
+    const int dirs[4][2]={{0,-1},{0,1},{-1,0},{1,0}};
+    double acc[3]={0,0,0}; int n=0;
+    for(int k=0;k<4;++k){
+        int dr=dirs[k][0], dc=dirs[k][1];
+        int r1=r+dr, c1=c+dc, r2=r+2*dr, c2=c+2*dc;
+        if(CGV(g,r1,c1) && CGV(g,r2,c2)){
+            const double *p1=CP(g,r1,c1), *p2=CP(g,r2,c2);
+            for(int i=0;i<3;++i) acc[i]+= 2.0*p1[i]-p2[i];   // p1 + (p1-p2)
+            n++;
+        }
+    }
+    if(n){ for(int i=0;i<3;++i) out[i]=acc[i]/n; return 1; }
+    // fall back: single valid neighbor + offset by `unit` along a perpendicular
+    // grid tangent (estimated from any valid second-order neighbor pair), else
+    // just step away from the neighbor by `unit` in a stable axis.
+    for(int k=0;k<4;++k){
+        int dr=dirs[k][0], dc=dirs[k][1];
+        int r1=r+dr, c1=c+dc;
+        if(CGV(g,r1,c1)){
+            const double *p1=CP(g,r1,c1);
+            // tangent along the perpendicular axis if available
+            int pr=(dr==0)?1:0, pc=(dc==0)?1:0;          // perpendicular unit
+            double tang[3]={0,0,0}; int have=0;
+            if(CGV(g,r1+pr,c1+pc)){ const double*q=CP(g,r1+pr,c1+pc); for(int i=0;i<3;++i) tang[i]=q[i]-p1[i]; have=1; }
+            else if(CGV(g,r1-pr,c1-pc)){ const double*q=CP(g,r1-pr,c1-pc); for(int i=0;i<3;++i) tang[i]=p1[i]-q[i]; have=1; }
+            // outward direction = -(neighbor->cell) i.e. from neighbor toward cell
+            // we don't know the 3D outward dir; reuse the in-plane step magnitude
+            (void)have;
+            for(int i=0;i<3;++i) out[i]=p1[i];            // start at the neighbor
+            // nudge along tangent by unit so the new cell isn't coincident
+            double tl=sqrt(tang[0]*tang[0]+tang[1]*tang[1]+tang[2]*tang[2]);
+            if(tl>1e-9){ for(int i=0;i<3;++i) out[i]+= g->unit*tang[i]/tl; }
+            else out[0]+=g->unit;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int mc_trace_grow(mc_surf_grid *g, const mc_grow_opts *opts, mc_grow_report *rep){
+    if(!g) return -1;
+    mc_grow_opts o; if(opts) o=*opts; else mc_grow_opts_default(&o);
+    int gw=g->gw, gh=g->gh, NB=gw*gh;
+    int added=0, rejected=0, gen=0;
+
+    // scratch: which cells are currently valid (mirrors NaN test, faster)
+    unsigned char *valid = malloc((size_t)NB);
+    if(!valid) return -1;
+    for(int i=0;i<NB;++i) valid[i] = !isnan(g->p[(size_t)i*3]);
+
+    for(gen=0; gen<o.max_gen; ++gen){
+        // collect this generation's candidates: invalid cells with >=1 valid
+        // 4-neighbor. Snapshot first (don't let this gen's adds seed the same gen).
+        int gen_added=0;
+        // simple list of candidate (r,c)
+        for(int r=0;r<gh;++r)for(int c=0;c<gw;++c){
+            if(valid[r*gw+c]) continue;
+            int has = (CGV(g,r,c-1)||CGV(g,r,c+1)||CGV(g,r-1,c)||CGV(g,r+1,c));
+            if(!has) continue;
+            // only grow cells that already had a valid neighbor at gen start:
+            // mark via a separate pass would be cleaner; here we accept that a
+            // cell filled this gen can seed an orthogonal neighbor same gen,
+            // which just speeds fill — deterministic given row-major order.
+            double init[3];
+            if(!init_candidate(g,r,c,init)){ continue; }
+            mc_surf_cell_set(g,r,c,init[0],init[1],init[2]);
+
+            // build a LOCAL problem: free cells = valid cells within `radius`
+            // of (r,c) plus the candidate; everything else frozen.
+            mc_problem *p=mc_problem_create(NB,3,g->p);
+            if(!p){ free(valid); return -1; }
+            for(int b=0;b<NB;++b) mc_problem_set_const(p,b,1);   // freeze all
+            int R=o.radius;
+            for(int rr=r-R; rr<=r+R; ++rr) for(int cc=c-R; cc<=c+R; ++cc){
+                if(rr<0||cc<0||rr>=gh||cc>=gw) continue;
+                if(rr==r&&cc==c){ mc_problem_set_const(p,rr*gw+cc,0); continue; }
+                if(valid[rr*gw+cc]) mc_problem_set_const(p,rr*gw+cc,0);
+            }
+            // add geometric terms among cells in the (radius+1) window that are
+            // valid or the candidate (so residuals touching the new cell exist).
+            #define INWIN(rr,cc) ((rr)>=r-R-1&&(rr)<=r+R+1&&(cc)>=c-R-1&&(cc)<=c+R+1&&(rr)>=0&&(cc)>=0&&(rr)<gh&&(cc)<gw)
+            #define CELLOK(rr,cc) (((rr)==r&&(cc)==c) || (CGV(g,rr,cc)))
+            for(int rr=r-R-1; rr<=r+R+1; ++rr) for(int cc=c-R-1; cc<=c+R+1; ++cc){
+                if(!INWIN(rr,cc) || !CELLOK(rr,cc)) continue;
+                int b0=rr*gw+cc;
+                if(INWIN(rr,cc+1)&&CELLOK(rr,cc+1)) mc_trace_add_dist(p,g,b0,rr*gw+cc+1,o.w_dist);
+                if(INWIN(rr+1,cc)&&CELLOK(rr+1,cc)) mc_trace_add_dist(p,g,b0,(rr+1)*gw+cc,o.w_dist);
+                if(INWIN(rr,cc-1)&&CELLOK(rr,cc-1)&&INWIN(rr,cc+1)&&CELLOK(rr,cc+1))
+                    mc_trace_add_straight(p,g,rr*gw+cc-1,b0,rr*gw+cc+1,o.w_straight);
+                if(INWIN(rr-1,cc)&&CELLOK(rr-1,cc)&&INWIN(rr+1,cc)&&CELLOK(rr+1,cc))
+                    mc_trace_add_straight(p,g,(rr-1)*gw+cc,b0,(rr+1)*gw+cc,o.w_straight);
+                if(INWIN(rr,cc+1)&&CELLOK(rr,cc+1)&&INWIN(rr+1,cc)&&CELLOK(rr+1,cc))
+                    mc_trace_add_sdir(p,g,b0,rr*gw+cc+1,(rr+1)*gw+cc,o.w_sdir);
+            }
+            #undef INWIN
+            #undef CELLOK
+            // optional volume term on just the new cell
+            if(o.vol_fn){
+                vol_ctx *vc=arena_alloc(g,sizeof *vc); if(vc){ vc->fn=o.vol_fn; vc->user=o.vol_user; vc->w=o.vol_weight;
+                    mc_problem_add(p,vol_eval,vc,1,1,(int[]){r*gw+c},0); }
+            }
+
+            mc_solve_opts so; mc_solve_opts_default(&so); so.max_iter=40;
+            mc_solve_report sr;
+            int rc_solve = mc_solve(p,&so,&sr);
+            mc_problem_free(p);
+
+            // accept test. Reject if the solve failed or produced a non-finite
+            // point, or — when a per-cell residual gate is set — if the new
+            // cell's own DIST residual to its valid neighbors is too large
+            // (its 3D spacing strayed too far from `unit`, i.e. the local fit
+            // is poor). The volume term (phase 4) tightens this into a real
+            // sheet-fit gate.
+            double *np = g->p+((size_t)(r*gw+c))*3;
+            int finite = isfinite(np[0]) && isfinite(np[1]) && isfinite(np[2]);
+            int ok = (rc_solve==0) && finite;
+            if(ok && o.accept_resid>0){
+                double worst=0; int ne=0; const int d4[4][2]={{0,-1},{0,1},{-1,0},{1,0}};
+                for(int k=0;k<4;++k){ int r1=r+d4[k][0], c1=c+d4[k][1];
+                    if(!CGV(g,r1,c1)) continue; const double *q=CP(g,r1,c1);
+                    double dx=np[0]-q[0],dy=np[1]-q[1],dz=np[2]-q[2];
+                    double L=sqrt(dx*dx+dy*dy+dz*dz);
+                    double e=fabs(L-g->unit)/g->unit; if(e>worst)worst=e; ne++; }
+                if(ne && worst > o.accept_resid) ok=0;
+            }
+            if(ok){ valid[r*gw+c]=1; added++; gen_added++; }
+            else { mc_surf_cell_invalidate(g,r,c); rejected++; }
+        }
+        if(o.verbose) fprintf(stderr,"gen %d: +%d (total %d, rej %d)\n", gen, gen_added, added, rejected);
+        if(gen_added==0) break;   // fringe exhausted / grid full
+    }
+    free(valid);
+    if(rep){ rep->generations=gen; rep->added=added; rep->rejected=rejected; }
+    return 0;
 }
 
 // ---- test hooks (mc_trace_test): expose the residual evals + a ctx builder so

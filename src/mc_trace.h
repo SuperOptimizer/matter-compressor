@@ -61,4 +61,45 @@ int mc_trace_add_straight(mc_problem *prob, mc_surf_grid *g,
 int mc_trace_add_sdir(mc_problem *prob, mc_surf_grid *g,
                       int blockP, int blockU, int blockV, double weight);
 
+// ---- growth orchestration -------------------------------------------------
+// Fringe-expansion surface growth (the role of VC3D's GrowPatch/GrowSurface).
+// Starting from the already-valid cells in `g` (the seed — at minimum a small
+// patch the caller has set), repeatedly: find invalid cells adjacent to valid
+// ones, initialize each by extrapolating from its valid neighbors, and solve a
+// LOCAL least-squares (the new cell + a radius of nearby valid cells free,
+// everything else frozen) using the geometric terms — plus, when provided, a
+// volume-data term that locks the surface onto a real sheet. A candidate is
+// accepted if its post-solve local residual is below a threshold.
+
+typedef struct {
+    double w_dist;        // DistLoss weight            (default 1.0)
+    double w_straight;    // StraightLoss weight        (default 0.5)
+    double w_sdir;        // SymmetricDirichlet weight  (default 1.0)
+    int    radius;        // local-solve free radius (cells) (default 3)
+    int    max_gen;       // max generations            (default 100000)
+    double accept_resid;  // max per-cell RMS residual to accept a candidate
+                          //                            (default 0.5; <=0 = always)
+    int    verbose;       // print per-generation progress to stderr
+
+    // Optional volume-data term (phase 4): pulls each new cell toward a sheet.
+    // If `vol_fn` is non-NULL it is added as a single-block residual on each
+    // grown cell: vol_fn(user, xyz[3], &resid, grad_or_null[3]) writes the
+    // residual value and, if grad != NULL, d(resid)/d(xyz). `vol_weight` scales
+    // it. (Left NULL in phase 3 -> pure-geometry growth in free space.)
+    int  (*vol_fn)(void *user, const double *xyz, double *resid, double *grad);
+    void  *vol_user;
+    double vol_weight;
+} mc_grow_opts;
+
+void mc_grow_opts_default(mc_grow_opts *o);
+
+typedef struct {
+    int generations;      // generations run
+    int added;            // cells accepted/added
+    int rejected;         // candidates rejected (residual too high / degenerate)
+} mc_grow_report;
+
+// Grow `g` in place. Returns 0 on success, <0 on a hard error.
+int mc_trace_grow(mc_surf_grid *g, const mc_grow_opts *opts, mc_grow_report *rep);
+
 #endif /* MC_TRACE_H */

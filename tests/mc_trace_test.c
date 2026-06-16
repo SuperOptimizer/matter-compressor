@@ -139,6 +139,34 @@ int main(void){
         mc_problem_free(p); mc_surf_grid_free(g);
     }
 
+    // ===== D. growth: seed a 3x3 patch of a z=0 plane in a 15x15 grid, grow it
+    // (geometry only). The whole grid should fill, lie exactly on z=0, and keep
+    // exact unit spacing — geometry-only growth recovers a plane perfectly. =====
+    {
+        int G=15; double U=10.0;
+        mc_surf_grid *g=mc_surf_grid_create(G,G,U);
+        int c0=G/2;
+        for(int dr=-1;dr<=1;++dr)for(int dc=-1;dc<=1;++dc)
+            mc_surf_cell_set(g,c0+dr,c0+dc,(c0+dc)*U,(c0+dr)*U,0.0);
+        mc_grow_opts o; mc_grow_opts_default(&o); o.max_gen=40; o.accept_resid=0;
+        mc_grow_report rep; CHECK(mc_trace_grow(g,&o,&rep)==0);
+        int nv=0; double zmax=0, sperr=0; int sp=0;
+        for(int r=0;r<G;++r)for(int c=0;c<G;++c){
+            if(!mc_surf_cell_valid(g,r,c)) continue; nv++;
+            double *p=g->p+((size_t)r*G+c)*3;
+            if(fabs(p[2])>zmax)zmax=fabs(p[2]);
+            if(mc_surf_cell_valid(g,r,c+1)){ double*q=g->p+((size_t)r*G+c+1)*3;
+                double d=sqrt((p[0]-q[0])*(p[0]-q[0])+(p[1]-q[1])*(p[1]-q[1])+(p[2]-q[2])*(p[2]-q[2]));
+                sperr+=fabs(d-U); sp++; } }
+        CHECK(nv==G*G);                 // grid fully filled
+        CHECK(zmax < 1e-3);             // stayed on the plane
+        CHECK(rep.rejected==0);
+        CHECK(sp && sperr/sp < 1e-3);   // exact unit spacing
+        printf("D. plane growth: filled %d/%d, max|z|=%.2e, mean|spacing-10|=%.2e\n",
+               nv, G*G, zmax, sp?sperr/sp:0);
+        mc_surf_grid_free(g);
+    }
+
     printf(fails ? "mc_trace_test: %d FAILED\n" : "mc_trace_test: OK\n", fails);
     return fails?1:0;
 }
