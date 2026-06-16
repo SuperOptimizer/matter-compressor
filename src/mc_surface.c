@@ -322,16 +322,51 @@ int mc_grid_from_mesh(const mc_mesh *m, int gw, int gh, float default_depth, mc_
     float *grid=malloc(n*3*sizeof(float)), *depth=malloc(n*sizeof(float));
     if(!grid||!depth){ free(uu);free(vv);free(grid);free(depth); return -1; }
     for(size_t i=0;i<n;++i){ grid[i*3]=-1;grid[i*3+1]=-1;grid[i*3+2]=-1; depth[i]=0; }
-    // nearest-vertex fill: for each grid cell (gu,gv) find the closest projected
-    // vertex within ~1.5 cells; copy its xyz. O(gw*gh*nv) — fine for segments.
+
+    // Nearest-vertex fill: for each grid cell find the closest projected vertex
+    // within sqrt(2.5)*cell. A brute scan is O(gw*gh*nv) (seconds-to-minutes for
+    // real segments), so bucket the vertices into a uniform SQUARE (u,v) index of
+    // side `cell` and scan only the nearby buckets per cell -> ~O(nv + gw*gh).
+    // Square buckets (independent of du!=dv) mean the search disc of radius
+    // sqrt(2.5)*cell (< 1.59*cell) is fully covered by a +/-2-bucket window, so
+    // results are identical to the brute scan. CSR layout: counts -> prefix-sum
+    // offsets -> packed ids.
+    double bsz = cell;                          // square bucket side (volume u/v units)
+    int bw = (int)((umax-umin)/bsz) + 1; if(bw<1) bw=1;
+    int bh = (int)((vmax-vmin)/bsz) + 1; if(bh<1) bh=1;
+    long nb=(long)bw*bh;
+    int *cnt=calloc((size_t)nb+1,sizeof(int));
+    int *bx=malloc((size_t)nv*sizeof(int)), *by=malloc((size_t)nv*sizeof(int));
+    if(!cnt||!bx||!by){ free(cnt);free(bx);free(by);free(uu);free(vv);free(grid);free(depth); return -1; }
+    for(int i=0;i<nv;++i){
+        int cu=(int)((uu[i]-umin)/bsz); if(cu<0)cu=0; if(cu>=bw)cu=bw-1;
+        int cv=(int)((vv[i]-vmin)/bsz); if(cv<0)cv=0; if(cv>=bh)cv=bh-1;
+        bx[i]=cu; by[i]=cv; cnt[(long)cv*bw+cu+1]++;
+    }
+    for(long b=0;b<nb;++b) cnt[b+1]+=cnt[b];    // prefix sum -> bucket offsets
+    int *ids=malloc((size_t)nv*sizeof(int)); int *cur=malloc((size_t)nb*sizeof(int));
+    if(!ids||!cur){ free(cnt);free(bx);free(by);free(ids);free(cur);free(uu);free(vv);free(grid);free(depth); return -1; }
+    for(long b=0;b<nb;++b) cur[b]=cnt[b];
+    for(int i=0;i<nv;++i){ long b=(long)by[i]*bw+bx[i]; ids[cur[b]++]=i; }
+
+    const int BR=2;                             // bucket scan radius (covers ~1.59*cell)
     for(int gy=0;gy<gh;++gy)for(int gx=0;gx<gw;++gx){
         double tu=umin+gx*du, tv=vmin+gy*dv;
         int best=-1; double bd=cell*cell*2.5;
-        for(int i=0;i<nv;++i){ double ddx=uu[i]-tu, ddy=vv[i]-tv, d2=ddx*ddx+ddy*ddy; if(d2<bd){bd=d2;best=i;} }
+        int cu=(int)((tu-umin)/bsz); if(cu<0)cu=0; if(cu>=bw)cu=bw-1;
+        int cv=(int)((tv-vmin)/bsz); if(cv<0)cv=0; if(cv>=bh)cv=bh-1;
+        for(int dvb=-BR;dvb<=BR;++dvb)for(int dub=-BR;dub<=BR;++dub){
+            int qu=cu+dub, qv=cv+dvb;
+            if(qu<0||qv<0||qu>=bw||qv>=bh) continue;
+            long b=(long)qv*bw+qu;
+            for(int t=cnt[b];t<cnt[b+1];++t){ int i=ids[t];
+                double ddx=uu[i]-tu, ddy=vv[i]-tv, d2=ddx*ddx+ddy*ddy; if(d2<bd){bd=d2;best=i;} }
+        }
         if(best>=0){ size_t gi=(size_t)gy*gw+gx;
             grid[gi*3]=m->v[best*3+2]; grid[gi*3+1]=m->v[best*3+1]; grid[gi*3+2]=m->v[best*3]; // (z,y,x)
             depth[gi]=default_depth; }
     }
+    free(cnt); free(bx); free(by); free(ids); free(cur);
     free(uu); free(vv);
     s->gw=gw; s->gh=gh; s->grid=grid; s->depth=depth; s->mean_depth=default_depth;
     return 0;
