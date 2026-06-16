@@ -84,6 +84,15 @@ target_link_libraries(mc_viewer PRIVATE matter_compressor SDL3::SDL3)
 # Nuklear + the viewer's own immediate-mode UI pull in <math.h>; nothing else.
 set_property(TARGET mc_viewer PROPERTY C_STANDARD 11)
 
+# mc_sview — pure-software multi-panel viewer (SDL_Renderer blit only, no
+# SDL_GPU / shaders / Nuklear). Shares the SDL3 dependency; CPU-renders the
+# 2x2 panel layout (surface + 3 ortho planes) into one framebuffer.
+add_executable(mc_sview ${CMAKE_SOURCE_DIR}/tools/mc_sview/mc_sview.c)
+target_include_directories(mc_sview PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(mc_sview PRIVATE -O2)
+target_link_libraries(mc_sview PRIVATE matter_compressor SDL3::SDL3 m)
+set_property(TARGET mc_sview PROPERTY C_STANDARD 11)
+
 # c3g_gpu_check — validates the GPU compute decoder against the CPU oracle
 # (mc_c3g_dec_block). Headless (SDL_VIDEODRIVER=offscreen). Built with the
 # viewer so it shares the SDL3 dependency.
