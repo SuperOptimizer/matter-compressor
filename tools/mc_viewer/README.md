@@ -78,6 +78,17 @@ system SDL3 install needed. Nuklear is the vendored single header in `vendor/`.
 | `G` | toggle CPU render vs GPU decode (c3g archives only) |
 | `3` | toggle 3D volume raycast mode (c3g archives only) |
 | `M` | in 3D mode: switch MIP vs emission-absorption |
+| `S` | toggle surface mode (when a `--surface` .grid is loaded) |
+
+### Surface mode (.grid)
+
+Pass `--surface path.grid` to load a parametric surface (the grid-native
+format: a 2D TIFF of (x,y,z,depth) — see `src/mc_surface.h`). The viewer renders
+the **flattened surface** by sampling the volume over the surface's quad
+parameterization (MIP through the per-point ±depth band) and displays it like a
+slice — pan/zoom/colormap/window-level all apply. `S` toggles between the
+surface and the slice/3D views. Convert Vesuvius segments (OBJ mesh or VC
+per-pixel `.ppm`) to `.grid` with the `mc_grid` tool, then view them here.
 
 ### GPU decode mode
 

@@ -35,6 +35,7 @@
 #include "mc_gpu_brick.h"
 
 #include "matter_compressor.h"
+#include "mc_surface.h"
 
 enum { AXIS_Z = 0, AXIS_Y = 1, AXIS_X = 2 };
 
@@ -74,6 +75,13 @@ typedef struct {
     float        cam_dist;            /* camera distance (in voxel units) */
     int          ray_comp;            /* MC_RAY_MIP or MC_RAY_EA */
     int          ray_lod;             /* LOD currently paged into the brick cache */
+
+    /* surface mode (.grid parametric surface) */
+    mc_surface   surf;                /* loaded surface (grid + depth), or {0} */
+    int          surf_loaded;         /* 1 if a .grid was loaded */
+    int          surf_mode;           /* 1 = render the surface (else slice) */
+    float        surf_x0, surf_y0;    /* grid-space pan origin (grid cells) */
+    float        surf_step;           /* grid cells per pixel (1 = native) */
 
     atomic_int   dirty;              /* set by ready_cb -> repaint slice */
 } viewer;
@@ -163,6 +171,44 @@ static void render_slice(viewer *v) {
 
     /* Hand the colormapped slice to the GPU frontend (it owns the texture and
      * recreates it on size change). */
+    if (v->gpu) mc_gpu_upload_slice(v->gpu, v->argb, iw, ih);
+}
+
+/* Render the loaded .grid surface (the flattened parametric surface) to the
+ * display buffer, mirroring render_slice but sampling the volume over the
+ * surface quad. The per-point depth drives a MAX composite through the local
+ * +-depth band, so the rendered image is the "flattened sheet" view. Output
+ * size = the surface grid resampled by surf_step. */
+static void render_surface(viewer *v) {
+    if (!v->surf_loaded) return;
+    mc_quad q = mc_surface_quad(&v->surf);
+    if (v->surf_step <= 0) v->surf_step = 1.0f;
+    // image covers the whole grid at the chosen density (cells/px = step).
+    int iw = (int)ceilf(v->surf.gw / v->surf_step);
+    int ih = (int)ceilf(v->surf.gh / v->surf_step);
+    if (iw < 1) iw = 1;
+    if (ih < 1) ih = 1;
+    if (iw != v->img_w || ih != v->img_h || !v->vals) {
+        free(v->vals); free(v->argb);
+        v->img_w = iw; v->img_h = ih;
+        v->vals = (uint8_t *)malloc((size_t)iw * ih);
+        v->argb = (uint32_t *)malloc((size_t)iw * ih * 4);
+    }
+    if (!v->vals || !v->argb) return;
+
+    mc_render_params rp;
+    memset(&rp, 0, sizeof(rp));
+    rp.filter = MC_FILTER_TRILINEAR;
+    // composite through the surface's local slab (+-mean depth) with MIP, so the
+    // flattened sheet shows ink/material through its thickness.
+    float d = v->surf.mean_depth > 0 ? v->surf.mean_depth : 1.0f;
+    rp.comp = MC_COMP_MAX; rp.t0 = -d; rp.t1 = d; rp.dt = 1.0f;
+
+    mc_render_quad_lod(&v->lods, &q, v->surf_x0, v->surf_y0, v->surf_step,
+                       iw, ih, &rp, v->vals, v->nthreads);
+
+    mc_colormap_lut(v->lut, v->win_low / 255.0f, v->win_high / 255.0f, v->cmap);
+    mc_colormap_apply(v->vals, iw, ih, v->lut, v->argb, iw);
     if (v->gpu) mc_gpu_upload_slice(v->gpu, v->argb, iw, ih);
 }
 
@@ -289,16 +335,23 @@ static void build_orbit_ivp(int vx,int vy,int vz, float az,float el,float dist,
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
+    // positional: <url-or-path> [cache_dir]; option: --surface <path.grid>.
+    const char *url = NULL, *cache_dir = NULL, *surf_path = NULL;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--surface") && i+1 < argc) surf_path = argv[++i];
+        else if (!url) url = argv[i];
+        else if (!cache_dir) cache_dir = argv[i];
+    }
+    if (!url) {
         fprintf(stderr,
-            "usage: %s <url-or-path> [cache_dir]\n"
+            "usage: %s <url-or-path> [cache_dir] [--surface path.grid]\n"
             "  url-or-path : .mca / zarr directory / s3:// / https://\n"
-            "  cache_dir   : local cache for streamed volumes (default ./mc_cache)\n",
+            "  cache_dir   : local cache for streamed volumes (default ./mc_cache)\n"
+            "  --surface   : a .grid parametric surface to render ('S' toggles)\n",
             argv[0]);
         return 2;
     }
-    const char *url = argv[1];
-    const char *cache_dir = (argc > 2) ? argv[2] : "./mc_cache";
+    if (!cache_dir) cache_dir = "./mc_cache";
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -311,7 +364,19 @@ int main(int argc, char **argv) {
     V.win_low = 0; V.win_high = 255;
     V.cmap = 0;
     V.nthreads = 0;   /* 0 -> renderer picks */
+    V.surf_step = 1.0f;
     atomic_store(&V.dirty, 1);
+
+    /* optional .grid parametric surface. */
+    if (surf_path) {
+        if (mc_surface_load_tiff(surf_path, &V.surf) == 0) {
+            V.surf_loaded = 1; V.surf_mode = 1;   /* default to showing it */
+            fprintf(stderr, "surface %dx%d grid loaded (mean depth %.2f)\n",
+                    V.surf.gw, V.surf.gh, V.surf.mean_depth);
+        } else {
+            fprintf(stderr, "warning: failed to load surface %s\n", surf_path);
+        }
+    }
 
     /* mc_volume_open writes <cache_dir>/<name>.mca but does not create the
      * directory itself — make sure it exists first. */
@@ -400,6 +465,11 @@ int main(int argc, char **argv) {
             if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_M && V.ray_mode) {
                 V.ray_comp = (V.ray_comp == MC_RAY_MIP) ? MC_RAY_EA : MC_RAY_MIP;
                 fprintf(stderr, "3D composite: %s\n", V.ray_comp==MC_RAY_MIP?"MIP":"emission-absorption");
+            }
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_S && V.surf_loaded) {
+                V.surf_mode = !V.surf_mode;
+                atomic_store(&V.dirty, 1);
+                fprintf(stderr, "surface mode: %s\n", V.surf_mode ? "ON" : "OFF");
             }
             if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                 e.button.button == SDL_BUTTON_RIGHT) dragging = 1;
@@ -494,21 +564,29 @@ int main(int argc, char **argv) {
                     nk_label(nk, "3D raycast: off  ('3' toggles)", NK_TEXT_LEFT);
                 }
             }
+            if (V.surf_loaded) {
+                snprintf(info, sizeof(info), "surface: %s  %dx%d ('S' toggles)",
+                         V.surf_mode ? "ON" : "off", V.surf.gw, V.surf.gh);
+                nk_label(nk, info, NK_TEXT_LEFT);
+            }
         }
         nk_end(nk);
 
-        /* --- (re)render slice if dirty (uploads to the GPU texture) --- */
+        /* --- (re)render the displayed image if dirty (uploads to the texture).
+         * In surface mode this renders the .grid surface; otherwise the slice.
+         * (Both feed the same blit; the 3D raycast branch below overrides.) --- */
+        int surf_active = V.surf_mode && V.surf_loaded && !V.ray_mode;
         if (atomic_exchange(&V.dirty, 0)) {
-            render_slice(&V);
+            if (surf_active) render_surface(&V); else render_slice(&V);
 
             /* MC_VIEWER_DUMP=path.ppm: re-render once with a BLOCKING sample
              * source (so absent regions transcode synchronously instead of
-             * sampling 0), write the slice as PPM, and exit. Headless
+             * sampling 0), write the image as PPM, and exit. Headless
              * verification path — no display / swapchain needed. */
             const char *dump = SDL_getenv("MC_VIEWER_DUMP");
             if (dump && V.vals && V.argb) {
                 V.lods = mc_volume_sample_lods(V.vol, /*blocking=*/1);
-                render_slice(&V);
+                if (surf_active) render_surface(&V); else render_slice(&V);
                 long nz = 0, mn = 256, mx = -1;
                 for (int i = 0; i < V.img_w * V.img_h; i++) {
                     int g = V.vals[i];
@@ -570,7 +648,7 @@ int main(int argc, char **argv) {
                                     V.ray_comp, /*alpha_min=*/0.08f, /*absorption=*/3.0f);
                 mc_gpu_frame_end_nuklear(V.gpu, cmd, swap, ow, oh);
             }
-        } else if (V.gpu_mode && V.gvol) {
+        } else if (V.gpu_mode && V.gvol && !surf_active) {
             /* GPU decode+sample path: gather the visible slab's COMPRESSED c3g
              * blocks, upload, and let the GPU decode + sample the slice, then
              * draw Nuklear over it in a second (LOAD) pass. */
@@ -591,10 +669,13 @@ int main(int argc, char **argv) {
                 mc_gpu_frame_end_nuklear(V.gpu, cmd, swap, ow, oh);
             }
         } else {
-            /* CPU render + GPU blit path (default). On screen the whole slice
-             * spans (slice voxels * zoom) px, independent of the texture res. */
-            int al2, vw, vh; axis_extent(&V, &al2, &vw, &vh);
-            mc_gpu_render(V.gpu, vw * V.zoom, vh * V.zoom, V.pan_x, V.pan_y,
+            /* CPU render + GPU blit path. On-screen size = source extent * zoom,
+             * independent of the texture's pixel count. Surface mode uses the
+             * grid extent; slice mode the volume's in-plane extent. */
+            float ew, eh;
+            if (surf_active) { ew = (float)V.surf.gw; eh = (float)V.surf.gh; }
+            else { int al2, vw, vh; axis_extent(&V, &al2, &vw, &vh); ew=(float)vw; eh=(float)vh; }
+            mc_gpu_render(V.gpu, ew * V.zoom, eh * V.zoom, V.pan_x, V.pan_y,
                           /*gain=*/1.0f, /*bias=*/0.0f);
         }
 
@@ -609,6 +690,7 @@ int main(int argc, char **argv) {
     if (V.gvol) mc_gpu_vol_destroy(V.gvol);
     mc_gpu_destroy(V.gpu);
     SDL_DestroyWindow(win);
+    if (V.surf_loaded) mc_surface_free(&V.surf);
     mc_volume_free(V.vol);
     free(V.vals); free(V.argb);
     SDL_Quit();
