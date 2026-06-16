@@ -73,6 +73,7 @@ typedef struct {
     float        cam_az, cam_el;      /* orbit camera azimuth/elevation (radians) */
     float        cam_dist;            /* camera distance (in voxel units) */
     int          ray_comp;            /* MC_RAY_MIP or MC_RAY_EA */
+    int          ray_lod;             /* LOD currently paged into the brick cache */
 
     atomic_int   dirty;              /* set by ready_cb -> repaint slice */
 } viewer;
@@ -222,11 +223,12 @@ static int gather_slab(viewer *v, int *out_gz,int *out_gy,int *out_gx,
  * origin, LOD0) into the raycaster's dense 3D volume. Same per-block read as
  * gather_slab. Returns 1 + region block dims in *gz/*gy/*gx. */
 #define MC_RAY_WIN 8    /* region block cube edge (8 blocks = 128 voxels) */
-static int gather_region(viewer *v, int *out_gz,int *out_gy,int *out_gx,
+static int gather_region(viewer *v, int lod, int *out_gz,int *out_gy,int *out_gx,
                          const uint8_t **blobs, uint32_t *lens, uint8_t *scratch4096){
     mc_archive *arc = mc_volume_archive(v->vol);
     if(!arc) return 0;
-    int bgz,bgy,bgx; mc_volume_block_grid(v->vol, 0, &bgz,&bgy,&bgx);
+    if(lod<0) lod=0; if(lod>=v->nlods) lod=v->nlods-1;
+    int bgz,bgy,bgx; mc_volume_block_grid(v->vol, lod, &bgz,&bgy,&bgx);
     int gz = bgz<MC_RAY_WIN?bgz:MC_RAY_WIN;
     int gy = bgy<MC_RAY_WIN?bgy:MC_RAY_WIN;
     int gx = bgx<MC_RAY_WIN?bgx:MC_RAY_WIN;
@@ -235,8 +237,8 @@ static int gather_region(viewer *v, int *out_gz,int *out_gy,int *out_gx,
     for(int Bz=0; Bz<gz; ++Bz) for(int By=0; By<gy; ++By) for(int Bx=0; Bx<gx; ++Bx){
         int i = (Bz*gy + By)*gx + Bx;
         blobs[i]=NULL; lens[i]=0;
-        mc_volume_get_block(v->vol, 0, Bz,By,Bx, scratch4096);
-        uint64_t co = mc_archive_chunk_offset(arc, 0, Bz>>4,By>>4,Bx>>4);
+        mc_volume_get_block(v->vol, lod, Bz,By,Bx, scratch4096);
+        uint64_t co = mc_archive_chunk_offset(arc, lod, Bz>>4,By>>4,Bx>>4);
         if(!co) continue;
         const uint8_t *p=NULL; uint32_t l=0;
         if(mc_archive_block_blob(arc, co, Bz&15,By&15,Bx&15, &p, &l)){ blobs[i]=p; lens[i]=l; }
@@ -485,8 +487,8 @@ int main(int argc, char **argv) {
             }
             if (V.gbrick) {
                 if (V.ray_mode) {
-                    snprintf(info, sizeof(info), "3D raycast: %s ('3' off, 'M' mode, drag/wheel)",
-                             V.ray_comp==MC_RAY_MIP ? "MIP" : "emission-absorption");
+                    snprintf(info, sizeof(info), "3D raycast: %s  LOD %d ('3'/'M', drag/wheel)",
+                             V.ray_comp==MC_RAY_MIP ? "MIP" : "EA", V.ray_lod);
                     nk_label(nk, info, NK_TEXT_LEFT);
                 } else {
                     nk_label(nk, "3D raycast: off  ('3' toggles)", NK_TEXT_LEFT);
@@ -537,14 +539,21 @@ int main(int argc, char **argv) {
              * compressed c3g blocks (once, when dirty), page in the resident
              * (non-air) bricks to the atlas, then raycast walking the page table
              * (air bricks skipped). Composite with Nuklear. */
-            if (atomic_exchange(&V.dirty, 0) || !V.ray_loaded) {
+            /* Distance LOD: farther camera -> coarser level. cam_dist is in
+             * LOD0 voxels; pick LOD so the region stays roughly constant on
+             * screen. Re-page when the LOD changes or on dirty. */
+            int want_lod = 0; { float d=V.cam_dist; while(d > 256.0f && want_lod < V.nlods-1){ d*=0.5f; want_lod++; } }
+            if (atomic_exchange(&V.dirty, 0) || !V.ray_loaded || want_lod != V.ray_lod) {
                 static const uint8_t *rblobs[MC_RAY_WIN*MC_RAY_WIN*MC_RAY_WIN];
                 static uint32_t       rlens[MC_RAY_WIN*MC_RAY_WIN*MC_RAY_WIN];
                 static uint8_t        rscratch[4096];
                 int gz,gy,gx, nres=0;
-                if (gather_region(&V,&gz,&gy,&gx,rblobs,rlens,rscratch) &&
-                    mc_gpu_brick_page(V.gbrick,0,0,0,gz,gy,gx,rblobs,rlens,&nres)) {
-                    V.rgz=gz; V.rgy=gy; V.rgx=gx; V.ray_loaded=1;
+                // key bricks by LOD too: separate keyspaces so a LOD switch
+                // doesn't alias the previous level's residency. (oz offset).
+                int koff = want_lod * 100000;
+                if (gather_region(&V,want_lod,&gz,&gy,&gx,rblobs,rlens,rscratch) &&
+                    mc_gpu_brick_page(V.gbrick,koff,0,0,gz,gy,gx,rblobs,rlens,&nres)) {
+                    V.rgz=gz; V.rgy=gy; V.rgx=gx; V.ray_loaded=1; V.ray_lod=want_lod;
                 }
             }
             mc_gpu_brick_set_lut(V.gbrick, V.lut);
