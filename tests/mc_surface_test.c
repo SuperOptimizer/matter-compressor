@@ -178,7 +178,19 @@ int main(void){
         CHECK(mc_grid_from_mesh(&m, 0, 0, 2.0f, &g2)==0);
         CHECK(g2.gw>0 && g2.gh>0);
         printf("grid_from_mesh auto-res: %d verts -> %dx%d grid\n", m.nv, g2.gw, g2.gh);
-        mc_surface_free(&g); mc_surface_free(&g2); mc_mesh_free(&m);
+        mc_surface_free(&g); mc_surface_free(&g2);
+
+        // mc_mesh_save_obj WITH per-vertex normals (the "f a//a" face form) +
+        // reload round-trip. Attach a normal per vertex first.
+        m.vn=malloc((size_t)m.nv*3*sizeof(float));
+        for(int vi=0;vi<m.nv;++vi){ m.vn[vi*3]=0; m.vn[vi*3+1]=0; m.vn[vi*3+2]=1; }
+        CHECK(mc_mesh_save_obj("/tmp/mc_mesh_n.obj",&m)==0);
+        mc_mesh rm;
+        CHECK(mc_mesh_load_obj("/tmp/mc_mesh_n.obj",&rm)==0);
+        CHECK(rm.nv==m.nv && rm.nt==m.nt);
+        CHECK(rm.vn!=NULL);                 // normals survived the round-trip
+        printf("mesh_save_obj w/normals: nv=%d nt=%d, normals round-tripped\n", rm.nv, rm.nt);
+        mc_mesh_free(&rm); mc_mesh_free(&m);
     }
 
     mc_surface_free(&s); mc_surface_free(&r); mc_surface_free(&o);

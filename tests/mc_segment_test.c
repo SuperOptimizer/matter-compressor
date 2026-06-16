@@ -38,6 +38,29 @@ int main(void){
     CHECK(on_sheet > sheet_tot*3/4);
     CHECK(off_sheet < bg_tot/10);
 
+    // ---- detector on a TILTED sheet ----
+    // The axis-aligned sheet above produces a diagonal structure tensor, which
+    // only exercises eig3sym's degenerate (p1~0) branch. A 45-degree sheet in
+    // the x-z plane (bright where x+z is near a constant) yields off-diagonal
+    // tensor terms, driving the general closed-form (acos/cos) eigenvalue path.
+    // It must still read as planar and be detected.
+    memset(vol,0,n);
+    for(int z=0;z<NZ;++z)for(int y=0;y<NY;++y)for(int x=0;x<NX;++x){
+        int onsheet = (x+z==38 || x+z==39);   // a 2-thick diagonal slab
+        vol[IDX(z,y,x)] = onsheet ? 220 : 40;
+    }
+    CHECK(mc_seg_detect(vol,NZ,NY,NX,&P,mask)==0);
+    long ton=0, ttot=0, tfalse=0;
+    for(int z=0;z<NZ;++z)for(int y=0;y<NY;++y)for(int x=0;x<NX;++x){
+        int onsheet = (x+z==38 || x+z==39);
+        if(onsheet){ ttot++; if(mask[IDX(z,y,x)]) ton++; }
+        // count false positives well away from the diagonal band.
+        else if(x+z<36 || x+z>41){ if(mask[IDX(z,y,x)]) tfalse++; }
+    }
+    printf("detect tilted: sheet %ld/%ld on, %ld far-field false\n", ton, ttot, tfalse);
+    CHECK(ton > ttot/2);          // most of the tilted sheet detected
+    CHECK(tfalse < ttot/4);       // little spurious detection off the band
+
     // ---- remove_small: add a 3-voxel speck, ensure it's removed (min 100) ----
     memset(mask,0,n);
     for(int x=10;x<30;++x)for(int y=10;y<30;++y) mask[IDX(18,y,x)]=255;   // a 400-vox sheet patch

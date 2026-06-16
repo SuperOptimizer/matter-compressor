@@ -45,7 +45,8 @@ static int try_open(const uint8_t *bytes, size_t n) {
 // build a minimal single-IFD little-endian TIFF with the given width/height
 // (LONG tags) into buf; ntag tags, pixel strip at offset 8. Returns total len.
 // `ifd_off_override` (if nonzero) replaces the header's IFD offset (poison).
-static size_t build_tiff(uint8_t *buf, uint32_t w, uint32_t h, uint32_t ifd_off_override) {
+// `bps` is the BitsPerSample value to advertise (8 = the normal u8 case).
+static size_t build_tiff_bps(uint8_t *buf, uint32_t w, uint32_t h, uint32_t ifd_off_override, int bps) {
     // 8B header + 64B pixel area + IFD.
     uint32_t pix_off = 8, pix_bytes = 64;     // generous strip
     uint32_t ifd_off = pix_off + pix_bytes;   // 72
@@ -59,7 +60,7 @@ static size_t build_tiff(uint8_t *buf, uint32_t w, uint32_t h, uint32_t ifd_off_
     #define T_SHORT(tag,val) do{ w16(e,(tag)); w16(e+2,3); w32(e+4,1); w16(e+8,(uint16_t)(val)); w16(e+10,0); e+=12; }while(0)
     T_LONG (256, w);          // ImageWidth
     T_LONG (257, h);          // ImageLength
-    T_SHORT(258, 8);          // BitsPerSample
+    T_SHORT(258, bps);        // BitsPerSample
     T_SHORT(259, 1);          // Compression = none
     T_SHORT(262, 1);          // Photometric
     T_LONG (273, pix_off);    // StripOffsets
@@ -70,6 +71,9 @@ static size_t build_tiff(uint8_t *buf, uint32_t w, uint32_t h, uint32_t ifd_off_
     #undef T_SHORT
     w32(e, 0); e += 4;        // next IFD = 0
     return (size_t)(e - buf);
+}
+static size_t build_tiff(uint8_t *buf, uint32_t w, uint32_t h, uint32_t ifd_off_override) {
+    return build_tiff_bps(buf, w, h, ifd_off_override, 8);
 }
 
 int main(void) {
@@ -122,6 +126,13 @@ int main(void) {
         rc = try_open(tiny, sizeof tiny);
         CHECK(rc < 0);
         printf("4-byte file: rc=%d %s\n", rc, rc<0?"rejected":"ACCEPTED!");
+
+        // unsupported sample width (bps=4): the reader only maps 8/16/32-bit
+        // types and must reject anything else (the type-dispatch else-branch).
+        n = build_tiff_bps(buf, 8, 8, 0, 4);
+        rc = try_open(buf, n);
+        CHECK(rc < 0);
+        printf("unsupported bps=4: rc=%d %s\n", rc, rc<0?"rejected":"ACCEPTED!");
     }
 
     printf(fails ? "mc_tiff_robust_test: %d FAILED\n" : "mc_tiff_robust_test: OK\n", fails);
