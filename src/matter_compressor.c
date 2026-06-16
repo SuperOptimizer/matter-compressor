@@ -7820,29 +7820,49 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     // Local vs remote: a URL with a "scheme://" is remote (s3/https), otherwise
     // `url` is a local filesystem directory read via file_read (no S3 client).
     v->local = (strstr(url, "://") == NULL);
-    if (!v->local) {
-        // s3 client: full credential resolution (profile/IMDS/SSO/env), else anonymous.
-        s3_config cfg = {0};
-        s3_credentials creds = {0};
-        if (s3_credentials_load(NULL, &creds) == S3_OK) cfg.creds = creds;
-        v->s3 = s3_client_new(&cfg);
-        s3_credentials_free(&creds);
-        if (!v->s3) { free(v); return NULL; }
-    }
     mc_zarr_read_fn read_cb = v->local ? file_read : s3_read;
 
     snprintf(v->root, sizeof v->root, "%s", url);
     rstrip_slash(v->root);
 
-    // discover levels: probe "<root>/<i>/zarr.json" for i=0.. until a gap.
-    for (int i = 0; i < MAXLOD; ++i) {
-        level_t *lv = &v->lv[i];
-        lv->vol = v;
-        snprintf(lv->prefix, sizeof lv->prefix, "%s/%d", v->root, i);
-        mc_zarr *z = mc_zarr_open(read_cb, lv);
-        if (!z) { lv->prefix[0] = 0; break; }
-        lv->z = z;
-        v->nlods = i + 1;
+    // discover levels: probe "<root>/<i>" for i=0.. until a gap (each level's
+    // .zarray / zarr.json). For S3 we AUTO-DETECT access: try ANONYMOUSLY first
+    // (open-data buckets like the Vesuvius public bucket reject signed requests
+    // made with the wrong/expired account), and only if level 0 doesn't open do
+    // we rebuild the client with resolved credentials and retry. This needs no
+    // config and works for both public and private buckets.
+    if (v->local) {
+        for (int i = 0; i < MAXLOD; ++i) {
+            level_t *lv = &v->lv[i];
+            lv->vol = v;
+            snprintf(lv->prefix, sizeof lv->prefix, "%s/%d", v->root, i);
+            mc_zarr *z = mc_zarr_open(read_cb, lv);
+            if (!z) { lv->prefix[0] = 0; break; }
+            lv->z = z;
+            v->nlods = i + 1;
+        }
+    } else {
+        for (int attempt = 0; attempt < 2 && v->nlods == 0; ++attempt) {
+            if (v->s3) { s3_client_free(v->s3); v->s3 = NULL; }
+            s3_config cfg = {0};
+            s3_credentials creds = {0};
+            if (attempt == 1) {                 // signed retry: resolve creds
+                if (s3_credentials_load(NULL, &creds) != S3_OK) break;  // none -> nothing to try
+                cfg.creds = creds;
+            }
+            v->s3 = s3_client_new(&cfg);         // attempt 0 -> anonymous (no creds)
+            s3_credentials_free(&creds);
+            if (!v->s3) { free(v); return NULL; }
+            for (int i = 0; i < MAXLOD; ++i) {
+                level_t *lv = &v->lv[i];
+                lv->vol = v;
+                snprintf(lv->prefix, sizeof lv->prefix, "%s/%d", v->root, i);
+                mc_zarr *z = mc_zarr_open(read_cb, lv);
+                if (!z) { lv->prefix[0] = 0; break; }
+                lv->z = z;
+                v->nlods = i + 1;
+            }
+        }
     }
     if (v->nlods == 0) { if (v->s3) s3_client_free(v->s3); free(v); return NULL; }
 
