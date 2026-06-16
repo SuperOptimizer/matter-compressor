@@ -89,13 +89,18 @@ static void blur_axis(const float *in, float *out, int nz,int ny,int nx,
     blur_args a = { in, out, k, rad, len, nx, ny, st, axis };
     seg_parallel_for(nlines, blur_lines, &a);
 }
-static void gauss3(float *vol, int nz,int ny,int nx, float sigma, float *scratch){
-    if(sigma<=0) return;
-    float *k; int rad; gauss1d_build(sigma,&k,&rad);
+// 3D separable blur with a PREBUILT kernel (so callers blurring several volumes
+// at the same sigma — e.g. the 6 tensor components — build it once).
+static void gauss3_k(float *vol, int nz,int ny,int nx, const float *k, int rad, float *scratch){
     blur_axis(vol,scratch,nz,ny,nx,0,k,rad);
     blur_axis(scratch,vol,nz,ny,nx,1,k,rad);
     blur_axis(vol,scratch,nz,ny,nx,2,k,rad);
     memcpy(vol,scratch,(size_t)nz*ny*nx*sizeof(float));
+}
+static void gauss3(float *vol, int nz,int ny,int nx, float sigma, float *scratch){
+    if(sigma<=0) return;
+    float *k; int rad; gauss1d_build(sigma,&k,&rad);
+    gauss3_k(vol,nz,ny,nx,k,rad,scratch);
     free(k);
 }
 
@@ -168,13 +173,15 @@ int mc_seg_detect(const uint8_t *vol, int nz, int ny, int nx,
         Txx[i]=gx*gx; Tyy[i]=gy*gy; Tzz[i]=gz*gz;
         Txy[i]=gx*gy; Txz[i]=gx*gz; Tyz[i]=gy*gz;
     }
-    // smooth the tensor (integration scale).
-    gauss3(Txx,nz,ny,nx,P.sigma_tensor,scratch);
-    gauss3(Tyy,nz,ny,nx,P.sigma_tensor,scratch);
-    gauss3(Tzz,nz,ny,nx,P.sigma_tensor,scratch);
-    gauss3(Txy,nz,ny,nx,P.sigma_tensor,scratch);
-    gauss3(Txz,nz,ny,nx,P.sigma_tensor,scratch);
-    gauss3(Tyz,nz,ny,nx,P.sigma_tensor,scratch);
+    // smooth the tensor (integration scale) — all 6 components share one kernel.
+    { float *tk; int trad; gauss1d_build(P.sigma_tensor,&tk,&trad);
+      gauss3_k(Txx,nz,ny,nx,tk,trad,scratch);
+      gauss3_k(Tyy,nz,ny,nx,tk,trad,scratch);
+      gauss3_k(Tzz,nz,ny,nx,tk,trad,scratch);
+      gauss3_k(Txy,nz,ny,nx,tk,trad,scratch);
+      gauss3_k(Txz,nz,ny,nx,tk,trad,scratch);
+      gauss3_k(Tyz,nz,ny,nx,tk,trad,scratch);
+      free(tk); }
 
     // sheetness = (l0 - l1)/(l0+eps): large when one eigenvalue dominates (a
     // planar feature: gradient coherent along the sheet normal, flat in-plane).
