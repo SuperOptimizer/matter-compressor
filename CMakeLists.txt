@@ -70,6 +70,7 @@ add_library(matter_compressor STATIC
   src/mc_tiff.c
   src/mc_surface.c
   src/mc_segment.c
+  src/mc_solve.c
   tools/vendor/libs3/libs3.c)
 target_include_directories(matter_compressor
   PUBLIC src PRIVATE tools/vendor/libs3 ${ZSTD_INC})
@@ -152,6 +153,11 @@ if(MC_STANDALONE)
   add_executable(mc_surface_robust_test tests/mc_surface_robust_test.c)
   target_link_libraries(mc_surface_robust_test matter_compressor)
   add_test(NAME surface_robust COMMAND mc_surface_robust_test)
+
+  # block-sparse Levenberg-Marquardt solver (foundation for the surface tracer).
+  add_executable(mc_solve_test tests/mc_solve_test.c)
+  target_link_libraries(mc_solve_test matter_compressor)
+  add_test(NAME solve COMMAND mc_solve_test)
 
   # c3g in the .mca archive: header codec field, round-trip == CABAC, back-compat.
   add_executable(mc_c3g_archive_test tests/mc_c3g_archive_test.c)
