@@ -263,10 +263,16 @@ long mc_seg_plug_holes(uint8_t *mask, int nz, int ny, int nx, int passes){
 // ---- spherical binary closing (dilate then erode) ----
 // dilate: out=fg if ANY in-radius voxel is fg. erode: out=fg only if ALL are.
 // outside the volume counts as background.
-static void morph(const uint8_t *in, uint8_t *out, int nz,int ny,int nx, int radius, int dilate){
-    int r2=radius*radius;
-    for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){
-        int hit = dilate?0:1;        // dilate: become fg on any hit; erode: stay fg unless a miss
+// spherical-SE dilate/erode; each output voxel depends only on `in`, so the
+// flat voxel range is split across the thread pool.
+typedef struct { const uint8_t *in; uint8_t *out; int nz,ny,nx,radius,r2,dilate; } morph_args;
+static void morph_range(void *vp, int lo, int hi){
+    morph_args *a=vp;
+    int nz=a->nz, ny=a->ny, nx=a->nx, radius=a->radius, r2=a->r2, dilate=a->dilate;
+    const uint8_t *in=a->in; uint8_t *out=a->out;
+    for(int idx=lo; idx<hi; ++idx){
+        int z=idx/(ny*nx), rem=idx%(ny*nx), y=rem/nx, x=rem%nx;
+        int hit = dilate?0:1;        // dilate: fg on any hit; erode: fg unless a miss
         for(int dz=-radius;dz<=radius;++dz)
         for(int dy=-radius;dy<=radius;++dy)
         for(int dx=-radius;dx<=radius;++dx){
@@ -277,8 +283,12 @@ static void morph(const uint8_t *in, uint8_t *out, int nz,int ny,int nx, int rad
             else      { if(!v){ hit=0; goto done; } }
         }
         done:
-        out[IDX(z,y,x)] = hit?255:0;
+        out[idx] = hit?255:0;
     }
+}
+static void morph(const uint8_t *in, uint8_t *out, int nz,int ny,int nx, int radius, int dilate){
+    morph_args a = { in, out, nz, ny, nx, radius, radius*radius, dilate };
+    seg_parallel_for((int)((size_t)nz*ny*nx), morph_range, &a);
 }
 
 int mc_seg_close(uint8_t *mask, int nz, int ny, int nx, int radius){
@@ -300,12 +310,13 @@ int mc_seg_fill_cavities(uint8_t *mask, int nz, int ny, int nx){
     int32_t *stack=malloc(n*sizeof(int32_t));
     if(!bg||!stack){ free(bg); free(stack); return -1; }
     int top=0;
-    // seed all border background voxels.
-    for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){
-        if(z||y||x){ if(z!=nz-1&&y!=ny-1&&x!=nx-1 && z&&y&&x) continue; }
-        size_t i=IDX(z,y,x);
-        if(!mask[i] && !bg[i]){ bg[i]=1; stack[top++]=(int32_t)i; }
-    }
+    // seed all border background voxels. Iterate just the six faces directly
+    // (the prior form scanned all n voxels to find the O(n^2/3) border).
+    #define SEED(z,y,x) do{ size_t _i=IDX((z),(y),(x)); if(!mask[_i]&&!bg[_i]){ bg[_i]=1; stack[top++]=(int32_t)_i; } }while(0)
+    for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){ SEED(0,y,x); if(nz>1) SEED(nz-1,y,x); }
+    for(int z=0;z<nz;++z)for(int x=0;x<nx;++x){ SEED(z,0,x); if(ny>1) SEED(z,ny-1,x); }
+    for(int z=0;z<nz;++z)for(int y=0;y<ny;++y){ SEED(z,y,0); if(nx>1) SEED(z,y,nx-1); }
+    #undef SEED
     while(top){
         int32_t cur=stack[--top];
         int cz=cur/((int)ny*nx), rem=cur%((int)ny*nx), cy=rem/nx, cx=rem%nx;
