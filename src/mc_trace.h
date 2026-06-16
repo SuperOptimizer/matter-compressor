@@ -20,6 +20,7 @@
 #define MC_TRACE_H
 
 #include "mc_solve.h"
+#include "mc_surface.h"
 
 // A surface grid: gh rows x gw cols of 3D points (3 doubles each, row-major).
 // p[(r*gw + c)*3 + {0,1,2}] = (x,y,z). A cell is invalid if its x is NaN.
@@ -119,5 +120,21 @@ typedef struct {
 } mc_sdf_field;
 
 int mc_trace_sdf_vol(void *user, const double *xyz, double *resid, double *grad);
+
+// ---- export / seed --------------------------------------------------------
+// Convert a traced grid into an mc_surface (.grid format): swizzles each cell's
+// (x,y,z) to the mc_surface (z,y,x) convention, marks invalid cells (-1,-1,-1),
+// and sets a constant `depth` (half-thickness) on every valid point. Fills
+// *out (allocates grid+depth; free with mc_surface_free). Returns 0 on success.
+int mc_trace_to_surface(const mc_surf_grid *g, double depth, mc_surface *out);
+
+// Auto-seed: scan a signed-distance field for a near-zero, low-curvature spot
+// and lay down a small flat seed patch (default 3x3) into `g` centered at grid
+// cell (gr,gc) (use g->gh/2, g->gw/2 for the middle), oriented in the SDF's
+// local tangent plane at the chosen 3D point, with `unit` spacing. `start` is a
+// hint 3D point to search near (in volume x,y,z); if any coord is negative the
+// field center is used. Returns 0 on success, <0 if no on-sheet spot found.
+int mc_trace_seed_from_sdf(mc_surf_grid *g, const mc_sdf_field *F,
+                           const double start[3], int patch);
 
 #endif /* MC_TRACE_H */

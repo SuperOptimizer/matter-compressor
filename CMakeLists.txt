@@ -160,7 +160,7 @@ if(MC_STANDALONE)
   target_link_libraries(mc_solve_test matter_compressor)
   add_test(NAME solve COMMAND mc_solve_test)
 
-  # surface tracer geometric cost terms (Dist/Straight/SymmetricDirichlet).
+  # surface tracer cost terms + growth + volume term + export.
   add_executable(mc_trace_test tests/mc_trace_test.c)
   target_link_libraries(mc_trace_test matter_compressor)
   add_test(NAME trace COMMAND mc_trace_test)
@@ -256,6 +256,10 @@ if(MC_STANDALONE)
   # microbenchmark for the sheet detector + topology post-proc (perf baseline).
   add_executable(mc_segbench tools/mc_segbench.c)
   target_link_libraries(mc_segbench matter_compressor)
+
+  # classical surface tracer CLI: chunk -> detect -> SDT -> seed -> grow -> .grid
+  add_executable(mc_trace tools/mc_trace.c)
+  target_link_libraries(mc_trace matter_compressor)
 
   add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
   target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})

@@ -395,6 +395,70 @@ int mc_trace_sdf_vol(void *user, const double *xyz, double *resid, double *grad)
     return 0;
 }
 
+// ---- export to mc_surface (.grid) -------------------------------------------
+int mc_trace_to_surface(const mc_surf_grid *g, double depth, mc_surface *out){
+    if(!g||!out) return -1;
+    memset(out,0,sizeof *out);
+    int gw=g->gw, gh=g->gh; size_t n=(size_t)gw*gh;
+    out->grid=malloc(n*3*sizeof(float));
+    out->depth=malloc(n*sizeof(float));
+    if(!out->grid||!out->depth){ free(out->grid); free(out->depth); memset(out,0,sizeof *out); return -1; }
+    out->gw=gw; out->gh=gh; out->mean_depth=(float)depth;
+    for(size_t i=0;i<n;++i){
+        const double *p=g->p+i*3;
+        if(isnan(p[0])){ out->grid[i*3]=-1; out->grid[i*3+1]=-1; out->grid[i*3+2]=-1; out->depth[i]=0; }
+        else { out->grid[i*3]=(float)p[2]; out->grid[i*3+1]=(float)p[1]; out->grid[i*3+2]=(float)p[0]; // (z,y,x)
+               out->depth[i]=(float)depth; }
+    }
+    return 0;
+}
+
+// ---- auto-seed from an SDF --------------------------------------------------
+// project a point onto the SDF zero set by a few gradient-descent steps:
+// p <- p - sdf(p) * grad/|grad|^2  (Newton on the linearized SDF). Returns the
+// converged point + its unit gradient (surface normal) in n[3].
+static int sdf_project(const mc_sdf_field *F, double p[3], double nrm[3]){
+    for(int it=0;it<40;++it){
+        double s, gr[3];
+        if(mc_trace_sdf_vol((void*)F,p,&s,gr)!=0) return -1;
+        double gl=gr[0]*gr[0]+gr[1]*gr[1]+gr[2]*gr[2];
+        if(gl<1e-12) return -1;
+        for(int i=0;i<3;++i) p[i]-= s*gr[i]/gl;
+        if(fabs(s)<1e-3){ double g=sqrt(gl); nrm[0]=gr[0]/g; nrm[1]=gr[1]/g; nrm[2]=gr[2]/g; return 0; }
+    }
+    // last gradient as normal even if not fully converged
+    double s,gr[3]; if(mc_trace_sdf_vol((void*)F,p,&s,gr)!=0) return -1;
+    double g=sqrt(gr[0]*gr[0]+gr[1]*gr[1]+gr[2]*gr[2]); if(g<1e-9) return -1;
+    nrm[0]=gr[0]/g; nrm[1]=gr[1]/g; nrm[2]=gr[2]/g;
+    return fabs(s)<1.0 ? 0 : -1;
+}
+int mc_trace_seed_from_sdf(mc_surf_grid *g, const mc_sdf_field *F,
+                           const double start[3], int patch){
+    if(!g||!F) return -1;
+    if(patch<1) patch=3;
+    double p[3];
+    if(start && start[0]>=0 && start[1]>=0 && start[2]>=0){ p[0]=start[0]; p[1]=start[1]; p[2]=start[2]; }
+    else { p[0]=F->nx/2.0; p[1]=F->ny/2.0; p[2]=F->nz/2.0; }
+    double nrm[3];
+    if(sdf_project(F,p,nrm)!=0) return -1;        // land on the sheet
+    // build two orthonormal in-plane tangents perpendicular to nrm
+    double a[3]={1,0,0}; if(fabs(nrm[0])>0.9){ a[0]=0; a[1]=1; }
+    double u[3]={ a[1]*nrm[2]-a[2]*nrm[1], a[2]*nrm[0]-a[0]*nrm[2], a[0]*nrm[1]-a[1]*nrm[0] };
+    double ul=sqrt(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]); for(int i=0;i<3;++i) u[i]/=ul;
+    double v[3]={ nrm[1]*u[2]-nrm[2]*u[1], nrm[2]*u[0]-nrm[0]*u[2], nrm[0]*u[1]-nrm[1]*u[0] };
+    // lay the patch centered at the middle grid cell, projected back onto the sheet
+    int cr=g->gh/2, cc=g->gw/2, half=patch/2;
+    for(int dr=-half; dr<=half; ++dr) for(int dc=-half; dc<=half; ++dc){
+        int r=cr+dr, c=cc+dc; if(r<0||c<0||r>=g->gh||c>=g->gw) continue;
+        double q[3]={ p[0]+g->unit*(dc*u[0]+dr*v[0]),
+                      p[1]+g->unit*(dc*u[1]+dr*v[1]),
+                      p[2]+g->unit*(dc*u[2]+dr*v[2]) };
+        double qn[3]; sdf_project(F,q,qn);        // snap each seed cell to the sheet
+        mc_surf_cell_set(g,r,c,q[0],q[1],q[2]);
+    }
+    return 0;
+}
+
 // ---- test hooks (mc_trace_test): expose the residual evals + a ctx builder so
 // the jacobians can be checked directly against finite differences. -----------
 int mc_trace__dist_eval(void *u,const double*const*pr,double*r,double*const*j){ return dist_eval(u,pr,r,j); }

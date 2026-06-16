@@ -204,6 +204,43 @@ int main(void){
         free(sdf); mc_surf_grid_free(gg); mc_surf_grid_free(gv);
     }
 
+    // ===== F. full chain: auto-seed from an SDF, grow, export to mc_surface.
+    // On a gentle cylinder the traced surface should hug the arc and the export
+    // should preserve every valid cell (swizzled to z,y,x). =====
+    {
+        int VN=300; double Rc=120.0, cx=VN/2.0, cz=VN/2.0;
+        float *sdf=malloc((size_t)VN*VN*VN*sizeof(float)); CHECK(sdf!=NULL);
+        for(int z=0;z<VN;++z)for(int y=0;y<VN;++y)for(int x=0;x<VN;++x){
+            double dx=x-cx, dz=z-cz; sdf[((size_t)z*VN+y)*VN+x]=(float)(sqrt(dx*dx+dz*dz)-Rc); }
+        mc_sdf_field F={sdf,VN,VN,VN};
+        int G=13; double U=8.0;
+        mc_surf_grid *g=mc_surf_grid_create(G,G,U);
+        double hint[3]={cx+Rc, VN/2.0, cz};
+        CHECK(mc_trace_seed_from_sdf(g,&F,hint,3)==0);
+        mc_grow_opts o; mc_grow_opts_default(&o); o.max_gen=30; o.accept_resid=0;
+        o.vol_fn=mc_trace_sdf_vol; o.vol_user=&F; o.vol_weight=4.0;
+        mc_grow_report rep; mc_trace_grow(g,&o,&rep);
+        mc_surface s; CHECK(mc_trace_to_surface(g,5.0,&s)==0);
+        // every valid traced cell must export to a valid (z,y,x) surface cell
+        // matching the source, and lie near the cylinder.
+        int nv=0, mism=0; double e=0;
+        for(int i=0;i<G*G;++i){
+            int gv = !isnan(g->p[i*3]);
+            int sv = (s.grid[i*3]>=0);
+            if(gv!=sv){ mism++; continue; }
+            if(!gv) continue; nv++;
+            if(fabs((double)s.grid[i*3+2]-g->p[i*3])>1e-2) mism++;     // x
+            if(fabs((double)s.grid[i*3+0]-g->p[i*3+2])>1e-2) mism++;   // z
+            double X=s.grid[i*3+2], Z=s.grid[i*3+0];
+            e+=fabs(sqrt((X-cx)*(X-cx)+(Z-cz)*(Z-cz))-Rc);
+        }
+        CHECK(nv>100); CHECK(mism==0); CHECK(s.depth[ (G/2)*G + G/2 ]==5.0f);
+        CHECK(nv && e/nv < 3.0);
+        printf("F. full chain: seeded->grew %d, exported %d valid (0 mism), mean|r-Rc|=%.2f\n",
+               rep.added, nv, nv?e/nv:0);
+        free(sdf); mc_surface_free(&s); mc_surf_grid_free(g);
+    }
+
     printf(fails ? "mc_trace_test: %d FAILED\n" : "mc_trace_test: OK\n", fails);
     return fails?1:0;
 }
