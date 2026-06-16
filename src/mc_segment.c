@@ -4,8 +4,37 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define IDX(z,y,x) (((size_t)(z)*ny + (y))*nx + (x))
+
+// thread count for the detector's data-parallel loops (blur lines, eigen/mask).
+#define MC_SEG_MAXTHREADS 16
+static int seg_threads(void){
+    long nc = sysconf(_SC_NPROCESSORS_ONLN);
+    if(nc<1) nc=1; if(nc>MC_SEG_MAXTHREADS) nc=MC_SEG_MAXTHREADS;
+    return (int)nc;
+}
+// run fn(arg, lo, hi) over [0,total) split into the thread pool's contiguous
+// ranges. Falls back to a single in-line call for tiny work or 1 thread.
+typedef void (*seg_range_fn)(void *arg, int lo, int hi);
+typedef struct { seg_range_fn fn; void *arg; int lo, hi; } seg_task;
+static void *seg_trampoline(void *p){ seg_task *t=p; t->fn(t->arg,t->lo,t->hi); return NULL; }
+static void seg_parallel_for(int total, seg_range_fn fn, void *arg){
+    int nt = seg_threads();
+    if(nt<=1 || total < 256){ fn(arg,0,total); return; }
+    if(nt>total) nt=total;
+    pthread_t th[MC_SEG_MAXTHREADS]; seg_task tk[MC_SEG_MAXTHREADS];
+    int chunk=(total+nt-1)/nt, made=0;
+    for(int i=0;i<nt;++i){
+        int lo=i*chunk, hi=lo+chunk; if(hi>total)hi=total; if(lo>=hi) break;
+        tk[i]=(seg_task){fn,arg,lo,hi};
+        if(pthread_create(&th[i],NULL,seg_trampoline,&tk[i])!=0){ fn(arg,lo,hi); continue; }
+        made++;
+    }
+    for(int i=0;i<made;++i) pthread_join(th[i],NULL);
+}
 
 // ---- separable 1D gaussian blur of a float volume along one axis ----
 static void gauss1d_build(float sigma, float **k, int *r){
@@ -15,19 +44,50 @@ static void gauss1d_build(float sigma, float **k, int *r){
     for(int i=0;i<2*rad+1;++i) w[i]/=s;
     *k=w; *r=rad;
 }
+// Separable 1D gaussian blur along one axis, clamp-to-edge. Walks each 1D line
+// along the axis once: the stride between taps is constant (1 for x, nx for y,
+// ny*nx for z), so we hoist the line base + stride and split each line into a
+// clamped head, an unclamped interior (the hot, vectorizable run), and a
+// clamped tail. Same numerics as the naive per-tap-clamp form.
+// args for the threaded blur (one axis pass); lines are split across threads.
+typedef struct { const float *in; float *out; const float *k;
+                 int rad, len, nx, ny; size_t st; int axis; } blur_args;
+static void blur_lines(void *vp, int Llo, int Lhi){
+    blur_args *a=vp;
+    int len=a->len, rad=a->rad, nx=a->nx, ny=a->ny, axis=a->axis;
+    size_t st=a->st; const float *k=a->k;
+    for(int L=Llo; L<Lhi; ++L){
+        size_t base;
+        if(axis==2){ base=(size_t)L*nx; }              // x: contiguous row
+        else if(axis==1){ int z=L/nx,x=L%nx; base=(size_t)z*ny*nx+x; }  // y
+        else { int y=L/nx,x=L%nx; base=(size_t)y*nx+x; }                // z
+        const float *ip=a->in+base; float *op=a->out+base;
+        for(int p=0; p<len; ++p){
+            float acc=0;
+            int lo=p-rad, hi=p+rad;
+            if(lo>=0 && hi<len){     // interior: no clamp, straight strided dot
+                const float *s=ip+(size_t)lo*st;
+                for(int t=0;t<2*rad+1;++t){ acc+=k[t]*(*s); s+=st; }
+            } else {                 // border: clamp each tap to [0,len-1]
+                for(int t=-rad;t<=rad;++t){
+                    int q=p+t; if(q<0)q=0; else if(q>=len)q=len-1;
+                    acc+=k[t+rad]*ip[(size_t)q*st];
+                }
+            }
+            op[(size_t)p*st]=acc;
+        }
+    }
+}
+// Separable 1D gaussian blur along one axis, clamp-to-edge. Each 1D line is
+// independent, so the line set is split across the thread pool. Walking a line
+// once with a constant tap stride lets the interior run vectorize.
 static void blur_axis(const float *in, float *out, int nz,int ny,int nx,
                       int axis, const float *k, int rad){
-    for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){
-        float acc=0;
-        for(int t=-rad;t<=rad;++t){
-            int zz=z,yy=y,xx=x;
-            if(axis==0){ zz=z+t; if(zz<0)zz=0; if(zz>=nz)zz=nz-1; }
-            else if(axis==1){ yy=y+t; if(yy<0)yy=0; if(yy>=ny)yy=ny-1; }
-            else { xx=x+t; if(xx<0)xx=0; if(xx>=nx)xx=nx-1; }
-            acc += k[t+rad]*in[IDX(zz,yy,xx)];
-        }
-        out[IDX(z,y,x)]=acc;
-    }
+    int len   = (axis==0)?nz : (axis==1)?ny : nx;
+    size_t st = (axis==0)?(size_t)ny*nx : (axis==1)?(size_t)nx : 1;
+    int nlines = (int)((size_t)nz*ny*nx / len);
+    blur_args a = { in, out, k, rad, len, nx, ny, st, axis };
+    seg_parallel_for(nlines, blur_lines, &a);
 }
 static void gauss3(float *vol, int nz,int ny,int nx, float sigma, float *scratch){
     if(sigma<=0) return;
@@ -61,6 +121,20 @@ static void eig3sym(double a,double b,double c,double d,double e,double f,
     double e2=q+2*p*cos(phi+2.0*M_PI/3.0);
     double e1=3*q-e0-e2;
     ev[0]=e0; ev[1]=e1; ev[2]=e2;  // already sorted desc by construction
+}
+
+// threaded sheetness -> mask over the smoothed structure-tensor components.
+typedef struct { const float *Txx,*Tyy,*Tzz,*Txy,*Txz,*Tyz;
+                 const uint8_t *vol; uint8_t *mask; float sheetness; int val_lo; } sheet_args;
+static void sheet_mask(void *vp, int lo, int hi){
+    sheet_args *a=vp;
+    for(int i=lo;i<hi;++i){
+        double ev[3];
+        eig3sym(a->Txx[i],a->Tyy[i],a->Tzz[i],a->Txy[i],a->Txz[i],a->Tyz[i],ev);
+        double l0=ev[0],l1=ev[1];
+        double sheet = (l0>1e-6) ? (l0-l1)/(l0+1e-6) : 0.0;
+        a->mask[i] = (a->vol[i] >= a->val_lo && sheet >= a->sheetness) ? 255 : 0;
+    }
 }
 
 int mc_seg_detect(const uint8_t *vol, int nz, int ny, int nx,
@@ -104,13 +178,9 @@ int mc_seg_detect(const uint8_t *vol, int nz, int ny, int nx,
 
     // sheetness = (l0 - l1)/(l0+eps): large when one eigenvalue dominates (a
     // planar feature: gradient coherent along the sheet normal, flat in-plane).
-    for(size_t i=0;i<n;++i){
-        double ev[3];
-        eig3sym(Txx[i],Tyy[i],Tzz[i],Txy[i],Txz[i],Tyz[i],ev);
-        double l0=ev[0],l1=ev[1];
-        double sheet = (l0>1e-6) ? (l0-l1)/(l0+1e-6) : 0.0;
-        mask[i] = (vol[i] >= P.val_lo && sheet >= P.sheetness) ? 255 : 0;
-    }
+    // Per-voxel + independent -> split across the thread pool.
+    sheet_args sa = { Txx,Tyy,Tzz,Txy,Txz,Tyz, vol, mask, P.sheetness, P.val_lo };
+    seg_parallel_for((int)((n>(size_t)0x7fffffff)?0x7fffffff:n), sheet_mask, &sa);
     free(f); free(scratch); free(Txx);free(Tyy);free(Tzz);free(Txy);free(Txz);free(Tyz);
     return 0;
 }

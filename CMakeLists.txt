@@ -241,6 +241,10 @@ if(MC_STANDALONE)
   add_executable(mc_detect tools/mc_detect.c)
   target_link_libraries(mc_detect matter_compressor)
 
+  # microbenchmark for the sheet detector + topology post-proc (perf baseline).
+  add_executable(mc_segbench tools/mc_segbench.c)
+  target_link_libraries(mc_segbench matter_compressor)
+
   add_executable(mc_fetch tools/mc_fetch.c tools/vendor/libs3/libs3.c)
   target_include_directories(mc_fetch PRIVATE tools/vendor/libs3 ${ZSTD_INC})
   set_property(TARGET mc_fetch PROPERTY C_STANDARD 23)
