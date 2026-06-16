@@ -18,6 +18,8 @@
 #include "matter_compressor.h"
 #define MC_GPU_RAY_IMPLEMENTATION
 #include "mc_gpu_ray.h"
+#define MC_GPU_BRICK_IMPLEMENTATION
+#include "mc_gpu_brick.h"
 
 #define N3 4096
 static int die(const char*m){ fprintf(stderr,"FATAL %s: %s\n",m,SDL_GetError()); return 1; }
@@ -251,7 +253,55 @@ int main(void){
     // measurably brighter than the opposite side.
     int m4ok = (lumR > lumL) && (lumR - lumL > lumL/50);   // > 2% directional
 
-    int allok = m1ok && m2ok && m3ok && m4ok;
+    // ---- M5: brick cache (page table + atlas + empty-space skip) ----
+    // Page the GZxGYxGX bricks into the brick cache, but mark every other brick
+    // AIR (NULL blob). The page table must mark exactly the material bricks
+    // resident; the MIP render must show only those bricks; air bricks (skipped
+    // via the page table) cost nothing. Then read the page table back and check
+    // resident slots match, and the render has the resident bricks.
+    int m5ok = 0;
+    {
+        mc_gpu_brick *B = mc_gpu_brick_create(R, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, 8);
+        if(!B){ fprintf(stderr,"mc_gpu_brick_create failed\n"); }
+        else {
+            const uint8_t *bb[8]; uint32_t bl[8];
+            int want_resident=0;
+            for(int i=0;i<NB;++i){
+                int air = (i & 1);                  // odd bricks -> air
+                bb[i] = (coded[i] && !air) ? payloads[i].p : NULL;
+                bl[i] = (coded[i] && !air) ? plen[i] : 0;
+                if(bb[i]) want_resident++;
+            }
+            int nres=0;
+            mc_gpu_brick_page(B, GZ,GY,GX, bb, bl, &nres);
+            mc_gpu_brick_set_lut(B, lut);           // gray LUT from M2
+
+            // render MIP from the same ortho camera into rt.
+            SDL_GPUCommandBuffer *cb5=SDL_AcquireGPUCommandBuffer(dev);
+            mc_gpu_brick_render(B, cb5, rt, ivp, 0.5f, 1.0f, MC_RAY_MIP, 0.0f, 0.0f);
+            SDL_GPUTransferBuffer *otb5=SDL_CreateGPUTransferBuffer(dev,&o);
+            SDL_GPUCopyPass *cp5=SDL_BeginGPUCopyPass(cb5);
+            SDL_GPUTextureTransferInfo oi5={0}; oi5.transfer_buffer=otb5; oi5.pixels_per_row=(Uint32)RW; oi5.rows_per_layer=(Uint32)RH;
+            SDL_DownloadFromGPUTexture(cp5,&rr,&oi5);
+            SDL_EndGPUCopyPass(cp5);
+            SDL_GPUFence *f5=SDL_SubmitGPUCommandBufferAndAcquireFence(cb5);
+            SDL_WaitForGPUFences(dev,true,&f5,1); SDL_ReleaseGPUFence(dev,f5);
+            uint32_t *img5=SDL_MapGPUTransferBuffer(dev,otb5,false);
+            long lit5=0; int bgc=img5[0]&0xFFFFFF;
+            for(int i=0;i<RW*RH;++i) if((img5[i]&0xFFFFFF)!=bgc) lit5++;
+            const char *d5=SDL_getenv("RAY_DUMP_BRICK");
+            if(d5){ FILE*fp=fopen(d5,"wb"); if(fp){ fprintf(fp,"P6\n%d %d\n255\n",RW,RH);
+                for(int i=0;i<RW*RH;++i){ uint32_t p=img5[i]; unsigned char c[3]={(p>>16)&255,(p>>8)&255,p&255}; fwrite(c,1,3,fp);} fclose(fp);} }
+            SDL_UnmapGPUTransferBuffer(dev,otb5);
+            printf("M5 (brick cache): resident=%d/%d (want %d)  lit=%ld\n",
+                   nres, NB, want_resident, lit5);
+            // resident count = the material (non-air) bricks; render shows them.
+            m5ok = (nres == want_resident) && (lit5 > 0);
+            mc_gpu_brick_destroy(B);
+        }
+    }
+
+    int allok = m1ok && m2ok && m3ok && m4ok && m5ok;
     printf("%s\n", allok ? "ray_gpu_check: OK" : "ray_gpu_check: FAIL");
 
     for(int b=0;b<NB;++b) free(payloads[b].p);

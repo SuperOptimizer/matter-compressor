@@ -55,6 +55,19 @@ void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture 
 /* The dense 3D texture (for readback validation). */
 SDL_GPUTexture *mc_gpu_ray_volume(mc_gpu_ray *r, int *vx,int *vy,int *vz);
 
+/* The SDL_GPU device this raycaster was created with (shared by mc_gpu_brick). */
+SDL_GPUDevice *mc_gpu_ray_device(mc_gpu_ray *r);
+
+/* Lower-level: decode `nb` compressed c3g blocks into an arbitrary storage 3D
+ * texture `target` using the shared decode pipeline + constant tables. `tab` is
+ * the 3-wide block table [off,len,dst] (dst = brick origin/16 packed
+ * x|y<<10|z<<20). `packed`/`packed_len` is the contiguous payload buffer the
+ * offsets index. Runs one compute pass on its own command buffer. Used by the
+ * brick atlas (mc_gpu_brick) to decode bricks into atlas slots. */
+void mc_gpu_ray_decode_into(mc_gpu_ray *r, SDL_GPUTexture *target,
+                            const uint8_t *packed, uint32_t packed_len,
+                            const uint32_t *tab, int nb);
+
 #endif /* MC_GPU_RAY_H_ */
 
 #ifdef MC_GPU_RAY_IMPLEMENTATION
@@ -269,6 +282,27 @@ bool mc_gpu_ray_upload(mc_gpu_ray *r, int gz,int gy,int gx,
 SDL_GPUTexture *mc_gpu_ray_volume(mc_gpu_ray *r, int *vx,int *vy,int *vz){
     if(vx)*vx=r->vx; if(vy)*vy=r->vy; if(vz)*vz=r->vz; return r->vol;
 }
+SDL_GPUDevice *mc_gpu_ray_device(mc_gpu_ray *r){ return r->dev; }
+
+void mc_gpu_ray_decode_into(mc_gpu_ray *r, SDL_GPUTexture *target,
+                            const uint8_t *packed, uint32_t packed_len,
+                            const uint32_t *tab, int nb){
+    if(nb<=0) return;
+    if(packed_len==0) packed_len=4;
+    mcr_up(r->dev, r->b_payload, packed, packed_len);
+    mcr_up(r->dev, r->b_blktab, tab, (uint32_t)nb*3*4);
+    SDL_GPUCommandBuffer *cb=SDL_AcquireGPUCommandBuffer(r->dev);
+    SDL_GPUStorageTextureReadWriteBinding rw={0}; rw.texture=target;
+    SDL_GPUComputePass *cp=SDL_BeginGPUComputePass(cb,&rw,1,NULL,0);
+    SDL_BindGPUComputePipeline(cp,r->decode_pipe);
+    SDL_GPUBuffer *ro[8]={r->b_payload,r->b_blktab,r->b_freq,r->b_cdf,r->b_slot,r->b_step,r->b_scan,r->b_dct};
+    SDL_BindGPUComputeStorageBuffers(cp,0,ro,8);
+    mcr_decode_ubo du={ (uint32_t)nb, 0,0,0, 1u };   // use_dst=1 (per-block dst)
+    SDL_PushGPUComputeUniformData(cb,0,&du,sizeof du);
+    SDL_DispatchGPUCompute(cp,(Uint32)nb,1,1);
+    SDL_EndGPUComputePass(cp);
+    SDL_SubmitGPUCommandBuffer(cb);
+}
 
 void mc_gpu_ray_set_lighting(mc_gpu_ray *r, int on, const float light_dir[3],
                              float ambient, float diffuse, float specular,
@@ -294,7 +328,8 @@ void mc_gpu_ray_render(mc_gpu_ray *r, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture 
     tsb[0].texture=r->vol;     tsb[0].sampler=r->vol_samp;
     tsb[1].texture=r->lut_tex; tsb[1].sampler=r->lut_samp;
     SDL_BindGPUFragmentSamplers(rp,0,tsb,2);
-    mcr_ray_ubo u; SDL_memcpy(u.inv_view_proj,inv_view_proj,16*sizeof(float));
+    mcr_ray_ubo u;
+    for(int k=0;k<16;++k) u.inv_view_proj[k]=inv_view_proj[k];
     u.cam_pos[0]=cam_pos[0]; u.cam_pos[1]=cam_pos[1]; u.cam_pos[2]=cam_pos[2]; u.cam_pos[3]=0;
     u.vol_dim[0]=(float)r->vx; u.vol_dim[1]=(float)r->vy; u.vol_dim[2]=(float)r->vz; u.vol_dim[3]=step_voxels;
     u.params[0]=(float)mode; u.params[1]=gain; u.params[2]=alpha_min; u.params[3]=absorption;

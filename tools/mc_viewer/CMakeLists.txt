@@ -43,7 +43,8 @@ FetchContent_MakeAvailable(SDL3)
 set(MC_VIEWER_SHADERS
   blit.vert:vert blit.frag:frag ui.vert:vert ui.frag:frag
   c3g_decode.comp:comp vol.vert:vert vol_slice.frag:frag
-  c3g_decode3d.comp:comp raycast.vert:vert raycast.frag:frag)
+  c3g_decode3d.comp:comp raycast.vert:vert raycast.frag:frag
+  raycast_brick.frag:frag)
 find_program(GLSLANG_VALIDATOR glslangValidator)
 set(_shader_hdrs "")
 if(GLSLANG_VALIDATOR)
@@ -114,7 +115,8 @@ add_executable(ray_gpu_check
   ${CMAKE_CURRENT_SOURCE_DIR}/ray_gpu_check.c
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/c3g_decode3d.comp.spv.h
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/raycast.vert.spv.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/raycast.frag.spv.h)
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/raycast.frag.spv.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/raycast_brick.frag.spv.h)
 target_include_directories(ray_gpu_check PRIVATE
   ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(ray_gpu_check PRIVATE -O2)
