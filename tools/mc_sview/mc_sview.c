@@ -117,7 +117,7 @@ static void draw_ortho(sview *s, int panel, int px, int py, int pw, int ph){
             fprintf(stderr,"auto-window -> [%d,%d]\n", lo, hi);
         }
     }
-    mc_colormap_lut(s->lut, s->win_low/255.0f, s->win_high/255.0f, s->cmap);
+    mc_colormap_lut(s->lut, (float)s->win_low, (float)s->win_high, s->cmap);
     for (int y=0;y<ih;++y)
         mc_colormap_apply(s->scratch+(size_t)y*iw, iw, 1, s->lut,
                           s->fb + (size_t)(py+y)*s->win_w + px, iw);
@@ -144,7 +144,7 @@ static void draw_surface(sview *s, int px, int py, int pw, int ph){
     float d = s->surf.mean_depth>0 ? s->surf.mean_depth : 1.0f;
     rp.comp = MC_COMP_MAX; rp.t0 = -d; rp.t1 = d; rp.dt = 1.0f;
     mc_render_quad_lod(&s->lods, &q, s->surf_x0, s->surf_y0, step, iw, ih, &rp, s->scratch, s->nthreads);
-    mc_colormap_lut(s->lut, s->win_low/255.0f, s->win_high/255.0f, s->cmap);
+    mc_colormap_lut(s->lut, (float)s->win_low, (float)s->win_high, s->cmap);
     for (int y=0;y<ih;++y)
         mc_colormap_apply(s->scratch+(size_t)y*iw, iw, 1, s->lut,
                           s->fb + (size_t)(py+y)*s->win_w + px, iw);
