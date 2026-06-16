@@ -52,17 +52,22 @@ static int save_vcps(const char *path, const mc_surface *s){
 
 int main(int argc, char **argv){
     const char *in=NULL,*out=NULL; float depth=4.0f; int gw=0,gh=0; int as_vcps=0;
+    double scale=1.0;
     for(int i=1;i<argc;++i){
         if(!strcmp(argv[i],"--depth")&&i+1<argc) depth=(float)atof(argv[++i]);
         else if(!strcmp(argv[i],"--grid")&&i+2<argc){ gw=atoi(argv[++i]); gh=atoi(argv[++i]); }
+        else if(!strcmp(argv[i],"--scale")&&i+1<argc) scale=atof(argv[++i]);
+        else if(!strcmp(argv[i],"--vox-scale")&&i+2<argc){ double src=atof(argv[++i]), dst=atof(argv[++i]); if(dst>0) scale=src/dst; }
         else if(!strcmp(argv[i],"--vcps")) as_vcps=1;
         else if(!in) in=argv[i];
         else if(!out) out=argv[i];
     }
     if(!in||!out){
-        fprintf(stderr,"usage: %s <in> <out> [--depth D] [--grid W H] [--vcps]\n"
+        fprintf(stderr,"usage: %s <in> <out> [--depth D] [--grid W H] [--scale F] [--vox-scale SRC DST] [--vcps]\n"
                        "  in: .grid/.tif | .ppm (VC map) | .obj (mesh)\n"
-                       "  out: .grid | .obj | .ppm(--vcps)\n", argv[0]);
+                       "  out: .grid | .obj | .ppm(--vcps)\n"
+                       "  --scale F        multiply all coords (+depth) by F (rescale between volumes)\n"
+                       "  --vox-scale S D  rescale from a SRC-um volume to a DST-um volume (F=S/D)\n", argv[0]);
         return 2;
     }
 
@@ -81,6 +86,17 @@ int main(int argc, char **argv){
     } else { // .grid / .tif / .tiff
         rc=mc_surface_load_tiff(in,&s);
         if(rc!=0){ fprintf(stderr,"load grid tiff failed (%d): %s\n",rc,in); return 1; }
+    }
+    // optional coordinate rescale (e.g. trace from a 7.91um volume -> view on a
+    // 2.4um volume: --vox-scale 7.91 2.4). Scales valid xyz + per-point depth.
+    if(scale!=1.0){
+        for(size_t i=0;i<(size_t)s.gw*s.gh;++i){ float*p=&s.grid[i*3];
+            if(p[0]<0&&p[1]<0&&p[2]<0) continue;     // keep invalid marker
+            p[0]*=(float)scale; p[1]*=(float)scale; p[2]*=(float)scale;
+            if(s.depth) s.depth[i]*=(float)scale;
+        }
+        s.mean_depth*=(float)scale;
+        fprintf(stderr,"rescaled coords by %.4f\n", scale);
     }
     // count valid points.
     long valid=0; for(size_t i=0;i<(size_t)s.gw*s.gh;++i){ const float*p=&s.grid[i*3]; if(!(p[0]<0&&p[1]<0&&p[2]<0)) valid++; }
