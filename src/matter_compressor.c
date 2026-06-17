@@ -7662,7 +7662,14 @@ static void *dl_main(void *ud) {
         while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
         if (v->stop && v->rs_n == 0) { pthread_mutex_unlock(&v->mu); return NULL; }
         int popped = 0;
-        while (m < DL_BATCH && v->rs_n > 0) {           // grab a batch, newest first
+        // Grab only this thread's SHARE of the queue, not the whole DL_BATCH. One
+        // greedy thread taking 64 regions left the other ndl-1 download threads
+        // asleep on an empty stack -> a single s3_get_batch in flight -> the link
+        // idles. Split the work so all ndl threads issue concurrent batches.
+        int grab = (v->rs_n + v->ndl - 1) / v->ndl;     // ceil(queue / threads)
+        if (grab < 4) grab = 4;                          // small floor: avoid tiny GETs
+        if (grab > DL_BATCH) grab = DL_BATCH;
+        while (m < grab && v->rs_n > 0) {               // grab a slice, newest first
             uint64_t key = v->reqstk[--v->rs_n];
             popped = 1;
             if (inflight_has(v, key)) continue;          // another dl thread already has it
@@ -7671,6 +7678,9 @@ static void *dl_main(void *ud) {
             ++m;
         }
         if (popped) rs_set_rebuild(v);                  // popped keys leave the set
+        // Work remains -> wake another download thread so the pool fans out
+        // instead of this thread draining the queue alone.
+        if (v->rs_n > 0) pthread_cond_signal(&v->cv);
         pthread_mutex_unlock(&v->mu);
 
         if (v->streaming) {
