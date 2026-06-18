@@ -68,6 +68,7 @@ static uint8_t *blosc_decode(const uint8_t *src, size_t srclen, size_t *out_len)
         *out_len = nbytes;
         return out;
     }
+    if (blocksize == 0) { free(out); return NULL; }   // untrusted blob: no div by 0
     uint32_t nblocks = (nbytes + blocksize - 1) / blocksize;
     const uint8_t *bstarts = src + 16;
     if (16 + (size_t)nblocks * 4 > srclen) { free(out); return NULL; }
@@ -225,6 +226,10 @@ mc_zarr *mc_zarr_open(mc_zarr_read_fn read, void *ud) {
         return NULL;
     }
     z->per = z->shard_edge / z->inner_edge;
+    // bound per^3 (used as an index-table size + nested loop counts): an untrusted
+    // shard_edge/inner_edge could otherwise overflow size_t or hang. 256 inner
+    // chunks/axis = 16M/shard, far beyond any real zarr.
+    if (z->inner_edge == 0 || z->per == 0 || z->per > 256) { free(z); return NULL; }
     for (int d = 0; d < 3; ++d)
         z->inner_grid[d] = (z->shape[d] + z->inner_edge - 1) / z->inner_edge;
     return z;

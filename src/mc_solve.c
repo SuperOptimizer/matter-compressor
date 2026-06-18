@@ -1,5 +1,6 @@
 /* mc_solve.c — block-sparse Levenberg-Marquardt least squares (see mc_solve.h). */
 #include "mc_solve.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -150,6 +151,11 @@ int mc_solve(mc_problem *p, const mc_solve_opts *opts, mc_solve_report *rep){
     for(int b=0;b<p->nblocks;++b){ if(p->is_const[b]) col[b]=-1; else { col[b]=nfree*B; nfree++; } }
     int N = nfree*B;
     if(N==0){ free(col); if(rep){ rep->initial_cost=rep->final_cost=0; rep->iterations=0; rep->success=1; } return 0; }
+    // guard the dense-Hessian (N*N doubles) and jstore (max_nblk*max_rdim*B) sizes
+    // against integer overflow on a pathological problem size.
+    if(N < 0 || (size_t)N > (size_t)1<<20){ free(col); return -1; }
+    { size_t mn=(size_t)(p->max_nblk?p->max_nblk:1), mr=(size_t)(p->max_rdim?p->max_rdim:1);
+      if(mn > (SIZE_MAX/sizeof(double))/(mr?mr*(size_t)B:1)){ free(col); return -1; } }
 
     double *H   = malloc((size_t)N*N*sizeof(double));
     double *Hd  = malloc((size_t)N*N*sizeof(double));

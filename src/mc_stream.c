@@ -33,10 +33,16 @@ struct mc_reader {
 };
 
 // occupancy state of a slot: flat reads the mmap, streaming reads the cached copy.
+// occ_off/total_chunks come from an UNTRUSTED header -> bounds-check every index.
 static int occ_state(mc_reader *r, uint64_t slot){
-    const u8 *occ = r->arc ? r->arc + r->occ_off : r->occ_buf;
-    if(!occ) return MC_OCC_REAL;       // unknown source -> don't gate
-    return (occ[slot>>2] >> ((unsigned)(slot&3)*2u)) & 3u;
+    if(slot >= r->total_chunks) return MC_OCC_DONT_KNOW;
+    uint64_t byte = slot >> 2;
+    if(r->arc){
+        if(r->occ_off + byte >= r->len) return MC_OCC_DONT_KNOW;   // OOB -> absent
+        return (r->arc[r->occ_off + byte] >> ((unsigned)(slot&3)*2u)) & 3u;
+    }
+    if(!r->occ_buf) return MC_OCC_REAL;       // no cache -> don't gate (caller-managed)
+    return (r->occ_buf[byte] >> ((unsigned)(slot&3)*2u)) & 3u;
 }
 
 static void hdr_load(mc_reader *r, const u8 *h){
@@ -107,9 +113,12 @@ void mc_reader_set_partial_fetch(mc_reader *r, int on){ if(r) r->partial=on; }
 void mc_reader_set_quality(mc_reader *r, float q){ if(r&&r->codec) mc_codec_ctx_set_quality(r->codec,q); }
 void mc_close(mc_reader *r){ if(!r)return; mc_codec_ctx_free(r->codec); free(r->cbuf); free(r->occ_buf); free(r); }
 
-// occupancy of a slot in flat mode (streaming readers trust the caller's gating).
-static int occ_flat(const u8 *arc, uint64_t occ_off, uint64_t slot){
-    u8 b = arc[occ_off + (slot>>2)]; return (b >> ((unsigned)(slot&3)*2u)) & 3u;
+// occupancy of a slot in flat mode (bounds-checked against the buffer length —
+// occ_off comes from an untrusted header).
+static int occ_flat(const u8 *arc, uint64_t occ_off, uint64_t slot, size_t len){
+    uint64_t i = occ_off + (slot>>2);
+    if(i >= len) return MC_OCC_DONT_KNOW;
+    return (arc[i] >> ((unsigned)(slot&3)*2u)) & 3u;
 }
 
 uint64_t mc_chunk_offset(mc_reader *r, int lod, int cz,int cy,int cx){
@@ -133,6 +142,10 @@ static const u8 *sfetch_chunk(mc_reader *r, uint64_t chunk_off){
     if(total < MC_CHUNK_PAYLOAD_OFF || total > MC_SLOT_STRIDE) return NULL;
     void *tmp=realloc(r->cbuf,total); if(!tmp) return NULL; r->cbuf=tmp;
     if(sread(r,chunk_off,(uint32_t)total,r->cbuf)!=0) return NULL;
+    // integrity: a streaming fetch crosses the network -> verify the stored hash
+    // over the whole chunk before decoding. Mismatch = corruption in transit.
+    if(mc_xxh64(r->cbuf+8,(size_t)(total-8),0x6D636168756E6Bull) != mc_chunk_xxh3(r->cbuf))
+        return NULL;
     r->cbuf_off=chunk_off; r->cbuf_len=total;
     return r->cbuf;
 }
@@ -169,7 +182,10 @@ uint64_t mc_reader_chunk_blob_len(mc_reader *r, uint64_t chunk_off){
 }
 int mc_reader_read_blob(mc_reader *r, uint64_t chunk_off, size_t len, uint8_t *dst){
     if(!r||!chunk_off||!len||!dst) return -1;
-    if(r->arc){ memcpy(dst, r->arc+chunk_off, len); return 0; }
+    if(r->arc){
+        if(chunk_off > r->len || len > r->len - chunk_off) return -1;   // bounds
+        memcpy(dst, r->arc+chunk_off, len); return 0;
+    }
     size_t done=0;
     while(done<len){
         uint32_t n=(len-done>0x40000000u)?0x40000000u:(uint32_t)(len-done);
@@ -199,7 +215,7 @@ long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
         uint64_t ncz=mca_chunks_axis(dims[0],lod),ncy=mca_chunks_axis(dims[1],lod),ncx=mca_chunks_axis(dims[2],lod);
         for(uint64_t cz=0;cz<ncz;cz++)for(uint64_t cy=0;cy<ncy;cy++)for(uint64_t cx=0;cx<ncx;cx++){
             uint64_t slot=mca_slot_index(dims,nl,lod,cz,cy,cx);
-            if(occ_flat(arc,occ_off,slot)!=MC_OCC_REAL) continue;
+            if(occ_flat(arc,occ_off,slot,len)!=MC_OCC_REAL) continue;
             uint64_t co=chunks_off+slot*stride;
             if(co+MC_CHUNK_PAYLOAD_OFF>len){ bad++; continue; }
             const u8 *c=arc+co; uint64_t clen=mc_chunk_len(c);

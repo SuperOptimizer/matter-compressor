@@ -57,8 +57,7 @@ static int dist_eval(void *u, const double *const *pr, double *res, double *cons
     double d[3]={a[0]-b[0],a[1]-b[1],a[2]-b[2]};
     double L=sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
     if(L < 1e-9){ // degenerate: pull apart toward unit, jac ~ 0
-        res[0]=C->w*( -1.0 ); // unit/L huge -> clamp; treat as large positive
-        res[0]=C->w*100.0;
+        res[0]=C->w*100.0; // unit/L huge -> clamp; treat as large positive
         if(jac){ if(jac[0]) for(int i=0;i<3;++i) jac[0][i]=0; if(jac[1]) for(int i=0;i<3;++i) jac[1][i]=0; }
         return 0;
     }

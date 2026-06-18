@@ -305,11 +305,12 @@ static void ghost_put(shard_t *sh, uint32_t fp){
     uint32_t old=sh->gfp[sh->g_head];
     if(old){  // remove the overwritten fingerprint from the set
         uint32_t m=sh->gset_cap-1, i=(old*0x9E3779B1u)&m;
-        while(sh->gset[i]!=-1){ if(sh->gfp[sh->gset[i]]==old && (uint32_t)sh->gset[i]==sh->g_head){ sh->gset[i]=-1; break; } i=(i+1)&m; }
+        for(uint32_t p=0; p<sh->gset_cap && sh->gset[i]!=-1; ++p, i=(i+1)&m)
+            if(sh->gfp[sh->gset[i]]==old && (uint32_t)sh->gset[i]==sh->g_head){ sh->gset[i]=-1; break; }
     }
     sh->gfp[sh->g_head]=fp;
     uint32_t m=sh->gset_cap-1, i=(fp*0x9E3779B1u)&m;
-    while(sh->gset[i]!=-1) i=(i+1)&m;
+    { uint32_t p=0; while(sh->gset[i]!=-1 && p<sh->gset_cap){ i=(i+1)&m; ++p; } }
     sh->gset[i]=(int32_t)sh->g_head;
     sh->g_head=(sh->g_head+1)%sh->g_cap;
 }
@@ -605,11 +606,13 @@ static void *aupd_worker(void *p){
 mc_cache_ticket *mc_cache_update_async(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads){
     if(!c||!ids||!n||cache_frozen(c)) return NULL;
     mc_cache_ticket *t=calloc(1,sizeof *t);
+    if(!t) return NULL;
     t->c=c;
     t->ids=malloc(n*sizeof *t->ids);
-    memcpy(t->ids,ids,n*sizeof *t->ids);
     t->bucket=malloc(NSHARD*sizeof *t->bucket);
     t->link=malloc(n*sizeof *t->link);
+    if(!t->ids||!t->bucket||!t->link){ free(t->ids); free(t->bucket); free(t->link); free(t); return NULL; }
+    memcpy(t->ids,ids,n*sizeof *t->ids);
     for(int s=0;s<NSHARD;++s) t->bucket[s]=UINT32_MAX;
     for(size_t i=0;i<n;++i){
         uint64_t key=bkey(t->ids[i].lod,t->ids[i].bz,t->ids[i].by,t->ids[i].bx);

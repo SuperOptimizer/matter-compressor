@@ -106,6 +106,9 @@ static inline int mc_block_span(const uint8_t *c, int bi, uint32_t *off, uint32_
         uint32_t oj = mc_chunk_offtab(c, j);
         if(oj != MC_OFF_ABSENT){ next = oj; break; }
     }
+    // corrupt table (terminator absent, or next<o): refuse rather than underflow
+    // the unsigned subtraction into a multi-GB length.
+    if(next == MC_OFF_ABSENT || next < o) return 0;
     *off = o; *len = next - o; return 1;
 }
 
@@ -124,15 +127,23 @@ struct mc_archive {
     _Atomic uint64_t gen;      // bumped on every write (cache invalidation)
 };
 
-// occupancy accessors (2 bits/chunk over the global slot space).
+// occupancy accessors (2 bits/chunk over the global slot space). Adjacent chunks
+// (consecutive slot indices) share one byte (4 slots/byte), so concurrent writers
+// MUST update it atomically -- a plain read-modify-write races and silently drops
+// a neighbor's state. CAS loop on the byte; reads are an atomic acquire-load.
 static inline int mca_occ_get(const struct mc_archive *a, uint64_t slot){
-    const uint8_t *p = a->base + a->occ_off + (slot >> 2);
-    return (*p >> ((unsigned)(slot & 3) * 2u)) & 3u;
+    const _Atomic uint8_t *p = (const _Atomic uint8_t*)(a->base + a->occ_off + (slot >> 2));
+    uint8_t b = atomic_load_explicit(p, memory_order_acquire);
+    return (b >> ((unsigned)(slot & 3) * 2u)) & 3u;
 }
 static inline void mca_occ_set(struct mc_archive *a, uint64_t slot, int st){
-    uint8_t *p = a->base + a->occ_off + (slot >> 2);
+    _Atomic uint8_t *p = (_Atomic uint8_t*)(a->base + a->occ_off + (slot >> 2));
     unsigned sh = (unsigned)(slot & 3) * 2u;
-    *p = (uint8_t)((*p & ~(3u << sh)) | ((unsigned)(st & 3) << sh));
+    uint8_t mask = (uint8_t)(3u << sh);
+    uint8_t old = atomic_load_explicit(p, memory_order_relaxed), nw;
+    do { nw = (uint8_t)((old & ~mask) | ((unsigned)(st & 3) << sh)); }
+    while(!atomic_compare_exchange_weak_explicit(p, &old, nw,
+              memory_order_release, memory_order_relaxed));
 }
 
 void priors_load(const uint8_t *base);

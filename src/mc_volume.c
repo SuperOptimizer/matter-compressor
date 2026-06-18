@@ -27,10 +27,6 @@ static inline uint64_t mc_covkey(int lod,int cz,int cy,int cx){
 // ============================================================================
 // mc_s3 — s3://-backed mc_reader glue (dep: libs3)
 // ============================================================================
-#include "libs3.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 struct mc_s3 {
     s3_client *cl;

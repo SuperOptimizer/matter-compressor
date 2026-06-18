@@ -760,7 +760,12 @@ void mc_codec_ctx_free(mc_codec_ctx *C){
     free(C->chunk.tmp.p);
     free(C);
 }
-void  mc_codec_ctx_set_quality(mc_codec_ctx *C, float q){ if(C){ C->quality=q; step_tab_build(C); } }
+void  mc_codec_ctx_set_quality(mc_codec_ctx *C, float q){
+    // reject NaN/Inf/<=0 (e.g. an untrusted per-chunk q): they make step=0 ->
+    // rstep=Inf and poison the quant tables (Inf*0=NaN; NaN->uint16 cast is UB).
+    if(!(q > 0.0f) || q > 1024.0f) q = 8.0f;
+    if(C){ C->quality=q; step_tab_build(C); }
+}
 float mc_codec_ctx_get_quality(mc_codec_ctx *C){ return C?C->quality:0.0f; }
 void  mc_codec_ctx_set_max_error(mc_codec_ctx *C, int tau){ if(C) C->max_err = tau<0?0:tau; }
 int   mc_codec_ctx_get_max_error(mc_codec_ctx *C){ return C?C->max_err:0; }
