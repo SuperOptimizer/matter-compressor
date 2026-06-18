@@ -113,22 +113,6 @@ int   mc_enc_block(mc_codec_ctx *ctx, const mc_u8 *vox, mc_buf *out, uint32_t *l
 // contained (mask in payload); plen comes from the chunk's block-length table.
 void  mc_dec_block(mc_codec_ctx *ctx, const mc_u8 *payload, uint32_t plen, mc_u8 *dst);
 
-// ---------------------------------------------------------------------------
-// c3g — GPU-amenable block codec (parallel rANS entropy; see docs/c3g_format.md)
-// ---------------------------------------------------------------------------
-// A SEPARATE, additional 16^3 block format whose payload one GPU thread can
-// decode (static rANS, no adaptive/cross-block state) while reusing the same
-// DCT-16 + dead-zone quant as the CABAC codec. The existing mc_enc/dec_block
-// format is unchanged. Same ctx (quality/scratch) drives both.
-//
-// Encode: same quant as mc_enc_block, then rANS-code the coefficient levels.
-// Appends a self-contained payload to `out`, sets *len_out. Returns 1 if coded,
-// 0 if the block is all-air (no payload, like mc_enc_block).
-int   mc_c3g_enc_block(mc_codec_ctx *ctx, const mc_u8 *vox, mc_buf *out, uint32_t *len_out);
-// Decode a c3g payload of `plen` bytes into dst (16^3). The reference the GPU
-// compute decoder must match bit-for-bit (same bytes in -> same 4096 voxels).
-void  mc_c3g_dec_block(mc_codec_ctx *ctx, const mc_u8 *payload, uint32_t plen, mc_u8 *dst);
-
 // per-chunk material-fraction map (4096 nibbles 0..15), context-coded.
 uint32_t mc_enc_fracmap(const mc_u8 *frac, mc_u8 *out, size_t cap);
 void     mc_dec_fracmap(const mc_u8 *in, uint32_t len, mc_u8 *frac);
@@ -196,20 +180,16 @@ mc_archive *mc_archive_open(const char *path, int dim, float quality);
 mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float quality);
 
 // Block entropy codec for the archive (stamped in the header at MCH_BLOCKCODEC).
-//   MC_BLOCKCODEC_CABAC (0) = the original adaptive-binary-range-coded blocks.
-//   MC_BLOCKCODEC_C3G   (1) = GPU-decodable static-rANS blocks (docs/c3g_format.md).
-// Old archives have 0 and decode as CABAC, so this is backward compatible. The
-// decode path (reader + archive) dispatches on the stored codec automatically.
+//   MC_BLOCKCODEC_CABAC (0) = adaptive-binary-range-coded blocks (the only codec).
+// (c3g was removed.) Old archives have 0 here and decode as CABAC.
 #define MC_BLOCKCODEC_CABAC 0u
-#define MC_BLOCKCODEC_C3G   1u
 // Set the codec on a FRESH archive before appending chunks (stamps the header).
 // Returns 0 on success, <0 on unknown codec. Default (unset) is CABAC.
 int      mc_archive_set_block_codec(mc_archive *a, uint32_t codec);
 uint32_t mc_archive_block_codec(const mc_archive *a);
 
 // Raw compressed bytes of one 16^3 block (no decode): on success points *ptr
-// into the archive's live mapping and sets *len. For a c3g archive these are
-// exactly the bytes the GPU compute decoder reads. Returns 1 if present, 0 if
+// into the archive's live mapping and sets *len. Returns 1 if present, 0 if
 // absent/air/out-of-bounds. Pointer is valid while the archive is open.
 int mc_archive_block_blob(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx,
                           const uint8_t **ptr, uint32_t *len);

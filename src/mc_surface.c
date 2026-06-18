@@ -1,6 +1,5 @@
 /* mc_surface.c — parametric surface I/O (see mc_surface.h). */
 #include "mc_surface.h"
-#include "mc_tiff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,48 +14,6 @@ void mc_surface_free(mc_surface *s){
 mc_quad mc_surface_quad(const mc_surface *s){
     mc_quad q = { s->grid, s->gw, s->gh };
     return q;
-}
-
-int mc_surface_load_tiff(const char *path, mc_surface *s){
-    memset(s,0,sizeof *s);
-    mc_tiff t;
-    if(mc_tiff_open(path,&t)!=0) return -1;
-    if(t.samples!=4 || t.type!=MC_TIFF_F32){ mc_tiff_close(&t); return -2; }
-    int gw=t.width, gh=t.height;
-    size_t n=(size_t)gw*gh;
-    float *grid = malloc(n*3*sizeof(float));
-    float *depth= malloc(n*sizeof(float));
-    if(!grid||!depth){ free(grid); free(depth); mc_tiff_close(&t); return -3; }
-
-    const float (*px)[4] = (const float (*)[4])t.pixels;   // (x,y,z,depth)
-    double dsum=0; long dcnt=0;
-    for(size_t i=0;i<n;++i){
-        float x=px[i][0], y=px[i][1], z=px[i][2], d=px[i][3];
-        // store as (z,y,x) for mc_quad; preserve VC's invalid marker.
-        if(x<0 && y<0 && z<0){ grid[i*3]=-1; grid[i*3+1]=-1; grid[i*3+2]=-1; depth[i]=0; }
-        else { grid[i*3]=z; grid[i*3+1]=y; grid[i*3+2]=x; depth[i]=d;
-               if(d>0){ dsum+=d; dcnt++; } }
-    }
-    mc_tiff_close(&t);
-    s->gw=gw; s->gh=gh; s->grid=grid; s->depth=depth;
-    s->mean_depth = dcnt ? (float)(dsum/(double)dcnt) : 0.0f;
-    return 0;
-}
-
-int mc_surface_save_tiff(const char *path, const mc_surface *s){
-    if(!s||!s->grid||s->gw<1||s->gh<1) return -1;
-    size_t n=(size_t)s->gw*s->gh;
-    float (*px)[4] = malloc(n*sizeof *px);
-    if(!px) return -1;
-    for(size_t i=0;i<n;++i){
-        float z=s->grid[i*3], y=s->grid[i*3+1], x=s->grid[i*3+2];
-        if(x<0 && y<0 && z<0){ px[i][0]=-1; px[i][1]=-1; px[i][2]=-1; px[i][3]=0; }
-        else { px[i][0]=x; px[i][1]=y; px[i][2]=z;
-               px[i][3] = s->depth ? s->depth[i] : s->mean_depth; }
-    }
-    int rc = mc_tiff_write(path, s->gw, s->gh, 4, MC_TIFF_F32, px);
-    free(px);
-    return rc;
 }
 
 // any coord < 0 marks an invalid grid point.

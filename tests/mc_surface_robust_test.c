@@ -8,7 +8,7 @@
 //
 // Run under ASan/UBSan with leak detection so a regression faults hard:
 //   clang -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-//     tests/mc_surface_robust_test.c src/mc_surface.c src/mc_tiff.c -Isrc -lm \
+//     tests/mc_surface_robust_test.c src/mc_surface.c tiff/tiff.c -Isrc -Itiff -lm \
 //     -o t && ASAN_OPTIONS=detect_leaks=1 ./t
 #include "mc_surface.h"
 #include <stdio.h>

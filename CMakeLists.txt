@@ -59,26 +59,40 @@ endif()
 
 # core library: codec + archive + cache + sample/render + zarr/s3/volume —
 # everything in one .c/.h pair. Required deps: libcurl + libzstd (and the
-# in-tree c3d.c + vendored libs3.c, compiled into the target).
+# vendored libs3.c, compiled into the target unless MC_LIBS3_TARGET is set).
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_library(ZSTD_LIB zstd REQUIRED HINTS /opt/homebrew/lib /usr/local/lib)
 find_path(ZSTD_INC zstd.h REQUIRED HINTS /opt/homebrew/include /usr/local/include)
+# libs3 is vendored by default; a parent project (taberna) can supply the shared
+# `s3` target via -DMC_LIBS3_TARGET=s3 so there is ONE libs3 across the build
+# (avoids duplicate s3_* symbols when this lib is linked alongside another libs3 user).
+set(MC_LIBS3_TARGET "" CACHE STRING "external libs3 target to link instead of the vendored tools/vendor/libs3 copy")
+if(MC_LIBS3_TARGET)
+  set(MC_LIBS3_SRC "")
+else()
+  set(MC_LIBS3_SRC tools/vendor/libs3/libs3.c)
+endif()
 add_library(matter_compressor STATIC
-  src/matter_compressor.c
-  src/c3d.c
-  src/mc_tiff.c
+  src/mc_codec.c
+  src/mc_archive.c
+  src/mc_stream.c
+  src/mc_cache.c
+  src/mc_render.c
+  src/mc_zarr.c
+  src/mc_volume.c
   src/mc_surface.c
   src/mc_segment.c
   src/mc_solve.c
   src/mc_trace.c
-  tools/vendor/libs3/libs3.c)
-target_include_directories(matter_compressor
-  PUBLIC src PRIVATE tools/vendor/libs3 ${ZSTD_INC})
+  ${MC_LIBS3_SRC})
+target_include_directories(matter_compressor PUBLIC src PRIVATE ${ZSTD_INC})
+if(MC_LIBS3_TARGET)
+  target_link_libraries(matter_compressor ${MC_LIBS3_TARGET})
+else()
+  target_include_directories(matter_compressor PRIVATE tools/vendor/libs3)
+endif()
 set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
-# c3d decode output feeds the .mca re-encode, so honor the archive
-# determinism policy: no -ffast-math, explicit -ffp-contract=off.
-set_source_files_properties(src/c3d.c PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off;-fno-openmp")
 target_link_libraries(matter_compressor CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
 
 # The codec is the hot path; build it -O3 -march=native regardless of
@@ -123,15 +137,8 @@ if(MC_STANDALONE)
   target_link_libraries(mc_render_test matter_compressor)
   add_test(NAME render COMMAND mc_render_test)
 
-  # c3g (GPU-amenable rANS block codec) parity vs CABAC + determinism.
-  add_executable(mc_c3g_test tests/mc_c3g_test.c)
-  target_link_libraries(mc_c3g_test matter_compressor)
-  add_test(NAME c3g COMMAND mc_c3g_test)
-
-  # minimal TIFF reader/writer (all sample types + mmap-into-struct).
-  add_executable(mc_tiff_test tests/mc_tiff_test.c)
-  target_link_libraries(mc_tiff_test matter_compressor)
-  add_test(NAME tiff COMMAND mc_tiff_test)
+  # TIFF reader/writer lives in the tiff/ submodule with its own tests
+  # (cmake -B build tiff && ctest); not re-tested here.
 
   # parametric surface I/O: 4x-f32 grid TIFF (x,y,z,depth) + OBJ + PPM.
   add_executable(mc_surface_test tests/mc_surface_test.c)
@@ -143,11 +150,8 @@ if(MC_STANDALONE)
   target_link_libraries(mc_segment_test matter_compressor)
   add_test(NAME segment COMMAND mc_segment_test)
 
-  # TIFF reader untrusted-input hardening regression (2 fuzz-found OOB/degenerate
-  # bugs; see tests/fuzz/mc_fuzz_tiff.c + tests/fuzz/FINDINGS.md).
-  add_executable(mc_tiff_robust_test tests/mc_tiff_robust_test.c)
-  target_link_libraries(mc_tiff_robust_test matter_compressor)
-  add_test(NAME tiff_robust COMMAND mc_tiff_robust_test)
+  # TIFF reader untrusted-input hardening lives in the tiff/ submodule
+  # (tiff/tiff_robust_test.c + tiff/fuzz_tiff.c).
 
   # surface-loader untrusted-input hardening regression (4 fuzz-found bugs: leak,
   # unchecked realloc, OOB face index, dim overflow; tests/fuzz/mc_fuzz_surface.c).
@@ -164,11 +168,6 @@ if(MC_STANDALONE)
   add_executable(mc_trace_test tests/mc_trace_test.c)
   target_link_libraries(mc_trace_test matter_compressor)
   add_test(NAME trace COMMAND mc_trace_test)
-
-  # c3g in the .mca archive: header codec field, round-trip == CABAC, back-compat.
-  add_executable(mc_c3g_archive_test tests/mc_c3g_archive_test.c)
-  target_link_libraries(mc_c3g_archive_test matter_compressor)
-  add_test(NAME c3g_archive COMMAND mc_c3g_archive_test)
 
   # public-API surface coverage: introspection getters, codec/quality extras,
   # colormap + image filters, plane/quad/LOD samplers + parallel renderers.
@@ -221,7 +220,7 @@ if(MC_STANDALONE)
   # archive repacker: Morton order + clustered index for streaming + offline
   add_executable(mc_export tools/mc_export.c)
   target_include_directories(mc_export PRIVATE src tools/vendor/libs3 ${ZSTD_INC})
-  target_sources(mc_export PRIVATE src/c3d.c tools/vendor/libs3/libs3.c)
+  target_sources(mc_export PRIVATE tools/vendor/libs3/libs3.c)
   target_link_libraries(mc_export CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
 
   # tools: benchmark harness (no extra deps) + zarr fetcher (libcurl + libzstd).
@@ -276,22 +275,6 @@ if(MC_STANDALONE)
            COMMAND mc_make_fixture ${MC_FIXTURE_DIR})
   set_tests_properties(zarr_fixture_setup PROPERTIES FIXTURES_SETUP zarr_fixture)
 
-  # v3 / c3d-sharded fixture (the v2/raw fixture can't reach the c3d inner-codec
-  # branches). Generator links the lib (it uses the c3d encoder).
-  add_executable(mc_make_fixture_v3 tests/support/mc_make_fixture_v3.c)
-  target_link_libraries(mc_make_fixture_v3 matter_compressor)
-  set(MC_FIXTURE_V3_DIR ${CMAKE_BINARY_DIR}/fixture_v3)
-  add_test(NAME zarr_v3_fixture_setup
-           COMMAND mc_make_fixture_v3 ${MC_FIXTURE_V3_DIR})
-  set_tests_properties(zarr_v3_fixture_setup PROPERTIES FIXTURES_SETUP zarr_v3_fixture)
-
-  # v3 zarr read path against the c3d fixture (footer index, read_inner/shard).
-  add_executable(mc_zarr_v3_test tests/mc_zarr_test.c)
-  set_property(TARGET mc_zarr_v3_test PROPERTY C_STANDARD 23)
-  target_link_libraries(mc_zarr_v3_test matter_compressor)
-  add_test(NAME zarr_v3 COMMAND mc_zarr_v3_test ${MC_FIXTURE_V3_DIR}/zarr/0)
-  set_tests_properties(zarr_v3 PROPERTIES FIXTURES_REQUIRED zarr_v3_fixture)
-
   # v2 blosc+zstd fixture -> the blosc_decode path (raw fixture is compressor:null).
   add_executable(mc_make_fixture_blosc tests/support/mc_make_fixture_blosc.c)
   target_link_libraries(mc_make_fixture_blosc ${ZSTD_LIB})
@@ -305,13 +288,6 @@ if(MC_STANDALONE)
   target_link_libraries(mc_zarr_blosc_test matter_compressor)
   add_test(NAME zarr_blosc COMMAND mc_zarr_blosc_test ${MC_FIXTURE_BLOSC_DIR}/zarr/0)
   set_tests_properties(zarr_blosc PROPERTIES FIXTURES_REQUIRED zarr_blosc_fixture)
-
-  # v3 volume c3d-transcode path (prefetch_shard full body, c3d decode pool).
-  add_executable(mc_volume_v3_test tests/mc_volume_v3_test.c)
-  target_link_libraries(mc_volume_v3_test matter_compressor)
-  add_test(NAME volume_v3
-           COMMAND mc_volume_v3_test ${MC_FIXTURE_V3_DIR}/zarr ${CMAKE_BINARY_DIR})
-  set_tests_properties(volume_v3 PROPERTIES FIXTURES_REQUIRED zarr_v3_fixture)
 
   add_executable(mc_zarr_test tests/mc_zarr_test.c)
   set_property(TARGET mc_zarr_test PROPERTY C_STANDARD 23)
@@ -346,10 +322,3 @@ if(MC_STANDALONE)
   target_link_libraries(mc_stream_probe matter_compressor CURL::libcurl)
 endif()
 
-# Integrated slice viewer (SDL3 + Nuklear + SDL_GPU). Opt-in and standalone-only:
-# pulls SDL3 from git via FetchContent, so it stays out of the default build,
-# the test matrix, and CI unless explicitly requested with -DMC_BUILD_VIEWER=ON.
-option(MC_BUILD_VIEWER "Build the SDL3/Nuklear slice viewer (mc_viewer)" OFF)
-if(MC_STANDALONE AND MC_BUILD_VIEWER)
-  add_subdirectory(tools/mc_viewer)
-endif()

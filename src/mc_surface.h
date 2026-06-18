@@ -27,15 +27,6 @@ typedef struct {
     float  mean_depth;    // average of valid depths (convenience)
 } mc_surface;
 
-// Load a surface from a 4x-f32 TIFF (x,y,z,depth). Returns 0 on success
-// (fills *s, allocates grid+depth), <0 on error / wrong format. Free with
-// mc_surface_free.
-int  mc_surface_load_tiff(const char *path, mc_surface *s);
-
-// Save a surface to a 4x-f32 TIFF (x,y,z,depth). If s->depth is NULL, writes
-// the surface's mean_depth (or 0) for every point. Returns 0 on success.
-int  mc_surface_save_tiff(const char *path, const mc_surface *s);
-
 void mc_surface_free(mc_surface *s);
 
 // Expose the grid as an mc_quad (z,y,x) for the existing quad renderer.

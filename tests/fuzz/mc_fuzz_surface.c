@@ -12,8 +12,8 @@
 //
 // Loaders take a PATH, so we materialize each input to a temp file.
 //   AFL_USE_ASAN=1 AFL_USE_UBSAN=1 afl-clang-fast \
-//     tests/fuzz/mc_fuzz_surface.c src/mc_surface.c src/mc_tiff.c \
-//     -Isrc -O1 -g -lm -o mc_fuzz_surface
+//     tests/fuzz/mc_fuzz_surface.c src/mc_surface.c tiff/tiff.c \
+//     -Isrc -Itiff -O1 -g -lm -o mc_fuzz_surface
 //   afl-fuzz -i corpus -o findings -- ./mc_fuzz_surface @@
 // Standalone replay (CI smoke / crash replay): -DMC_FUZZ_STANDALONE.
 #include "mc_surface.h"

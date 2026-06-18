@@ -25,16 +25,16 @@ CC="$AFL_DIR/afl-clang-fast"
 [ -x "$CC" ] || { echo "afl-clang-fast not found (set AFL_DIR); is AFL++ installed?"; exit 2; }
 
 SRC=(src/matter_compressor.c src/c3d.c tools/vendor/libs3/libs3.c)
-INC=(-Isrc -Itools/vendor/libs3)
+INC=(-Isrc -Itiff -Itools/vendor/libs3)
 LIBS=(-lm -lpthread -lzstd -lcurl)
 SEEDGEN=""
 case "$TARGET" in
   decode) HARNESS=tests/fuzz/mc_fuzz_decode.c; SEEDGEN=tests/fuzz/mc_fuzz_seed.c;;
   block)  HARNESS=tests/fuzz/mc_fuzz_block.c;  SEEDGEN=tests/fuzz/mc_fuzz_block_seed.c;;
-  tiff)   HARNESS=tests/fuzz/mc_fuzz_tiff.c;   SEEDGEN=tests/fuzz/mc_fuzz_tiff_seed.c
-          SRC=(src/mc_tiff.c); LIBS=(-lm);;   # self-contained reader, no archive/libs3 deps
+  tiff)   HARNESS=tiff/fuzz_tiff.c;   SEEDGEN=tiff/fuzz_tiff_seed.c
+          SRC=(tiff/tiff.c); LIBS=(-lm);;   # self-contained reader, no archive/libs3 deps
   surface) HARNESS=tests/fuzz/mc_fuzz_surface.c; SEEDGEN=tests/fuzz/mc_fuzz_surface_seed.c
-          SRC=(src/mc_surface.c src/mc_tiff.c); LIBS=(-lm);;   # surface loaders + their tiff dep
+          SRC=(src/mc_surface.c tiff/tiff.c); LIBS=(-lm);;   # surface loaders + their tiff dep
   segment) HARNESS=tests/fuzz/mc_fuzz_segment.c; SEEDGEN=tests/fuzz/mc_fuzz_segment_seed.c
           SRC=(src/mc_segment.c); LIBS=(-lm);;   # self-contained detector + post-proc
   *) echo "unknown target '$TARGET' (decode|block|tiff|surface|segment)"; exit 2;;

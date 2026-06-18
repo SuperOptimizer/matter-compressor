@@ -19,7 +19,6 @@
  */
 #include "matter_compressor.h"
 #include "mc_surface.h"
-#include "mc_tiff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

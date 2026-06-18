@@ -3,7 +3,6 @@
 // per-point depth survive, invalid points are preserved, and the OBJ carries
 // the grid back.
 #include "mc_surface.h"
-#include "mc_tiff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

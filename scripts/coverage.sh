@@ -26,8 +26,8 @@ case "$("$CC" --version 2>/dev/null | head -1)" in
   *) echo "coverage.sh requires clang (CC=$CC is not clang)"; exit 2;;
 esac
 
-SRC=(src/matter_compressor.c src/c3d.c src/mc_tiff.c src/mc_surface.c src/mc_segment.c tools/vendor/libs3/libs3.c)
-INC=(-Isrc -Itools/vendor/libs3)
+SRC=(src/matter_compressor.c src/c3d.c tiff/tiff.c src/mc_surface.c src/mc_segment.c tools/vendor/libs3/libs3.c)
+INC=(-Isrc -Itiff -Itools/vendor/libs3)
 LIBS=(-lm -lpthread -lzstd -lcurl)
 CFLAGS=(-O1 -g -fprofile-instr-generate -fcoverage-mapping -w "${INC[@]}")
 
@@ -39,8 +39,8 @@ OFFLINE_TESTS=(
   mc_volume_offline_test mc_volume_api_test mc_zarr_test mc_api_test
   mc_decode_robust_test mc_stream_volume_api_test mc_volume_v3_test
   mc_archive_errpaths_test
-  mc_tiff_test mc_surface_test mc_segment_test
-  mc_tiff_robust_test mc_surface_robust_test
+  mc_surface_test mc_segment_test
+  mc_surface_robust_test
 )
 
 rm -rf "$OUT"; mkdir -p "$OUT/prof" "$OUT/bin"
@@ -121,7 +121,7 @@ llvm-profdata merge -sparse "$OUT"/prof/*.profraw -o "$OUT/merged.profdata"
 # Report scoped to the first-party core sources (c3d.c + vendored libs3 stay
 # excluded — third-party / separately validated decoders).
 FIRST="$OUT/bin/${built[0]}"
-SCOPE=("$ROOT/src/matter_compressor.c" "$ROOT/src/mc_tiff.c" "$ROOT/src/mc_surface.c" "$ROOT/src/mc_segment.c")
+SCOPE=("$ROOT/src/matter_compressor.c" "$ROOT/tiff/tiff.c" "$ROOT/src/mc_surface.c" "$ROOT/src/mc_segment.c")
 llvm-cov report "$FIRST" "${objs[@]:2}" -instr-profile="$OUT/merged.profdata" "${SCOPE[@]}" \
   | tee "$OUT/coverage.txt"
 llvm-cov export "$FIRST" "${objs[@]:2}" -instr-profile="$OUT/merged.profdata" -format=lcov "${SCOPE[@]}" \
@@ -135,7 +135,7 @@ LINE_PCT="$(awk '/^TOTAL/{print $(NF-3)}' "$OUT/coverage.txt" | tr -d '%' | head
 # (mc_s3_*, mc_stream_fetch_batch). Surfaced so the % is read in context.
 NEON_LINES="$(awk '/#if.*MC_SIMD_NEON/{n=1} n{c++} /#else|#elif|#endif/{if(n&&c>1)t+=c-1;n=0;c=0} END{print t+0}' "$ROOT/src/matter_compressor.c")"
 {
-  echo '### Coverage — core sources (`matter_compressor.c`, `mc_tiff.c`, `mc_surface.c`, `mc_segment.c`)'
+  echo '### Coverage — core sources (`matter_compressor.c`, `tiff.c`, `mc_surface.c`, `mc_segment.c`)'
   echo '```'
   cat "$OUT/coverage.txt"
   echo '```'
