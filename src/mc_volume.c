@@ -576,7 +576,7 @@ static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx
     int rerr = 0;
     uint64_t off = mc_chunk_offset_chk(v->rd, lod, rz, ry, rx, &rerr);
     if (rerr) return;                                  // transient: leave ABSENT, retry
-    if (off <= MC_SLOT_ZERO) {                          // CONFIRMED air (absent OR remote
+    if (off == 0) {                          // CONFIRMED air (absent OR remote
         // ZERO slot) -> record a local ZERO region. Without this, a remote MC_SLOT_ZERO
         // (==1) chunk -- the masked margin at mid LODs -- stayed ABSENT locally, so the
         // render's LOD fallback walked PAST it to a coarser PRESENT level and sampled
@@ -596,24 +596,14 @@ static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx
     free(blob);
 }
 
-// Blob total length parsed from its LEADING bytes (header + fmap + bitmap + len
-// table must all be inside `buf`). 0 = window too short (caller falls back to the
-// exact serial path). Mirrors mc_reader_chunk_blob_len, but over one buffer.
+// Chunk total length parsed from its LEADING bytes: the static format puts the
+// offset-table terminator (= chunk length) inside the fixed header, so the whole
+// length is known once `buf` covers the offset table. 0 = window too short.
 static uint64_t mc_blob_len_parse(const uint8_t *buf, size_t len) {
-    if (len < MC_BLOB_HDR) return 0;
-    uint16_t fml; memcpy(&fml, buf + MC_BLOB_HDR - 2, 2);
-    uint64_t bm_off = (uint64_t)MC_BLOB_HDR + fml;
-    if (len < bm_off + MC_BITMAP_BYTES) return 0;
-    int np = 0;
-    for (int i = 0; i < MC_BITMAP_BYTES; ++i) np += __builtin_popcount(buf[bm_off + i]);
-    if (!np) return bm_off + MC_BITMAP_BYTES;
-    if (len < bm_off + MC_BITMAP_BYTES + (size_t)np * 2) return 0;
-    uint64_t pay = 0;
-    for (int i = 0; i < np; ++i) {
-        uint16_t l; memcpy(&l, buf + bm_off + MC_BITMAP_BYTES + (size_t)i * 2, 2);
-        pay += l;
-    }
-    return bm_off + MC_BITMAP_BYTES + (uint64_t)np * 2 + pay;
+    if (len < MC_CHUNK_HDR) return 0;                 // need the full offset table
+    uint64_t total = mc_chunk_len(buf);              // terminator entry
+    if (total < MC_CHUNK_PAYLOAD_OFF || total > MC_SLOT_STRIDE) return 0;
+    return total;
 }
 
 // Streaming fetch of a BATCH of regions -- the throughput path. The serial
@@ -636,7 +626,7 @@ static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
         int rerr = 0;
         uint64_t o = mc_chunk_offset_chk(v->rd, lods[i], rz[i], ry[i], rx[i], &rerr);
         if (rerr) continue;                                    // transient: leave ABSENT, retry
-        if (o <= MC_SLOT_ZERO) {                               // CONFIRMED air (absent OR remote
+        if (o == 0) {                               // CONFIRMED air (absent OR remote
             // ZERO slot) -> local ZERO region. A remote MC_SLOT_ZERO must record locally
             // as ZERO, else the masked margin stays ABSENT and the LOD fallback bleeds
             // coarser PRESENT data into the void.
