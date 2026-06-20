@@ -51,284 +51,27 @@ typedef uint8_t u8;
 #define MC_DCT_ALIGN 64
 typedef int32_t mc_fi32;
 
-// Q14 cosine matrix for N=16, built once. Packed even/odd variants:
-//   g_cm_eT[n][j] = cm[2j][n], g_cm_oT[n][j] = cm[2j+1][n]   (forward, k-contig)
-//   g_cm_e [j][n] = cm[2j][n], g_cm_o [j][n] = cm[2j+1][n]   (inverse, n-contig)
-static mc_fi32 g_mc_cm[MC_DCT_N][MC_DCT_N] __attribute__((aligned(MC_DCT_ALIGN)));
-static mc_fi32 g_cm_eT[8][8] __attribute__((aligned(MC_DCT_ALIGN)));
-static mc_fi32 g_cm_oT[8][8] __attribute__((aligned(MC_DCT_ALIGN)));
-static mc_fi32 g_cm_e [8][8] __attribute__((aligned(MC_DCT_ALIGN)));
-static mc_fi32 g_cm_o [8][8] __attribute__((aligned(MC_DCT_ALIGN)));
-static mc_fi32 g_cm_eo[8][16] __attribute__((aligned(MC_DCT_ALIGN)));   // [e row | o row] for zmm
-static int g_mc_cm_ready = 0;
-static void mc_dct_init(void){
-    if(g_mc_cm_ready) return;
-    double scale=(double)((int64_t)1<<MC_DCT_Q);
-    for(int k=0;k<MC_DCT_N;++k){ double ck=(k==0)?sqrt(1.0/MC_DCT_N):sqrt(2.0/MC_DCT_N);
-        for(int n=0;n<MC_DCT_N;++n){ double v=ck*cos(M_PI*(2.0*n+1.0)*k/(2.0*MC_DCT_N));
-            g_mc_cm[k][n]=(mc_fi32)llround(v*scale); } }
-    for(int j=0;j<8;++j)for(int n=0;n<8;++n){
-        g_cm_e[j][n]=g_mc_cm[2*j][n];   g_cm_eT[n][j]=g_mc_cm[2*j][n];
-        g_cm_o[j][n]=g_mc_cm[2*j+1][n]; g_cm_oT[n][j]=g_mc_cm[2*j+1][n];
-        g_cm_eo[j][n]=g_cm_e[j][n];     g_cm_eo[j][n+8]=g_cm_o[j][n];
-    }
-    g_mc_cm_ready=1;
-}
+// Float DCT-16: the integer Q14 fixed-point transform was REPLACED by the f32
+// transform in mc_codec_float.h. It is orthonormal with the same normalization
+// as the old integer table, so the quality/step calibration carries over
+// unchanged; it removes the per-pass >>14 rounding and the lrintf boundary
+// casts, so reconstruction no longer accumulates fixed-point noise. The old
+// integer path (g_mc_cm tables, mc_dct1d_*, mc_lines_*, mc_rot, mc_dct3_inv_i32)
+// and its SIMD variants are gone; archives written by it are not supported.
+#include "mc_codec_float.h"
+static void mc_dct_init(void){ mc_dctf_init(); }
 
-// 1D forward DCT-II (even/odd partial butterfly). NEON/AVX2: packed transposed
-// tables (g_cm_eT/oT) give contiguous 8-lane MACs; scalar keeps the k-parallel
-// form (measured faster under autovectorization). (AVX-512 defines fwd+inv
-// together above.)
-#if MC_SIMD_AVX512
-/* defined alongside the inverse above */
-#elif MC_SIMD_NEON
-static inline void mc_dct1d_fwd(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1); const int S=MC_DCT_N, H=S/2;
-    mc_fi32 s[8], d[8];
-    for(int n=0;n<H;++n){ s[n]=in[n]+in[S-1-n]; d[n]=in[n]-in[S-1-n]; }
-    int32x4_t ae0=vdupq_n_s32(rnd), ae1=vdupq_n_s32(rnd);
-    int32x4_t ao0=vdupq_n_s32(rnd), ao1=vdupq_n_s32(rnd);
-    for(int n=0;n<H;++n){
-        int32x4_t sn=vdupq_n_s32(s[n]), dn=vdupq_n_s32(d[n]);
-        ae0=vmlaq_s32(ae0,vld1q_s32(&g_cm_eT[n][0]),sn);
-        ae1=vmlaq_s32(ae1,vld1q_s32(&g_cm_eT[n][4]),sn);
-        ao0=vmlaq_s32(ao0,vld1q_s32(&g_cm_oT[n][0]),dn);
-        ao1=vmlaq_s32(ao1,vld1q_s32(&g_cm_oT[n][4]),dn);
-    }
-    mc_fi32 e[8],o[8];
-    vst1q_s32(e,vshrq_n_s32(ae0,MC_DCT_Q)); vst1q_s32(e+4,vshrq_n_s32(ae1,MC_DCT_Q));
-    vst1q_s32(o,vshrq_n_s32(ao0,MC_DCT_Q)); vst1q_s32(o+4,vshrq_n_s32(ao1,MC_DCT_Q));
-    for(int j=0;j<8;++j){ out[2*j]=e[j]; out[2*j+1]=o[j]; }
-}
-#elif MC_SIMD_AVX2
-static inline void mc_dct1d_fwd(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1); const int S=MC_DCT_N, H=S/2;
-    mc_fi32 s[8], d[8];
-    for(int n=0;n<H;++n){ s[n]=in[n]+in[S-1-n]; d[n]=in[n]-in[S-1-n]; }
-    __m256i ae=_mm256_set1_epi32(rnd), ao=_mm256_set1_epi32(rnd);
-    for(int n=0;n<H;++n){
-        ae=_mm256_add_epi32(ae,_mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*)&g_cm_eT[n][0]),_mm256_set1_epi32(s[n])));
-        ao=_mm256_add_epi32(ao,_mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*)&g_cm_oT[n][0]),_mm256_set1_epi32(d[n])));
-    }
-    mc_fi32 e[8],o[8];
-    _mm256_storeu_si256((__m256i*)e,_mm256_srai_epi32(ae,MC_DCT_Q));
-    _mm256_storeu_si256((__m256i*)o,_mm256_srai_epi32(ao,MC_DCT_Q));
-    for(int j=0;j<8;++j){ out[2*j]=e[j]; out[2*j+1]=o[j]; }
-}
-#else
-static inline void mc_dct1d_fwd(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1); const int S=MC_DCT_N, H=S/2;
-    mc_fi32 s[H], d[H];
-    for(int n=0;n<H;++n){ s[n]=in[n]+in[S-1-n]; d[n]=in[n]-in[S-1-n]; }
-    mc_fi32 acc[MC_DCT_N]; for(int k=0;k<S;++k) acc[k]=rnd;
-    for(int n=0;n<H;++n){ mc_fi32 sn=s[n], dn=d[n];
-        for(int k=0;k<S;k+=2) acc[k]+=g_mc_cm[k][n]*sn;
-        for(int k=1;k<S;k+=2) acc[k]+=g_mc_cm[k][n]*dn; }
-    for(int k=0;k<S;++k) out[k]=acc[k]>>MC_DCT_Q;
-}
-#endif
-// 1D inverse, sparse-aware: skips zero coefficients (most lines have only a few
-// nonzero low-frequency entries after dequant). NEON/AVX2 kernels measured
-// ~1.6x over the autovectorized scalar form; scalar fallback kept.
-#if MC_SIMD_NEON
-static inline void mc_dct1d_inv(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1);
-    const mc_fi32 *ce=&g_cm_e[0][0], *co=&g_cm_o[0][0];   // one base each: the
-    // unrolled loop below indexes with immediates instead of re-materializing
-    // adrp+add per table row (objdump finding).
-    int32x4_t ae0=vdupq_n_s32(rnd), ae1=vdupq_n_s32(rnd);
-    int32x4_t ao0=vdupq_n_s32(0),  ao1=vdupq_n_s32(0);
-    for(int j=0;j<8;++j){
-        mc_fi32 ve=in[2*j];
-        if(ve){
-            int32x4_t v=vdupq_n_s32(ve);
-            ae0=vmlaq_s32(ae0,vld1q_s32(ce+j*8),v);
-            ae1=vmlaq_s32(ae1,vld1q_s32(ce+j*8+4),v);
-        }
-        mc_fi32 vo=in[2*j+1];
-        if(vo){
-            int32x4_t v=vdupq_n_s32(vo);
-            ao0=vmlaq_s32(ao0,vld1q_s32(co+j*8),v);
-            ao1=vmlaq_s32(ao1,vld1q_s32(co+j*8+4),v);
-        }
-    }
-    int32x4_t s0=vshrq_n_s32(vaddq_s32(ae0,ao0),MC_DCT_Q);
-    int32x4_t s1=vshrq_n_s32(vaddq_s32(ae1,ao1),MC_DCT_Q);
-    int32x4_t d0=vshrq_n_s32(vsubq_s32(ae0,ao0),MC_DCT_Q);
-    int32x4_t d1=vshrq_n_s32(vsubq_s32(ae1,ao1),MC_DCT_Q);
-    vst1q_s32(out,s0); vst1q_s32(out+4,s1);
-    int32x4_t r1=vrev64q_s32(d1); r1=vextq_s32(r1,r1,2);   // reverse lanes
-    int32x4_t r0=vrev64q_s32(d0); r0=vextq_s32(r0,r0,2);
-    vst1q_s32(out+8,r1); vst1q_s32(out+12,r0);
-}
-#elif MC_SIMD_AVX512
-// even+odd accumulators in one zmm: lanes [ae0..ae7 | ao0..ao7].
-static inline void mc_dct1d_inv(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1);
-    __m512i acc=_mm512_inserti64x4(_mm512_set1_epi32(rnd),_mm256_setzero_si256(),1);
-    for(int j=0;j<8;++j){
-        mc_fi32 ve=in[2*j], vo=in[2*j+1];
-        if(!(ve|vo)) continue;
-        __m512i val=_mm512_inserti64x4(_mm512_set1_epi32(ve),_mm256_set1_epi32(vo),1);
-        acc=_mm512_add_epi32(acc,_mm512_mullo_epi32(_mm512_load_si512(&g_cm_eo[j][0]),val));
-    }
-    __m256i ae=_mm512_extracti64x4_epi64(acc,0), ao=_mm512_extracti64x4_epi64(acc,1);
-    __m256i sm=_mm256_srai_epi32(_mm256_add_epi32(ae,ao),MC_DCT_Q);
-    __m256i d =_mm256_srai_epi32(_mm256_sub_epi32(ae,ao),MC_DCT_Q);
-    _mm256_storeu_si256((__m256i*)out,sm);
-    __m256i rev=_mm256_shuffle_epi32(d,_MM_SHUFFLE(0,1,2,3));
-    rev=_mm256_permute2x128_si256(rev,rev,1);
-    _mm256_storeu_si256((__m256i*)(out+8),rev);
-}
-static inline void mc_dct1d_fwd(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1); const int S=MC_DCT_N, H=S/2;
-    mc_fi32 s[8], d[8];
-    for(int n=0;n<H;++n){ s[n]=in[n]+in[S-1-n]; d[n]=in[n]-in[S-1-n]; }
-    __m256i ae=_mm256_set1_epi32(rnd), ao=_mm256_set1_epi32(rnd);
-    for(int n=0;n<H;++n){
-        ae=_mm256_add_epi32(ae,_mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*)&g_cm_eT[n][0]),_mm256_set1_epi32(s[n])));
-        ao=_mm256_add_epi32(ao,_mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*)&g_cm_oT[n][0]),_mm256_set1_epi32(d[n])));
-    }
-    mc_fi32 e[8],o[8];
-    _mm256_storeu_si256((__m256i*)e,_mm256_srai_epi32(ae,MC_DCT_Q));
-    _mm256_storeu_si256((__m256i*)o,_mm256_srai_epi32(ao,MC_DCT_Q));
-    for(int j=0;j<8;++j){ out[2*j]=e[j]; out[2*j+1]=o[j]; }
-}
-#elif MC_SIMD_AVX2
-static inline void mc_dct1d_inv(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1);
-    __m256i ae=_mm256_set1_epi32(rnd), ao=_mm256_setzero_si256();
-    for(int j=0;j<8;++j){
-        mc_fi32 ve=in[2*j];
-        if(ve) ae=_mm256_add_epi32(ae,_mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*)&g_cm_e[j][0]),_mm256_set1_epi32(ve)));
-        mc_fi32 vo=in[2*j+1];
-        if(vo) ao=_mm256_add_epi32(ao,_mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*)&g_cm_o[j][0]),_mm256_set1_epi32(vo)));
-    }
-    __m256i s=_mm256_srai_epi32(_mm256_add_epi32(ae,ao),MC_DCT_Q);
-    __m256i d=_mm256_srai_epi32(_mm256_sub_epi32(ae,ao),MC_DCT_Q);
-    _mm256_storeu_si256((__m256i*)out,s);
-    // reverse d into out[8..15]
-    __m256i rev=_mm256_shuffle_epi32(d,_MM_SHUFFLE(0,1,2,3));
-    rev=_mm256_permute2x128_si256(rev,rev,1);
-    _mm256_storeu_si256((__m256i*)(out+8),rev);
-}
-#else
-static inline void mc_dct1d_inv(const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    const mc_fi32 rnd=(mc_fi32)1<<(MC_DCT_Q-1); const int S=MC_DCT_N, H=S/2;
-    mc_fi32 acc_e[8], acc_o[8];
-    for(int n=0;n<H;++n){ acc_e[n]=rnd; acc_o[n]=0; }
-    for(int j=0;j<8;++j){
-        mc_fi32 ve=in[2*j];
-        if(ve) for(int n=0;n<H;++n) acc_e[n]+=g_cm_e[j][n]*ve;
-        mc_fi32 vo=in[2*j+1];
-        if(vo) for(int n=0;n<H;++n) acc_o[n]+=g_cm_o[j][n]*vo;
-    }
-    for(int n=0;n<H;++n){ out[n]=(acc_e[n]+acc_o[n])>>MC_DCT_Q; out[S-1-n]=(acc_e[n]-acc_o[n])>>MC_DCT_Q; }
-}
-#endif
-
-// cache-blocked rotate (z,y,x)->(x,z,y): dst[(x*S+z)*S+y] = src[(z*S+y)*S+x].
-// Per fixed z this is a 16x16 i32 transpose (src rows y, stride S -> dst rows
-// x, stride S*S); done as 4x4 register tiles on NEON, scalar tiles otherwise.
-#if MC_SIMD_NEON
-static inline void mc_rot(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
-    const int S=MC_DCT_N;
-    for(int z=0;z<S;++z){
-        const mc_fi32 *sp=src+(size_t)z*S*S;
-        mc_fi32 *dp=dst+(size_t)z*S;
-        for(int y=0;y<S;y+=4)
-        for(int x=0;x<S;x+=4){
-            int32x4_t r0=vld1q_s32(sp+(size_t)(y+0)*S+x);
-            int32x4_t r1=vld1q_s32(sp+(size_t)(y+1)*S+x);
-            int32x4_t r2=vld1q_s32(sp+(size_t)(y+2)*S+x);
-            int32x4_t r3=vld1q_s32(sp+(size_t)(y+3)*S+x);
-            int32x4_t t0=vtrn1q_s32(r0,r1), t1=vtrn2q_s32(r0,r1);
-            int32x4_t t2=vtrn1q_s32(r2,r3), t3=vtrn2q_s32(r2,r3);
-            int32x4_t c0=vreinterpretq_s32_s64(vtrn1q_s64(vreinterpretq_s64_s32(t0),vreinterpretq_s64_s32(t2)));
-            int32x4_t c1=vreinterpretq_s32_s64(vtrn1q_s64(vreinterpretq_s64_s32(t1),vreinterpretq_s64_s32(t3)));
-            int32x4_t c2=vreinterpretq_s32_s64(vtrn2q_s64(vreinterpretq_s64_s32(t0),vreinterpretq_s64_s32(t2)));
-            int32x4_t c3=vreinterpretq_s32_s64(vtrn2q_s64(vreinterpretq_s64_s32(t1),vreinterpretq_s64_s32(t3)));
-            vst1q_s32(dp+(size_t)(x+0)*S*S+y, c0);
-            vst1q_s32(dp+(size_t)(x+1)*S*S+y, c1);
-            vst1q_s32(dp+(size_t)(x+2)*S*S+y, c2);
-            vst1q_s32(dp+(size_t)(x+3)*S*S+y, c3);
-        }
-    }
-}
-#else
-#define MC_ROT_TILE 8
-static inline void mc_rot(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
-    const int S=MC_DCT_N;
-    for(int zt=0; zt<S; zt+=MC_ROT_TILE)
-    for(int xt=0; xt<S; xt+=MC_ROT_TILE)
-        for(int z=zt; z<zt+MC_ROT_TILE; ++z)
-        for(int x=xt; x<xt+MC_ROT_TILE; ++x){
-            const mc_fi32 *sp = src + ((size_t)z*S)*S + x;
-            mc_fi32 *dp = dst + ((size_t)x*S+z)*S;
-            for(int y=0;y<S;++y) dp[y]=sp[(size_t)y*S];
-        }
-}
-#endif
-// transform all contiguous lines (skipping all-zero lines), in place or out-of-place.
-static inline void mc_lines_fwd_to(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
-    const int S=MC_DCT_N; mc_fi32 ol[MC_DCT_N];
-    for(int off=0;off<S*S;++off){ const mc_fi32 *v=src+(size_t)off*S; mc_fi32 *o=dst+(size_t)off*S;
-        int nz=0; for(int i=0;i<S;++i) if(v[i]){nz=1;break;}
-        if(!nz){ for(int i=0;i<S;++i) o[i]=0; continue; }
-        mc_dct1d_fwd(v,ol); for(int i=0;i<S;++i) o[i]=ol[i]; }
-}
-static inline void mc_lines_fwd(mc_fi32 *restrict blk){
-    const int S=MC_DCT_N; mc_fi32 ol[MC_DCT_N];
-    for(int off=0;off<S*S;++off){ mc_fi32 *v=blk+(size_t)off*S;
-        int nz=0; for(int i=0;i<S;++i) if(v[i]){nz=1;break;} if(!nz) continue;
-        mc_dct1d_fwd(v,ol); for(int i=0;i<S;++i) v[i]=ol[i]; }
-}
-static inline void mc_lines_inv_to(const mc_fi32 *restrict src, mc_fi32 *restrict dst){
-    const int S=MC_DCT_N; mc_fi32 ol[MC_DCT_N];
-    for(int off=0;off<S*S;++off){ const mc_fi32 *v=src+(size_t)off*S; mc_fi32 *o=dst+(size_t)off*S;
-        int nz=0; for(int i=0;i<S;++i) if(v[i]){nz=1;break;}
-        if(!nz){ for(int i=0;i<S;++i) o[i]=0; continue; }
-        mc_dct1d_inv(v,ol); for(int i=0;i<S;++i) o[i]=ol[i]; }
-}
-static inline void mc_lines_inv(mc_fi32 *restrict blk){
-    const int S=MC_DCT_N; mc_fi32 ol[MC_DCT_N];
-    for(int off=0;off<S*S;++off){ mc_fi32 *v=blk+(size_t)off*S;
-        int nz=0; for(int i=0;i<S;++i) if(v[i]){nz=1;break;} if(!nz) continue;
-        mc_dct1d_inv(v,ol); for(int i=0;i<S;++i) v[i]=ol[i]; }
-}
-
-// 3D forward/inverse on a 16^3 block (float in/out for the codec's quant path).
-// Each pass: transform contiguous lines, then rotate. 3 rotates return to (z,y,x).
+// 3D forward/inverse on a 16^3 block (f32 in/out for the quant path). The two
+// scratch buffers live in the per-thread ctx so the hot path is allocation-free.
 typedef struct {
-    mc_fi32 in[16*16*16] __attribute__((aligned(MC_DCT_ALIGN)));
-    mc_fi32 a [16*16*16] __attribute__((aligned(MC_DCT_ALIGN)));
-    mc_fi32 b [16*16*16] __attribute__((aligned(MC_DCT_ALIGN)));
+    float a[MC_F_N3] __attribute__((aligned(MC_DCT_ALIGN)));
+    float b[MC_F_N3] __attribute__((aligned(MC_DCT_ALIGN)));
 } mc_dct_tls_t;
 static void mc_dct3_fwd(mc_dct_tls_t *D, const float *restrict blk, float *restrict coef){
-    const int n=MC_DCT_N*MC_DCT_N*MC_DCT_N;
-    mc_fi32 *in=D->in, *a=D->a, *b=D->b;
-    for(int i=0;i<n;++i) in[i]=(mc_fi32)lrintf(blk[i]);
-    mc_lines_fwd_to(in,a); mc_rot(a,b);
-    mc_lines_fwd(b);       mc_rot(b,a);
-    mc_lines_fwd(a);       mc_rot(a,b);
-    for(int i=0;i<n;++i) coef[i]=(float)b[i];
+    mc_dctf3_fwd(blk,coef,D->a,D->b);
 }
 static void mc_dct3_inv(mc_dct_tls_t *D, const float *restrict coef, float *restrict blk){
-    const int n=MC_DCT_N*MC_DCT_N*MC_DCT_N;
-    mc_fi32 *in=D->in, *a=D->a, *b=D->b;
-    for(int i=0;i<n;++i) in[i]=(mc_fi32)lrintf(coef[i]);
-    mc_lines_inv_to(in,a); mc_rot(a,b);
-    mc_lines_inv(b);       mc_rot(b,a);
-    mc_lines_inv(a);       mc_rot(a,b);
-    for(int i=0;i<n;++i) blk[i]=(float)b[i];
-}
-// variant taking PREPARED i32 coefficients (decoder fuses dequantization into
-// the input conversion) and returning the raw i32 spatial result.
-static void mc_dct3_inv_i32(mc_dct_tls_t *D, const mc_fi32 *restrict in, mc_fi32 *restrict out){
-    mc_fi32 *a=D->a;
-    mc_lines_inv_to(in,a); mc_rot(a,out);
-    mc_lines_inv(out);     mc_rot(out,a);
-    mc_lines_inv(a);       mc_rot(a,out);
+    mc_dctf3_inv(coef,blk,D->a,D->b);
 }
 
 #endif
@@ -692,27 +435,15 @@ uint64_t mc_xxh64(const void *data, size_t len, uint64_t seed){
 // pools each allocate their own), so concurrent operations stay race-free.
 typedef struct {
     // decode
-    mc_u8  air[N3];
     rc_i16 ql[N3];
     float  coef[N3], blk[N3];
-    mc_fi32 qin[N3] __attribute__((aligned(64)));
-    mc_fi32 qout[N3] __attribute__((aligned(64)));
     // encode
     float  eblk[N3], ecoef[N3];
     rc_u8  scratch[N3*4+1024];
     uint16_t cpos[N3]; mc_i32 cdel[N3];
     float  rcoef[N3], rblk[N3];
 } mc_tls_t;
-
-// red-black SOR air-fill scratch (18^3 padded). Block-independent PM/CNT tables
-// are built once per ctx (pm_init guard).
-enum { MC_FILL_PS=MC_BLK+2, MC_FILL_PN=MC_FILL_PS*MC_FILL_PS*MC_FILL_PS };
-typedef struct {
-    float P[MC_FILL_PN];          // pads stay 0
-    float W6[2][MC_FILL_PN];      // pads stay 0
-    float PM[MC_FILL_PN], CNT[MC_FILL_PN];
-    int   pm_init;
-} mc_fill_tls_t;
+// (air-fill SOR scratch removed with the per-voxel air mask.)
 
 // chunk-level encode scratch (encode_chunk_blob / append paths). MC_GRID3 (=4096,
 // the 16^3 block grid) is #defined later in the archive section; use the literal
@@ -738,7 +469,6 @@ typedef struct mc_codec_ctx {
     int      pri_seen;            // priors generation seen
     mc_tls_t      scratch;        // hot enc/dec block scratch
     mc_dct_tls_t  dct;            // DCT line buffers
-    mc_fill_tls_t fill;           // air-fill SOR scratch
     mc_chunk_tls_t chunk;         // chunk-blob encode scratch
 } mc_codec_ctx;
 
@@ -820,95 +550,13 @@ static void step_tab_build(mc_codec_ctx *C){
     }
     C->step_q=C->quality;
 }
-static inline mc_i32 quant_one(float c, float step){
-    float dz=MC_DZ_FRAC*step, a=fabsf(c); mc_i32 lv=0;
-    if(a>=dz) lv=(mc_i32)((a-dz)/step+1.0f);
-    return c<0?-lv:lv;
-}
-static inline float deq_one(mc_i32 lv, float step){
-    if(!lv) return 0.0f;
-    float a=(float)(lv<0?-lv:lv); float r=(a-1.0f)*step+MC_DZ_FRAC*step+0.40f*step;
-    return lv<0?-r:r;
-}
+// Dead-zone quant/dequant come from mc_codec_float.h (mc_quantf_one / mc_deqf_one);
+// the local copies were identical f32 math and were removed with the integer path.
 
-// block-mask surface coder: 3-neighbor (z-1,y-1,x-1) context bit coder over the
-// block's 16^3 air mask (air = vox==0). Out-of-block neighbors read as 0. Codes
-// into the block's single range-coder stream (shared with the coefficients).
-// Two-level mask: per 4^3 subcube a class (uniform-air / uniform-material /
-// mixed; ~2 adaptive bins), then per-voxel 3-neighbor context bins only inside
-// mixed subcubes. Subcubes and voxels both scan in raster order so the causal
-// (z-1,y-1,x-1) context always reads already-coded mask values. Cuts mask bins
-// ~3-6x on boundary blocks (most blocks of a masked scroll volume).
-#define MSUB 4
-static void enc_blockmask(rc_enc *e, const mc_u8 *vox, const uint16_t (*pri)[RC_NSLOT]){
-    ctx_t ctx[8]; for(int i=0;i<8;++i) ctx_init_p(&ctx[i],RC_PRIOR_MASK(pri)[i]);
-    ctx_t cu[4];  for(int i=0;i<4;++i) ctx_init_p(&cu[i],RC_PRIOR_MASKU(pri)[i]);
-    ctx_t ca[2];  for(int i=0;i<2;++i) ctx_init_p(&ca[i],RC_PRIOR_MASKA(pri)[i]);
-    const int S=MC_BLK, G=S/MSUB;
-    mc_u8 air[N3];
-    mc_u8 sc[4*4*4];                       // subcube class: 0=material,1=air,2=mixed
-    for(int sz=0;sz<G;++sz)for(int sy=0;sy<G;++sy)for(int sx=0;sx<G;++sx){
-        int si=(sz*G+sy)*G+sx;
-        int nair_s=0;
-        for(int z=0;z<MSUB;++z)for(int y=0;y<MSUB;++y)for(int x=0;x<MSUB;++x)
-            nair_s += !vox[((sz*MSUB+z)*S+(sy*MSUB+y))*S+(sx*MSUB+x)];
-        int uni = (nair_s==0 || nair_s==MSUB*MSUB*MSUB);
-        int nmix=0, nairn=0, nn=0;
-        if(sz){ int c=sc[si-G*G]; nn++; nmix+=c==2; nairn+=c==1; }
-        if(sy){ int c=sc[si-G];   nn++; nmix+=c==2; nairn+=c==1; }
-        if(sx){ int c=sc[si-1];   nn++; nmix+=c==2; nairn+=c==1; }
-        int uctx=nmix<3?nmix:3, actx=nairn?1:0;
-        RC_TRAIN(RCC_MASKU,uctx,uni); enc_bit(e,&cu[uctx],uni);
-        if(uni){
-            int isair = nair_s>0;
-            RC_TRAIN(RCC_MASKA,actx,isair); enc_bit(e,&ca[actx],isair);
-            for(int z=0;z<MSUB;++z)for(int y=0;y<MSUB;++y)for(int x=0;x<MSUB;++x)
-                air[((sz*MSUB+z)*S+(sy*MSUB+y))*S+(sx*MSUB+x)]=(mc_u8)isair;
-        } else {
-            for(int z=0;z<MSUB;++z)for(int y=0;y<MSUB;++y)for(int x=0;x<MSUB;++x){
-                int gz=sz*MSUB+z, gy=sy*MSUB+y, gx=sx*MSUB+x;
-                int i=(gz*S+gy)*S+gx;
-                int a=!vox[i];
-                int nz_= gz?air[i-S*S]:0, ny_= gy?air[i-S]:0, nx_= gx?air[i-1]:0;
-                int cc=(nz_<<2)|(ny_<<1)|nx_;
-                RC_TRAIN(RCC_MASK,cc,a);
-                enc_bit(e,&ctx[cc],a);
-                air[i]=(mc_u8)a;
-            }
-        }
-        sc[si]=(mc_u8)(uni? (nair_s>0?1:0) : 2);
-    }
-}
-static void dec_blockmask(rc_dec *d, mc_u8 *air, const uint16_t (*pri)[RC_NSLOT]){
-    ctx_t ctx[8]; for(int i=0;i<8;++i) ctx_init_p(&ctx[i],RC_PRIOR_MASK(pri)[i]);
-    ctx_t cu[4];  for(int i=0;i<4;++i) ctx_init_p(&cu[i],RC_PRIOR_MASKU(pri)[i]);
-    ctx_t ca[2];  for(int i=0;i<2;++i) ctx_init_p(&ca[i],RC_PRIOR_MASKA(pri)[i]);
-    const int S=MC_BLK, G=S/MSUB;
-    mc_u8 sc[4*4*4];
-    for(int sz=0;sz<G;++sz)for(int sy=0;sy<G;++sy)for(int sx=0;sx<G;++sx){
-        int si=(sz*G+sy)*G+sx;
-        int nmix=0, nairn=0;
-        if(sz){ int c=sc[si-G*G]; nmix+=c==2; nairn+=c==1; }
-        if(sy){ int c=sc[si-G];   nmix+=c==2; nairn+=c==1; }
-        if(sx){ int c=sc[si-1];   nmix+=c==2; nairn+=c==1; }
-        int uctx=nmix<3?nmix:3, actx=nairn?1:0;
-        int uni=dec_bit(d,&cu[uctx]);
-        int isair_u=0;
-        if(uni){
-            int isair=dec_bit(d,&ca[actx]); isair_u=isair;
-            for(int z=0;z<MSUB;++z)for(int y=0;y<MSUB;++y)for(int x=0;x<MSUB;++x)
-                air[((sz*MSUB+z)*S+(sy*MSUB+y))*S+(sx*MSUB+x)]=(mc_u8)isair;
-        } else {
-            for(int z=0;z<MSUB;++z)for(int y=0;y<MSUB;++y)for(int x=0;x<MSUB;++x){
-                int gz=sz*MSUB+z, gy=sy*MSUB+y, gx=sx*MSUB+x;
-                int i=(gz*S+gy)*S+gx;
-                int nz_= gz?air[i-S*S]:0, ny_= gy?air[i-S]:0, nx_= gx?air[i-1]:0;
-                air[i]=(mc_u8)dec_bit(d,&ctx[(nz_<<2)|(ny_<<1)|nx_]);
-            }
-        }
-        sc[si]=(mc_u8)(uni? (isair_u?1:0) : 2);
-    }
-}
+
+// (per-voxel air mask coder removed: blocks are encoded fully-material; the
+// masked input zeros are just value-0 voxels reconstructed by the transform.)
+
 
 // ---- decode-side deblocking (optional, no format change) ---------------------
 // Clamped 2-tap filter across every 16-aligned block face, per axis. Gated on
@@ -1004,22 +652,19 @@ int mc_enc_block(mc_codec_ctx *C, const mc_u8 *vox, mc_buf *out, uint32_t *len_o
     }
 #endif
     if(!any||!cnt){ *len_out=0; return 0; }
-    int dc = (int)((sum+cnt/2)/cnt);                  // DC over material only
-    int nair = n-(int)cnt;                            // air = vox==0
+    int dc = (int)((sum+n/2)/n);   // DC over ALL voxels: no per-voxel air concept.
+    // Encode every voxel as material -- the masked input zeros are just value-0
+    // voxels (blk = -dc there, reconstructing to ~0). The per-voxel air mask and
+    // the harmonic air-fill were removed (air-cut is off by default; the SAM2 mask
+    // zeros are preserved closely enough by the transform + max-error pass, and
+    // whole all-zero blocks are still skipped via the chunk bitmap above).
 #if MC_SIMD_NEON
     {   int16x8_t vdc=vdupq_n_s16((int16_t)dc);
         for(int i=0;i<n;i+=16){
             uint8x16_t v=vld1q_u8(vox+i);
-            uint8x16_t nz=vtstq_u8(v,v);
             int16x8_t lo=vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v)));
             int16x8_t hi=vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v)));
             lo=vsubq_s16(lo,vdc); hi=vsubq_s16(hi,vdc);
-            int16x8_t mlo=vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(nz)));
-            int16x8_t mhi=vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(nz)));
-            // mask: 0x00FF per nonzero after widen -> turn into all-ones/all-zero
-            mlo=vreinterpretq_s16_u16(vtstq_u16(vreinterpretq_u16_s16(mlo),vreinterpretq_u16_s16(mlo)));
-            mhi=vreinterpretq_s16_u16(vtstq_u16(vreinterpretq_u16_s16(mhi),vreinterpretq_u16_s16(mhi)));
-            lo=vandq_s16(lo,mlo); hi=vandq_s16(hi,mhi);   // air -> 0 (== dc-dc)
             vst1q_f32(blk+i   ,vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))));
             vst1q_f32(blk+i+4 ,vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))));
             vst1q_f32(blk+i+8 ,vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))));
@@ -1027,161 +672,8 @@ int mc_enc_block(mc_codec_ctx *C, const mc_u8 *vox, mc_buf *out, uint32_t *len_o
         }
     }
 #else
-    for(int i=0;i<n;++i) blk[i]=(float)((vox[i]?vox[i]:dc)-dc);
+    for(int i=0;i<n;++i) blk[i]=(float)((int)vox[i]-dc);
 #endif
-    // harmonic air-fill: relax air voxels toward the 6-neighbor mean (material
-    // fixed) so the masked region carries no spurious DCT energy. Perf on real
-    // masked-scroll exports showed the original raster-order Gauss-Seidel/SOR
-    // over an air-voxel index list was the #1 hot spot of mc_enc_block (~31%
-    // of export compute): a strictly serial scalar dependency chain. The fill
-    // only shapes values UNDER the air mask — decode forces them to 0 — so its
-    // exact values are free to change slightly; only encode speed and archive
-    // size matter. Rewritten as: coarse 4^3 seed + RED-BLACK SOR in a dense,
-    // branch-free, auto-vectorizing form (see below).
-    // Measured (8x 256^3 mixed material/air chunks of a real masked scroll,
-    // q=8, best-of-5 process-CPU time incl. the vectorized stats/quant loops
-    // above/below): encode 0.345s -> 0.253s (-26.7%), archive size
-    // 1126163 -> 1126019 bytes (-0.013%), material max-abs-diff unchanged
-    // (41), air voxels still decode to exactly 0.
-    if(nair>0){
-        // CROSS-ISA DETERMINISM: the floats computed here feed the DCT, so
-        // they must round identically on every target. The build is strict
-        // IEEE (no -ffast-math — see CMakeLists); under fast-math the
-        // per-target reassociation/reciprocal choices in these loops broke
-        // bitstream identity (caught by CI), for zero measured speedup.
-#if defined(__clang__)
-#pragma clang fp reassociate(off) contract(off)
-#endif
-        const int S=MC_BLK;
-        // (b) skip the fine SOR sweeps on nearly-pure blocks (<5% or >95% air):
-        // the coarse 4^3 seed already lands within quantization noise there
-        // (thin slivers / almost-all-masked blocks), so refinement is an
-        // invisible cost.
-        int do_fine = (nair >= n/20) && (nair <= n - n/20);
-        // Coarse-to-fine init: solve the fill on the 4^3 subcube grid first
-        // (each cell = mean of its material voxels, air cells relaxed), then
-        // seed fine air voxels from their cell before the fine SOR sweeps.
-        // Lands much closer than a flat dc start, so few sweeps converge.
-        // Accumulation runs per (z,y) row with 4-wide unrolled segment sums
-        // (SLP-vectorizable; air contributes 0 to the sum because blk[]==0
-        // there) — no per-voxel div/mod or branches.
-        {
-            float cs[64]; int cm[64]; const int G=4;
-            for(int c=0;c<64;++c){ cs[c]=0.0f; cm[c]=0; }
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
-                const float *bp=blk+(size_t)(z*S+y)*S;
-                const mc_u8 *vp=vox+(size_t)(z*S+y)*S;
-                int cb=((z>>2)*G+(y>>2))*G;
-                for(int sx=0;sx<G;++sx){
-                    const float *b4=bp+4*sx; const mc_u8 *v4=vp+4*sx;
-                    cs[cb+sx]+=b4[0]+b4[1]+b4[2]+b4[3];
-                    cm[cb+sx]+=(v4[0]!=0)+(v4[1]!=0)+(v4[2]!=0)+(v4[3]!=0);
-                }
-            }
-            for(int c=0;c<64;++c) cs[c]=cm[c]?cs[c]/(float)cm[c]:0.0f;
-            for(int it=0;it<6;++it){                      // coarse relax (air cells)
-                for(int cz=0;cz<G;++cz)for(int cy=0;cy<G;++cy)for(int cx=0;cx<G;++cx){
-                    int c=(cz*G+cy)*G+cx; if(cm[c]) continue;
-                    float a=0; int k=0;
-                    if(cz){a+=cs[c-G*G];k++;} if(cz<G-1){a+=cs[c+G*G];k++;}
-                    if(cy){a+=cs[c-G];k++;}   if(cy<G-1){a+=cs[c+G];k++;}
-                    if(cx){a+=cs[c-1];k++;}   if(cx<G-1){a+=cs[c+1];k++;}
-                    if(k) cs[c]=a/k;
-                }
-            }
-            // seed air voxels from their cell: expand the 4 cell values of a
-            // subcube row into a 16-float row pattern once per 4 rows, then a
-            // dense branchless select per row (auto-vectorizes).
-            float vrow[16]={0};   // always set at y==0 (init quiets -Wmaybe-uninitialized)
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
-                if((y&3)==0){
-                    const float *cr=cs+((z>>2)*G+(y>>2))*G;
-                    for(int x=0;x<S;++x) vrow[x]=cr[x>>2];
-                }
-                float *bp=blk+(size_t)(z*S+y)*S;
-                const mc_u8 *vp=vox+(size_t)(z*S+y)*S;
-                for(int x=0;x<S;++x) bp[x]=vp[x]?bp[x]:vrow[x];
-            }
-        }
-        // (a) RED-BLACK SOR (two-color Gauss-Seidel, omega=1.6) in a DENSE
-        // vectorizable form replacing the serial scalar chain:
-        //   - copy the block into an 18^3 zero-padded buffer P (pad cells are
-        //     never written, so out-of-block neighbors read as 0 == dc);
-        //   - fold air mask and color ((z+y+x)&1) into two per-color weight
-        //     arrays (w6 = omega/6 on this color's air voxels, else 0) so a
-        //     color pass is a UNIFORM branch-free stencil over the whole
-        //     padded array:   P[i] += w6[i]*(nbsum[i] - cnt[i]*P[i])
-        //     where cnt[i] (in-block 6-neighbor count, = the old serial
-        //     code's divisor scaled into the relaxation step) is a static
-        //     block-independent table, built once per thread like PM below.
-        //   - within one color no voxel neighbors another, so the neighbor-sum
-        //     and update loops are data-parallel and auto-vectorize (AVX/
-        //     NEON); updated reds are visible to blacks (true Gauss-Seidel
-        //     convergence, same omega, same sweep count as the serial code).
-        if(do_fine){
-            enum { PS=MC_FILL_PS, PP=PS*PS, PN=MC_FILL_PN };
-            float *P=C->fill.P;                            // pads stay 0
-            float (*W6)[PN]=C->fill.W6;                    // pads stay 0
-            // parity mask (voxel color) and in-block neighbor count are both
-            // block-independent: build once per ctx.
-            float *PM=C->fill.PM, *CNT=C->fill.CNT;
-            if(!C->fill.pm_init){
-                for(int z=0;z<PS;++z)for(int y=0;y<PS;++y)for(int x=0;x<PS;++x){
-                    int i=(z*PS+y)*PS+x;
-                    PM[i]=(float)((z+y+x)&1);
-                    CNT[i]=(float)((z>1)+(z<S)+(y>1)+(y<S)+(x>1)+(x<S));
-                }
-                C->fill.pm_init=1;
-            }
-            // rows: copy P + build per-color weights in one vectorized pass.
-            // Only real-voxel lanes are ever written, so pad/gap lanes of P
-            // and W6 keep their static-zero values across blocks.
-            const float O6=1.6f/6.0f;
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
-                const mc_u8 *vp=vox+(size_t)(z*S+y)*S;
-                const float *bp=blk+(size_t)(z*S+y)*S;
-                int pb=((z+1)*PS+(y+1))*PS+1;
-                const float *pm=PM+pb;
-                for(int x=0;x<S;++x){
-                    P[pb+x]=bp[x];
-                    float w=vp[x]?0.0f:O6, a=w*pm[x];
-                    W6[1][pb+x]=a; W6[0][pb+x]=w-a;
-                }
-            }
-            // each color pass = per z-plane: (1) dense neighbor sums into a
-            // small plane buffer NB (pure reads of P), (2) masked update of
-            // the plane. Exact red-black Gauss-Seidel: this color's neighbors
-            // are all the OTHER color, untouched within the pass, so the
-            // snapshot in NB is the live value. Splitting removes the
-            // read-after-write dependence that kept the fused in-place loop
-            // scalar; both loops auto-vectorize (AVX/NEON). Plane blocking
-            // keeps NB and the three active P planes L1-resident instead of
-            // streaming a full-volume NB array through L2 every pass.
-            // Pad/material lanes are killed by w6=0.
-            // (c) the coarse seed does most of the work, so few fine sweeps
-            // are needed: on the benchmark below 1 red-black sweep gives a
-            // marginally SMALLER archive than the old 3 serial sweeps
-            // (-0.013%), 2 sweeps +0.016% — the rate effect of sweep count is
-            // already in the quantization noise (values are masked out at
-            // decode anyway), so take the cheapest.
-            int nsweep=MC_FILL_SWEEPS<1?MC_FILL_SWEEPS:1;
-            for(int it=0; it<nsweep; ++it){
-                for(int col=0; col<2; ++col){
-                    const float *restrict w6=W6[col];
-                    for(int pz=1; pz<PS-1; ++pz){
-                        float NB[PP]; const int b=pz*PP;
-                        for(int k=0;k<PP;++k)
-                            NB[k]=P[b+k-1]+P[b+k+1]+P[b+k-PS]+P[b+k+PS]+P[b+k-PP]+P[b+k+PP];
-                        for(int k=0;k<PP;++k)
-                            P[b+k]+=w6[b+k]*(NB[k]-CNT[b+k]*P[b+k]);
-                    }
-                }
-            }
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y)       // material rows are
-                memcpy(blk+(size_t)(z*S+y)*S,              // bit-identical (w=0)
-                       P+((z+1)*PS+(y+1))*PS+1, S*sizeof(float));
-        }
-    }
     mc_dct3_fwd(&C->dct,blk,coef);
     rc_i16 *ql=T->ql;
     rc_u8 *scratch=T->scratch;
@@ -1204,10 +696,11 @@ int mc_enc_block(mc_codec_ctx *C, const mc_u8 *vox, mc_buf *out, uint32_t *len_o
     int ncorr=0;
     if(C->max_err>0){
         float *rcoef=T->rcoef, *rblk=T->rblk;
-        for(int idx=0;idx<N3;++idx) rcoef[idx]=deq_one(ql[idx],C->step_tab[idx]);
+        for(int idx=0;idx<N3;++idx) rcoef[idx]=mc_deqf_one(ql[idx],C->step_tab[idx]);
         mc_dct3_inv(&C->dct,rcoef,rblk);
         for(int i=0;i<n;++i){
-            if(!vox[i]) continue;                          // air decodes to exactly 0
+            // correct EVERY voxel (incl. masked zeros) -- no air mask forces them to
+            // 0 now, so the max-error pass is what pins them back to ~0 within tau.
             int v=(int)lrintf(rblk[i])+dc; if(v<0)v=0; if(v>255)v=255;
             int err=(int)vox[i]-v;
             int ae=err<0?-err:err;
@@ -1220,11 +713,10 @@ int mc_enc_block(mc_codec_ctx *C, const mc_u8 *vox, mc_buf *out, uint32_t *len_o
         const uint16_t (*pri)[RC_NSLOT]=C->pri;
         ctx_t cf[2]; for(int i=0;i<2;++i) ctx_init_p(&cf[i],RC_PRIOR_FLAG(pri)[i]);
         ctx_t cd[8]; for(int i=0;i<8;++i) ctx_init_p(&cd[i],RC_PRIOR_DC(pri)[i]);
-        RC_TRAIN(RCC_FLAG,0,nair>0);  enc_bit(&e,&cf[0],nair>0);
+        RC_TRAIN(RCC_FLAG,0,0);       enc_bit(&e,&cf[0],0);   // bit0 reserved (was "mixed"; air mask removed)
         RC_TRAIN(RCC_FLAG,1,ncorr>0); enc_bit(&e,&cf[1],ncorr>0);
         for(int b=7;b>=0;--b){ int bit=(dc>>b)&1; RC_TRAIN(RCC_DC,7-b,bit); enc_bit(&e,&cd[7-b],bit); }
     }
-    if(nair>0) enc_blockmask(&e,vox,C->pri);
     enc_block_coefs(&e,ql,MC_BLK,C->pri);
     if(ncorr>0){                                           // [eg count][gap, sign, eg(|d|-1)]*
         enc_eg(&e,(rc_u32)(ncorr-1));
@@ -1248,7 +740,6 @@ void mc_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst){
     int n=N3, dc=0, flags=0;
     mc_tls_t *T=&C->scratch;
     step_tab_build(C);                  // before hot loops
-    mc_u8 *air=T->air;
     rc_i16 *ql=T->ql;
     rc_dec d; dec_init(&d,p,plen);
     {   // header bins (must mirror the encoder exactly)
@@ -1259,55 +750,23 @@ void mc_dec_block(mc_codec_ctx *C, const mc_u8 *p, uint32_t plen, mc_u8 *dst){
         flags |= dec_bit(&d,&cf[1]) ? 2 : 0;
         for(int b=0;b<8;++b) dc=(dc<<1)|dec_bit(&d,&cd[b]);
     }
-    if(flags&1) dec_blockmask(&d,air,C->pri);
-    else        memset(air,0,n);
+    (void)(flags&1);   // bit0 reserved (was "mixed"; per-voxel air mask removed)
     int ext[3]; dec_block_coefs_ext(&d,ql,MC_BLK,ext,C->pri);
     float *coef=T->coef, *blk=T->blk;
     int ez=ext[0],ey=ext[1],ex=ext[2];
-    if(ez<0 && !(flags&1) && !(flags&2)){                   // constant block: dc fill
+    if(ez<0 && !(flags&2)){                                 // constant block: dc fill
         memset(dst,(mc_u8)dc,n); return;
     }
     (void)ey;(void)ex;
-#if MC_SIMD_NEON
-    {   // fused dequant -> i32 DCT input (no float coefficient pass), then
-        // integer iDCT and vectorized clamp+dc+air store.
-        mc_fi32 *qin=T->qin, *qout=T->qout;
-        float32x4_t bias=vdupq_n_f32(MC_DZ_FRAC-1.0f+0.40f);
-        for(int i=0;i<N3;i+=4){
-            int32x4_t lv=vmovl_s16(vld1_s16(ql+i));
-            uint32x4_t nz=vmvnq_u32(vceqzq_s32(lv));
-            uint32x4_t neg=vcltzq_s32(lv);
-            float32x4_t a=vcvtq_f32_s32(vabsq_s32(lv));
-            float32x4_t r=vmulq_f32(vaddq_f32(a,bias),vld1q_f32(C->step_tab+i));
-            int32x4_t ri=vcvtnq_s32_f32(r);
-            ri=vbslq_s32(neg,vnegq_s32(ri),ri);
-            ri=vandq_s32(ri,vreinterpretq_s32_u32(nz));
-            vst1q_s32(qin+i,ri);
-        }
-        mc_dct3_inv_i32(&C->dct,qin,qout);
-        int32x4_t vdc=vdupq_n_s32(dc);
-        for(int i=0;i<n;i+=16){
-            int32x4_t a0=vaddq_s32(vld1q_s32(qout+i),vdc);
-            int32x4_t a1=vaddq_s32(vld1q_s32(qout+i+4),vdc);
-            int32x4_t a2=vaddq_s32(vld1q_s32(qout+i+8),vdc);
-            int32x4_t a3=vaddq_s32(vld1q_s32(qout+i+12),vdc);
-            uint16x8_t p0=vcombine_u16(vqmovun_s32(a0),vqmovun_s32(a1));
-            uint16x8_t p1=vcombine_u16(vqmovun_s32(a2),vqmovun_s32(a3));
-            uint8x16_t v8=vcombine_u8(vqmovn_u16(p0),vqmovn_u16(p1));
-            uint8x16_t am=vld1q_u8(air+i);
-            v8=vbicq_u8(v8,vtstq_u8(am,am));               // air -> 0
-            vst1q_u8(dst+i,v8);
-        }
-        (void)coef;(void)blk;
-    }
-#else
-    for(int idx=0;idx<N3;++idx) coef[idx]=deq_one(ql[idx],C->step_tab[idx]);
+    // dequant -> f32 coefficients -> f32 inverse DCT -> clamp + dc. Every voxel is
+    // material now (no air mask); masked input zeros were encoded as value-0 and
+    // reconstruct to ~0 (pinned by the max-error pass).
+    for(int idx=0;idx<N3;++idx) coef[idx]=mc_deqf_one(ql[idx],C->step_tab[idx]);
     mc_dct3_inv(&C->dct,coef,blk);
     for(int i=0;i<n;++i){
-        int v = air[i] ? 0 : (int)lrintf(blk[i])+dc;  // mask-restore: air -> exactly 0
+        int v = (int)lrintf(blk[i])+dc;
         if(v<0)v=0; if(v>255)v=255; dst[i]=(mc_u8)v;
     }
-#endif
     if(flags&2){                                      // sparse max-error corrections
         // HARDENED: ncorr and positions are attacker-controlled on corrupted
         // input — clamp both so a flipped bit can never write outside dst.
@@ -1339,3 +798,52 @@ int gather_blk256(const u8 *chunk,int bz,int by,int bx,u8 *dst){
     return any;
 }
 
+// ---------------------------------------------------------------- chunk-blob encoder
+// Encode one dense 256^3 chunk buffer into a compressed blob in `out` (a growable
+// byte sink: out_put(out, ptr, n)). Returns the blob length, or 0 if the chunk is all
+// air (no blob — caller leaves the slot absent). Shared by build + writer.
+// blob (v6) = [f32 q][u64 xxh64][512B block-bitmap][present-block u16 lens]
+// [block payloads]; blocks are self-contained (mask in payload). q is the
+// chunk's own quality; the hash covers bitmap+lens+payloads.
+
+size_t encode_chunk_blob_codec(mc_codec_ctx *C, uint32_t codec, const u8 *chunk256, out_put_fn put, void *out){
+    (void)codec;   // c3g removed: only CABAC
+    mc_buf *tmp=&C->chunk.tmp; tmp->len=0;
+    uint8_t bm[MC_BITMAP_BYTES]; memset(bm,0,sizeof bm);
+    uint16_t blen[MC_GRID3]; int npresent=0;
+    uint8_t *frac=C->chunk.frac;
+    memset(frac,0,MC_GRID3);
+    u8 *vox=C->chunk.vox;
+    for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
+        int bi=(bz*16+by)*16+bx;
+        if(!gather_blk256(chunk256,bz,by,bx,vox)) continue;
+        int cnt=0; for(int i=0;i<MC_BLK*MC_BLK*MC_BLK;++i) cnt+=vox[i]!=0;
+        frac[bi]=(uint8_t)((cnt*15+2048)/4096);              // nibble 0..15
+        if(cnt&&!frac[bi]) frac[bi]=1;                        // any material -> >=1
+        uint32_t len=0;
+        int coded = mc_enc_block(C,vox,tmp,&len);
+        if(coded){ mc_bit_set(bm,bi); blen[bi]=(uint16_t)len; npresent++; }
+    }
+    if(!npresent) return 0;   // all air -> no blob
+    // v7 blob header: [f32 q][u64 xxh64][u16 fmaplen][fmap]
+    float q=C->quality;
+    uint16_t *lens16=C->chunk.lens16; int nl=0;
+    for(int bi=0;bi<MC_GRID3;++bi) if(mc_bit_get(bm,bi)) lens16[nl++]=blen[bi];
+    uint8_t *fmap=C->chunk.fmap;
+    uint16_t fml=(uint16_t)mc_enc_fracmap(frac,fmap,sizeof C->chunk.fmap);
+    uint64_t h=mc_xxh64(fmap,fml,0x6D636368756E6Bull);
+    h^=mc_xxh64(bm,MC_BITMAP_BYTES,h);
+    h^=mc_xxh64(lens16,(size_t)nl*2,h);
+    h^=mc_xxh64(tmp->p,tmp->len,h);
+    size_t total=MC_BLOB_HDR+fml+MC_BITMAP_BYTES+(size_t)npresent*2+tmp->len;
+    put(out,&q,4); put(out,&h,8); put(out,&fml,2);
+    put(out,fmap,fml);
+    put(out,bm,MC_BITMAP_BYTES);
+    put(out,lens16,(size_t)nl*2);
+    put(out,tmp->p,tmp->len);
+    return total;
+}
+// back-compat wrapper: CABAC blocks (the original behavior).
+size_t encode_chunk_blob(mc_codec_ctx *C, const u8 *chunk256, out_put_fn put, void *out){
+    return encode_chunk_blob_codec(C,MC_BLOCKCODEC_CABAC,chunk256,put,out);
+}

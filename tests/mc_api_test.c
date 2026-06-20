@@ -73,22 +73,27 @@ int main(void){
         CHECK(ac==0,"all-air block should encode to 0 (got coded=%d len=%u)",ac,al);
         free(ab.p);
 
-        // MIXED air/material block: a half-air block forces the harmonic air-fill
-        // SOR (relax air toward the material mean before the DCT, force-zero on
-        // decode). Air voxels must restore to exactly 0.
+        // MIXED air/material block. The per-voxel air mask + harmonic fill were
+        // REMOVED: air is encoded as value-0 material, not force-zeroed on decode.
+        // The guarantee that now bounds it is the MAX-ERROR (tau) pass: with tau set,
+        // every voxel (incl. the masked zeros) reconstructs within tau, so air lands
+        // in [0,tau]. (Production -- mca_export -- always runs with tau=2q.)
         mc_u8 mix[16*16*16];
         for(int z=0;z<16;++z)for(int y=0;y<16;++y)for(int x=0;x<16;++x){
             int i=(z*16+y)*16+x;
             double r=sqrt((x-8)*(x-8)+(y-8)*(y-8)+(z-8)*(z-8));
             mix[i]= r<6 ? (mc_u8)(120+(i%80)) : 0;     // material ball in air
         }
-        mc_codec_ctx_set_max_error(cx,0);
+        const int MIX_TAU=8;
+        mc_codec_ctx_set_max_error(cx,MIX_TAU);
         mc_buf mb={0}; uint32_t mlx=0;
         int mc=mc_enc_block(cx,mix,&mb,&mlx);
         CHECK(mc==1&&mlx>0,"mixed block enc coded=%d len=%u",mc,mlx);
         mc_u8 mdec[16*16*16]; mc_dec_block(cx,mb.p,mlx,mdec);
-        long airleak=0; for(int i=0;i<4096;++i) if(mix[i]==0 && mdec[i]!=0) airleak++;
-        CHECK(airleak==0,"air-fill leaked %ld air voxels (must be exactly 0)",airleak);
+        long airmax=0;
+        for(int i=0;i<4096;++i) if(mix[i]==0 && mdec[i]>airmax) airmax=mdec[i];
+        CHECK(airmax<=MIX_TAU,"air exceeds tau: max=%ld (tau=%d)",airmax,MIX_TAU);
+        mc_codec_ctx_set_max_error(cx,0);
         free(mb.p);
         mc_codec_ctx_free(cx);
     }

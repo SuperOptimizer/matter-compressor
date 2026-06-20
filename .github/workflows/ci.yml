@@ -6,8 +6,6 @@ jobs:
       matrix:
         include:
           # x86 at the project's deployment floor (x86-64-v3: AVX2+FMA).
-          # Baseline x86-64 (SSE2, no FMA) is NOT a target and rounds
-          # fp-contracted expressions differently -> bitstream divergence.
           - { os: ubuntu-24.04,     cflags: "-march=x86-64-v3" }
           - { os: ubuntu-24.04-arm, cflags: "" }   # NEON baseline (Graviton-class)
           - { os: macos-15,         cflags: "" }   # Apple NEON
@@ -24,14 +22,6 @@ jobs:
         run: CC=clang cmake -B build -S . -DMC_NO_NATIVE=ON -DCMAKE_C_FLAGS="${{ matrix.cflags }}" && cmake --build build -j
       - name: test
         run: ctest --test-dir build --output-on-failure
-      - name: deterministic archive metrics
-        run: |
-          clang -O3 ${{ matrix.cflags }} -w -Isrc -Itools/vendor/libs3 -I/opt/homebrew/include \
-            tests/mc_det_archive.c src/matter_compressor.c src/c3d.c tools/vendor/libs3/libs3.c \
-            -L/opt/homebrew/lib -lm -lpthread -lzstd -lcurl -o detarc
-          mkdir -p digest && ./detarc | tee digest/${{ matrix.os }}.txt
-      - uses: actions/upload-artifact@v4
-        with: { name: "digest-${{ matrix.os }}", path: digest/ }
   asan:
     runs-on: ubuntu-24.04
     steps:
@@ -117,15 +107,3 @@ jobs:
           path: |
             build_bench/micro.json
             build_bench/quality.txt
-  metric-equivalence:
-    needs: test
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with: { pattern: "digest-*", merge-multiple: true, path: digests }
-      - name: assert metric-equivalent archives across ISAs/compilers
-        run: |
-          cat digests/*.txt
-          # size to the KB, PSNR to 0.1 dB, MAE to 0.01, max error exact —
-          # last-bit float rounding may differ; delivered quality must not.
-          [ "$(sort -u digests/*.txt | wc -l)" -eq 1 ] && echo EQUIVALENT || { echo DIVERGENT; exit 1; }

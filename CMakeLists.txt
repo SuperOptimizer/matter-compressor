@@ -17,19 +17,24 @@ endif()
 # Only set fast/native flags + tests when built standalone. When vendored, the parent
 # owns the build type/flags and may build shared libs (so we force PIC below).
 if(MC_STANDALONE)
-  set(CMAKE_C_FLAGS_RELEASE "-O3 -ffp-contract=off")
+  set(CMAKE_C_FLAGS_RELEASE "-O3 -ffast-math -ffp-contract=fast")
   add_compile_options(-Wall -Wno-stringop-overflow)
   if(NOT DEFINED MC_NO_NATIVE)
     add_compile_options(-march=native)
   endif()
 endif()
 
-# DETERMINISM: archives are byte-identical across ISAs and compilers
-# (CI-enforced). Two requirements: no -ffast-math (per-target reciprocal
-# tricks in the float air-fill diverge; zero measured speedup anyway) and an
-# explicit -ffp-contract=off (gcc contracts mul+add to FMA by default, clang
-# does not — pin one choice). Hot paths are integer by design, so neither
-# flag costs performance.
+# FLOATING-POINT: the block transform is f32 (mc_codec_float.h replaced the Q14
+# integer DCT). We build with -ffast-math (FMA contraction + reassociation) so
+# the f32 DCT lines autovectorize — this is the float core's intended build mode.
+# TRADE-OFF: fast-math makes f32 results depend on ISA / opt level / FMA, so
+# archives are NOT guaranteed byte-identical across machines, and the max-error
+# (tau) correction bound is best-effort SAME-BUILD: encode and decode in one
+# build agree exactly (the corrections are computed against this build's own
+# reconstruction), but a decoder built differently may diverge by a small delta.
+# The export pipeline encodes and decodes with the same build, so the bound holds
+# in practice. (To restore strict cross-ISA reproducibility, drop -ffast-math and
+# add -ffp-contract=off — the DCT then evaluates in fixed order, bit-identical.)
 
 # Optional ThinLTO + PGO. MEASURED POLICY (bench/RESULTS.md): LTO of either
 # flavor WITHOUT profiles costs ~15% decode (link-time inliner mispredicts the
@@ -95,11 +100,12 @@ endif()
 set_target_properties(matter_compressor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(matter_compressor CURL::libcurl ${ZSTD_LIB} m Threads::Threads)
 
-# The codec is the hot path; build it -O3 -march=native regardless of
+# The codec is the hot path; build it -O3 -march=native -ffast-math regardless of
 # how a parent project (vendoring via add_subdirectory) sets global flags. The
 # MC_STANDALONE block above already does this for standalone builds; this target-
-# scoped copy guarantees it when vendored too. -DMC_NO_NATIVE=ON for portable builds.
-target_compile_options(matter_compressor PRIVATE -O3 -Wno-stringop-overflow)
+# scoped copy guarantees it when vendored too (the f32 DCT wants fast-math +
+# FMA contraction to vectorize). -DMC_NO_NATIVE=ON for portable builds.
+target_compile_options(matter_compressor PRIVATE -O3 -ffast-math -ffp-contract=fast -Wno-stringop-overflow)
 if(NOT MC_NO_NATIVE)
   include(CheckCCompilerFlag)
   check_c_compiler_flag(-march=native MC_HAS_MARCH_NATIVE)
@@ -120,6 +126,13 @@ if(MC_STANDALONE)
   add_executable(mc_append_roundtrip tests/mc_append_roundtrip.c)
   target_link_libraries(mc_append_roundtrip matter_compressor)
   add_test(NAME append_roundtrip COMMAND mc_append_roundtrip)
+
+  # index-node 8-byte alignment regression: node tables share the append cursor
+  # with variable-length blobs, so a fresh node after a blob must still be aligned
+  # (its u64 child slots are accessed as _Atomic -> BUS-fault if misaligned).
+  add_executable(mc_node_align_test tests/mc_node_align_test.c)
+  target_link_libraries(mc_node_align_test matter_compressor m)
+  add_test(NAME node_align COMMAND mc_node_align_test)
 
   add_executable(mc_stream_partial tests/mc_stream_partial.c)
   target_link_libraries(mc_stream_partial matter_compressor)

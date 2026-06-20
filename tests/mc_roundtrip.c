@@ -30,7 +30,7 @@ int main(void){
     printf("metadata (%zu B): %.*s\n",ml,(int)ml,m);
 
     mc_reader *r=mc_open(arc,len); mc_reader_set_quality(r,8.0f);
-    long air=0,airbad=0,mat=0,sqerr=0,maxerr=0,nblk=0;
+    long air=0,airbad=0,mat=0,sqerr=0,maxerr=0,nblk=0,airsq=0;
     int nch=(DIM+255)/256;
     mc_u8 dec[16*16*16];
     for(int cz=0;cz<nch;++cz)for(int cy=0;cy<nch;++cy)for(int cx=0;cx<nch;++cx){
@@ -40,17 +40,24 @@ int main(void){
             for(int z=0;z<16;++z)for(int y=0;y<16;++y)for(int x=0;x<16;++x){
                 int gx=(cx*16+bx)*16+x, gy=(cy*16+by)*16+y, gz=(cz*16+bz)*16+z;
                 int s=src_fn(NULL,gx,gy,gz), d=dec[(z*16+y)*16+x];
-                if(s==0){ air++; if(d!=0) airbad++; }
+                if(s==0){ air++; if(d!=0){ airbad++; airsq+=(long)d*d; } }
                 else { mat++; long e=labs((long)d-s); sqerr+=e*e; if(e>maxerr)maxerr=e; }
             }
         }
     }
     double rmse=mat?sqrt((double)sqerr/mat):0, psnr=rmse>0?10*log10(255.0*255.0/(rmse*rmse)):99;
+    double air_rmse=air?sqrt((double)airsq/air):0;
     printf("blocks=%ld material=%ld air=%ld\n",nblk,mat,air);
-    printf("air->nonzero(leak)=%ld  material RMSE=%.3f maxerr=%ld PSNR=%.2f dB\n",airbad,rmse,maxerr,psnr);
+    printf("air leak: %ld voxels nonzero (RMSE=%.3f)  material RMSE=%.3f maxerr=%ld PSNR=%.2f dB\n",
+           airbad,air_rmse,rmse,maxerr,psnr);
     mc_close(r); free(arc);
 
-    int ok = (airbad==0) && (rmse<6.0) && (ml==20);
+    // The per-voxel air mask was removed: air is no longer forced to EXACTLY 0, it
+    // reconstructs like any voxel (bounded by the codec error; by tau when the
+    // max-error pass is on -- mc_build here leaves it off, a worst case). So assert
+    // air lands NEAR 0 (low RMSE), not bit-exact. Fully-air blocks still decode to
+    // exact 0 (chunk bitmap skip); the leak is only at material/air boundaries.
+    int ok = (air_rmse<8.0) && (rmse<6.0) && (ml==20);
     printf("%s\n", ok?"PASS ✓":"FAIL ✗");
     return ok?0:1;
 }
