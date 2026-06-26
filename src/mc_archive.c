@@ -337,7 +337,16 @@ static int w_ensure(mc_archive *w, uint64_t need){
                     (unsigned long long)nf,(unsigned long long)w->reserve);
             pthread_mutex_unlock(&w->grow_mu); return -1;
         }
-        if(ftruncate(w->fd, (off_t)nf) != 0){ pthread_mutex_unlock(&w->grow_mu); return -1; }
+        // Allocate REAL disk blocks for the grown region [fl,nf), not a sparse ftruncate. Writing into
+        // a sparse mmap region defers block allocation to PAGE-FAULT time, and a transient failure there
+        // (fragmentation / momentary ENOSPC on the LVM volume / truncate-vs-write race) raises an
+        // UNCATCHABLE SIGBUS -- exactly the observed crash (faulted once at a 1GiB grow boundary, resumed
+        // straight past it). fallocate reserves the blocks up front so the mmap store always lands on
+        // backed storage; real out-of-space now surfaces as a clean -1, not a bus fault. Falls back to
+        // ftruncate on filesystems without fallocate (EOPNOTSUPP/ENOSYS).
+        int gr = fallocate(w->fd, 0, (off_t)fl, (off_t)(nf - fl));
+        if(gr != 0 && (errno == EOPNOTSUPP || errno == ENOSYS)) gr = ftruncate(w->fd, (off_t)nf);
+        if(gr != 0){ pthread_mutex_unlock(&w->grow_mu); return -1; }
         atomic_store_explicit(&w->file_len, nf, memory_order_release);
     }
     pthread_mutex_unlock(&w->grow_mu);
